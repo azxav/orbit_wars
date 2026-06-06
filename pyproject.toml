@@ -18,4 +18,5 @@ where = ["."]
 include = [
   "orbit_geometry_skeleton*",
   "orbit_training_prep*",
+  "orbit_bc_training*",
 ]
