@@ -8,3 +8,4 @@ bc_checkpoints
 *.jsonl
 *.csv
 *.log
+*.zip
