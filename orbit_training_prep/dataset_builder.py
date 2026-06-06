@@ -1,0 +1,305 @@
+from __future__ import annotations
+
+import argparse
+import json
+import math
+from collections import Counter, defaultdict
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from .features import PLANET_FEATURE_NAMES, PAIR_FEATURE_NAMES, all_planet_features, pair_features
+from .replay_io import iter_actual_launches, iter_player_steps, load_replay
+from .schema import (
+    AMOUNT_BIN_NAMES,
+    NOOP_TARGET_ID,
+    NOOP_TARGET_SLOT,
+    P_MAX,
+    ActionSpaceSpec,
+    alive_target_slots,
+    build_planet_slot_maps,
+    owned_source_slots,
+    safe_float,
+)
+from .target_inference import TargetInferer
+
+
+def resolve_replay_paths(replay_input: str | Path, max_files: int | None = None) -> list[Path]:
+    if max_files is not None and int(max_files) < 1:
+        raise ValueError("max_files must be at least 1")
+    replay_input = Path(replay_input)
+    if replay_input.is_dir():
+        paths = sorted(p for p in replay_input.glob("*-replay.json") if p.is_file())
+        if not paths:
+            paths = sorted(
+                p
+                for p in replay_input.glob("*.json")
+                if p.is_file() and p.name.lower() != "replay_metadata.json"
+            )
+        if not paths:
+            raise ValueError(f"No replay JSON files found in directory: {replay_input}")
+        if max_files is not None:
+            paths = paths[: int(max_files)]
+        return paths
+    return [replay_input]
+
+
+def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, separators=(",", ":"), sort_keys=True) + "\n")
+
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                rows.append(json.loads(line))
+    return rows
+
+
+class DatasetBuilder:
+    def __init__(
+        self,
+        *,
+        horizon: int = 160,
+        device: str = "cpu",
+        include_loser_actions: bool = True,
+        max_replay_files: int | None = None,
+    ):
+        self.horizon = int(horizon)
+        self.device = device
+        self.include_loser_actions = bool(include_loser_actions)
+        self.max_replay_files = None if max_replay_files is None else int(max_replay_files)
+        self.inferer = TargetInferer(horizon=horizon, device=device)
+
+    def build_from_replay(self, replay_path: str | Path, out_dir: str | Path) -> dict[str, Any]:
+        replay_input = Path(replay_path)
+        replay_paths = resolve_replay_paths(replay_input, self.max_replay_files)
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        launch_rows: list[dict[str, Any]] = []
+        source_turn_rows: list[dict[str, Any]] = []
+        pair_rows: list[dict[str, Any]] = []
+        state_rows: list[dict[str, Any]] = []
+        dense_planet_features: list[list[list[float]]] = []
+        dense_source_labels: list[list[int]] = []
+        dense_amount_labels: list[list[int]] = []
+        dense_source_mask: list[list[float]] = []
+        stats = Counter()
+        inference_methods = Counter()
+        amount_bins = Counter()
+
+        for replay_path in replay_paths:
+            replay = load_replay(replay_path)
+            for sample in iter_player_steps(replay):
+                obs = sample["obs"]
+                player_id = int(sample["player_id"])
+                final_reward = float(sample["final_reward"])
+                if not self.include_loser_actions and final_reward <= 0:
+                    continue
+                action = list(iter_actual_launches(sample["action"]))
+                owned_slots = owned_source_slots(obs, player_id)
+                if not owned_slots and not action:
+                    continue
+                obs_uid = f"{sample['episode_id']}:{sample['step_index']}:p{player_id}"
+                pfeat = all_planet_features(obs, player_id, P_MAX)
+                dense_planet_features.append(pfeat)
+                source_labels = [NOOP_TARGET_SLOT] * P_MAX
+                amount_labels = [0] * P_MAX
+                source_mask = [1.0 if s in owned_slots else 0.0 for s in range(P_MAX)]
+                state_rows.append({
+                    "obs_uid": obs_uid,
+                    "episode_id": sample["episode_id"],
+                    "step_index": sample["step_index"],
+                    "player_id": player_id,
+                    "final_reward": final_reward,
+                    "num_owned_sources": len(owned_slots),
+                    "num_raw_launches": len(action),
+                })
+                stats["states"] += 1
+                stats["owned_source_slots"] += len(owned_slots)
+                stats["raw_launches"] += len(action)
+
+                inferred_by_source: dict[int, list[dict[str, Any]]] = defaultdict(list)
+                inferred_moves = self.inferer.infer_moves(obs, player_id, action) if action else []
+                for launch_index, inf in enumerate(inferred_moves):
+                    row = {
+                        "obs_uid": obs_uid,
+                        "launch_uid": f"{obs_uid}:l{launch_index}",
+                        "episode_id": sample["episode_id"],
+                        "step_index": sample["step_index"],
+                        "obs_step": sample["obs_step"],
+                        "player_id": player_id,
+                        "final_reward": final_reward,
+                        "winner_action": final_reward > 0,
+                        "status": sample["status"],
+                        **inf.as_dict(),
+                    }
+                    launch_rows.append(row)
+                    stats["valid_launches"] += int(bool(row["valid_source"]))
+                    stats["invalid_launches"] += int(not bool(row["valid_source"]))
+                    inference_methods[str(row["target_inference_method"])] += 1
+                    amount_bins[int(row["amount_bin"])] += 1
+                    if row["valid_source"]:
+                        inferred_by_source[int(row["source_slot"])].append(row)
+
+                # Per-owned-source policy rows. This is the primary BC/RL-compatible dataset.
+                for source_slot in owned_slots:
+                    launches = inferred_by_source.get(source_slot, [])
+                    launches_sorted = sorted(launches, key=lambda r: (-int(r.get("ships", 0)), int(r.get("launch_uid", "0").split("l")[-1])))
+                    primary = launches_sorted[0] if launches_sorted else None
+                    if primary is None:
+                        target_slot = NOOP_TARGET_SLOT
+                        target_id = NOOP_TARGET_ID
+                        amount_bin = 0
+                        ships = 0
+                        amount_fraction = 0.0
+                        method = "noop"
+                        angle_error = 0.0
+                        geometry_viable = True
+                        contact_target_slot = NOOP_TARGET_SLOT
+                        contact_eta = math.inf
+                        capture_needed = 0
+                    else:
+                        target_slot = int(primary["inferred_target_slot"])
+                        target_id = int(primary["inferred_target_id"])
+                        amount_bin = int(primary["amount_bin"])
+                        ships = int(primary["ships"])
+                        amount_fraction = float(primary["amount_fraction"])
+                        method = str(primary["target_inference_method"])
+                        angle_error = float(primary["angle_error"])
+                        geometry_viable = bool(primary["geometry_viable"])
+                        contact_target_slot = int(primary["contact_target_slot"])
+                        contact_eta = float(primary["contact_eta"])
+                        capture_needed = int(primary["capture_needed"])
+                    multi_launch_count = len(launches_sorted)
+                    ambiguous = multi_launch_count > 1
+                    row = {
+                        "source_turn_uid": f"{obs_uid}:s{source_slot}",
+                        "obs_uid": obs_uid,
+                        "episode_id": sample["episode_id"],
+                        "step_index": sample["step_index"],
+                        "obs_step": sample["obs_step"],
+                        "player_id": player_id,
+                        "final_reward": final_reward,
+                        "winner_action": final_reward > 0,
+                        "source_slot": int(source_slot),
+                        "source_planet_id": int(obs["planets"][source_slot][0]),
+                        "target_slot_label": int(target_slot),
+                        "target_planet_id_label": int(target_id),
+                        "amount_bin_label": int(amount_bin),
+                        "amount_bin_name": AMOUNT_BIN_NAMES[int(amount_bin)],
+                        "ships_label": int(ships),
+                        "amount_fraction": float(amount_fraction),
+                        "capture_needed": int(capture_needed),
+                        "target_inference_method": method,
+                        "contact_target_slot": int(contact_target_slot),
+                        "contact_eta": float(contact_eta) if math.isfinite(float(contact_eta)) else None,
+                        "angle_error": float(angle_error),
+                        "geometry_viable": bool(geometry_viable),
+                        "multi_launch_count": int(multi_launch_count),
+                        "ambiguous_multi_launch": bool(ambiguous),
+                        "train_weight": 1.0 if final_reward > 0 else 0.35,
+                        "drop_for_v1_bc": bool(ambiguous or not geometry_viable),
+                    }
+                    source_turn_rows.append(row)
+                    source_labels[source_slot] = int(target_slot)
+                    amount_labels[source_slot] = int(amount_bin)
+                    stats["source_turn_rows"] += 1
+                    stats["noop_source_turns"] += int(primary is None)
+                    stats["positive_source_turns"] += int(primary is not None)
+                    stats["ambiguous_multi_launch_sources"] += int(ambiguous)
+
+                    # Pair-ranker rows share the same target candidates and target label as the policy.
+                    # One group = all candidate targets for one source at one state.
+                    candidate_slots = alive_target_slots(obs, include_noop=True, exclude_slot=source_slot)
+                    for cand in candidate_slots:
+                        label = 1 if int(cand) == int(target_slot) else 0
+                        candidate_id = NOOP_TARGET_ID if cand == NOOP_TARGET_SLOT else int(obs["planets"][cand][0])
+                        pair_rows.append({
+                            "pair_uid": f"{obs_uid}:s{source_slot}:t{cand}",
+                            "group_uid": f"{obs_uid}:s{source_slot}",
+                            "obs_uid": obs_uid,
+                            "source_turn_uid": row["source_turn_uid"],
+                            "episode_id": sample["episode_id"],
+                            "step_index": sample["step_index"],
+                            "player_id": player_id,
+                            "source_slot": int(source_slot),
+                            "candidate_target_slot": int(cand),
+                            "candidate_target_id": int(candidate_id),
+                            "label": int(label),
+                            "amount_bin_label": int(amount_bin),
+                            "ships_label": int(ships),
+                            "train_weight": float(row["train_weight"]),
+                            "drop_for_v1_bc": bool(row["drop_for_v1_bc"]),
+                            "features": pair_features(obs, player_id, source_slot, cand, ships),
+                        })
+                dense_source_labels.append(source_labels)
+                dense_amount_labels.append(amount_labels)
+                dense_source_mask.append(source_mask)
+
+        write_jsonl(out_dir / "launch_rows.jsonl", launch_rows)
+        write_jsonl(out_dir / "source_turn_rows.jsonl", source_turn_rows)
+        write_jsonl(out_dir / "pair_rank_rows.jsonl", pair_rows)
+        write_jsonl(out_dir / "state_rows.jsonl", state_rows)
+        if dense_planet_features:
+            np.savez_compressed(
+                out_dir / "dense_bc_arrays.npz",
+                planet_features=np.asarray(dense_planet_features, dtype=np.float32),
+                target_labels=np.asarray(dense_source_labels, dtype=np.int64),
+                amount_labels=np.asarray(dense_amount_labels, dtype=np.int64),
+                source_mask=np.asarray(dense_source_mask, dtype=np.float32),
+                planet_feature_names=np.asarray(PLANET_FEATURE_NAMES),
+            )
+        metadata = {
+            "replay_path": str(replay_input),
+            "replay_paths": [str(p) for p in replay_paths],
+            "action_space": ActionSpaceSpec().as_dict(),
+            "geometry_horizon": self.horizon,
+            "target_inference_mode": "exact_first_hit_with_angular_fallback",
+            "replay_action_alignment": "action at replay index t is paired with observation at replay index t-1",
+            "include_loser_actions": self.include_loser_actions,
+            "max_replay_files": self.max_replay_files,
+            "files": {
+                "launch_rows": "launch_rows.jsonl",
+                "source_turn_rows": "source_turn_rows.jsonl",
+                "pair_rank_rows": "pair_rank_rows.jsonl",
+                "state_rows": "state_rows.jsonl",
+                "dense_bc_arrays": "dense_bc_arrays.npz",
+            },
+            "planet_feature_names": PLANET_FEATURE_NAMES,
+            "pair_feature_names": PAIR_FEATURE_NAMES,
+            "stats": dict(stats),
+            "target_inference_methods": dict(inference_methods),
+            "amount_bin_counts": {AMOUNT_BIN_NAMES[int(k)]: int(v) for k, v in amount_bins.items() if int(k) < len(AMOUNT_BIN_NAMES)},
+        }
+        with open(out_dir / "metadata.json", "w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=2, sort_keys=True)
+        return metadata
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--replay", required=True, help="Replay JSON file or directory containing replay JSON files.")
+    ap.add_argument("--out-dir", required=True)
+    ap.add_argument("--horizon", type=int, default=160)
+    ap.add_argument("--device", default="cpu")
+    ap.add_argument("--winner-only", action="store_true")
+    ap.add_argument("--max-files", type=int, default=None, help="Maximum number of replay files to include from a replay directory.")
+    args = ap.parse_args()
+    builder = DatasetBuilder(
+        horizon=args.horizon,
+        device=args.device,
+        include_loser_actions=not args.winner_only,
+        max_replay_files=args.max_files,
+    )
+    meta = builder.build_from_replay(args.replay, args.out_dir)
+    print(json.dumps({"out_dir": args.out_dir, "stats": meta["stats"], "target_inference_methods": meta["target_inference_methods"]}, indent=2, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()
