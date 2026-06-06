@@ -4,6 +4,8 @@ import math
 from dataclasses import dataclass
 from typing import Any
 
+import torch
+
 from .exact_target_sim import ExactTargetSimulator
 from .schema import (
     NOOP_TARGET_ID,
@@ -21,6 +23,19 @@ SUN_RADIUS = 10.0
 ROT_RADIUS_LIMIT = 50.0
 LAUNCH_SURFACE_OFFSET = 0.1
 TARGET_HIT_SURFACE_OFFSET = 0.0
+
+
+def resolve_device(device: str | None = "auto") -> torch.device:
+    requested = (device or "auto").lower()
+    if requested == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if requested.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA was requested, but this Python environment is using a CPU-only "
+            f"PyTorch build (torch {torch.__version__}, torch.version.cuda={torch.version.cuda}). "
+            "Install a CUDA-enabled PyTorch wheel in this environment or run with --device cpu."
+        )
+    return torch.device(requested)
 
 
 def fleet_speed_formula(ships: int | float, max_speed: float = 6.0) -> float:
@@ -111,37 +126,50 @@ class FastProjector:
 class TargetInferer:
     """Map raw Kaggle moves to model labels using exact first-hit simulation."""
 
-    def __init__(self, *, horizon: int = 96, device: str = "cpu"):
+    def __init__(self, *, horizon: int = 96, device: str = "auto", batch_size: int | None = 256):
         self.horizon = int(horizon)
-        self.device = device
-        self.exact_sim = ExactTargetSimulator(horizon=horizon, device=device)
+        self.device = str(resolve_device(device))
+        if batch_size is not None and int(batch_size) < 1:
+            raise ValueError("batch_size must be at least 1")
+        self.batch_size = None if batch_size is None else int(batch_size)
+        self.exact_sim = ExactTargetSimulator(horizon=horizon, device=self.device)
 
     def infer_moves(self, obs: dict[str, Any], player_id: int, moves: list[tuple[int, float, int]]) -> list[InferredMove]:
         if not moves:
             return []
         id_to_slot, id_to_planet = build_planet_slot_maps(obs)
         projector = FastProjector(obs, self.horizon)
-        out: list[InferredMove] = []
-        for from_planet_id, raw_angle, ships in moves:
+        out: list[InferredMove | None] = [None] * len(moves)
+        valid_contexts: list[tuple[int, int, float, int, int, list[Any], int]] = []
+        exact_moves: list[dict[str, Any]] = []
+        for move_index, (from_planet_id, raw_angle, ships) in enumerate(moves):
             source_planet = id_to_planet.get(int(from_planet_id))
             source_slot = id_to_slot.get(int(from_planet_id), -1)
             available = int(math.floor(safe_float(source_planet[5]))) if source_planet is not None else 0
             if source_planet is None or source_slot < 0:
-                out.append(self._invalid(-1, int(from_planet_id), raw_angle, ships, 0, "source_not_found")); continue
+                out[move_index] = self._invalid(-1, int(from_planet_id), raw_angle, ships, 0, "source_not_found")
+                continue
             if int(source_planet[1]) != int(player_id):
-                out.append(self._invalid(source_slot, int(from_planet_id), raw_angle, ships, available, "source_not_owned")); continue
+                out[move_index] = self._invalid(source_slot, int(from_planet_id), raw_angle, ships, available, "source_not_owned")
+                continue
             if int(ships) <= 0 or int(ships) > available:
-                out.append(self._invalid(source_slot, int(from_planet_id), raw_angle, ships, available, "bad_ship_count")); continue
-            hit = self.exact_sim.first_hit_for_launch(
-                obs,
-                player_id,
-                {
-                    "source_planet_id": int(from_planet_id),
-                    "source_slot": int(source_slot),
-                    "raw_angle": float(raw_angle),
-                    "ships": int(ships),
-                },
-            )
+                out[move_index] = self._invalid(source_slot, int(from_planet_id), raw_angle, ships, available, "bad_ship_count")
+                continue
+            valid_contexts.append((move_index, int(from_planet_id), float(raw_angle), int(ships), int(source_slot), source_planet, int(available)))
+            exact_moves.append({
+                "source_planet_id": int(from_planet_id),
+                "source_slot": int(source_slot),
+                "raw_angle": float(raw_angle),
+                "ships": int(ships),
+            })
+
+        exact_hits: list[dict[str, Any]] = []
+        if exact_moves:
+            chunk_size = len(exact_moves) if self.batch_size is None else self.batch_size
+            for start in range(0, len(exact_moves), chunk_size):
+                exact_hits.extend(self.exact_sim.first_hits_for_launches(obs, player_id, exact_moves[start : start + chunk_size]))
+
+        for hit, (move_index, from_planet_id, raw_angle, ships, source_slot, source_planet, available) in zip(exact_hits, valid_contexts, strict=True):
             fallback_slot, fallback_id, fallback_err, fallback_eta, _fallback_viable = self._angular_nearest(
                 obs,
                 projector,
@@ -173,7 +201,7 @@ class TargetInferer:
             target_planet = obs["planets"][target_slot] if 0 <= target_slot < len(obs.get("planets", [])) else None
             cap_need = capture_needed_ships(source_planet, target_planet, player_id)
             amount_bin = encode_amount_bin(int(ships), available, cap_need)
-            out.append(InferredMove(
+            out[move_index] = InferredMove(
                 True,
                 int(source_slot),
                 int(from_planet_id),
@@ -192,8 +220,8 @@ class TargetInferer:
                 int(cap_need),
                 float(ships) / float(max(available, 1)),
                 "",
-            ))
-        return out
+            )
+        return [move for move in out if move is not None]
 
     def infer_move(self, obs: dict[str, Any], player_id: int, move: tuple[int, float, int]) -> InferredMove:
         return self.infer_moves(obs, player_id, [move])[0]

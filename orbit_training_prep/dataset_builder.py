@@ -66,15 +66,19 @@ class DatasetBuilder:
         self,
         *,
         horizon: int = 160,
-        device: str = "cpu",
+        device: str = "auto",
+        batch_size: int | None = 256,
         include_loser_actions: bool = True,
         max_replay_files: int | None = None,
     ):
         self.horizon = int(horizon)
-        self.device = device
+        if batch_size is not None and int(batch_size) < 1:
+            raise ValueError("batch_size must be at least 1")
+        self.batch_size = None if batch_size is None else int(batch_size)
         self.include_loser_actions = bool(include_loser_actions)
         self.max_replay_files = None if max_replay_files is None else int(max_replay_files)
-        self.inferer = TargetInferer(horizon=horizon, device=device)
+        self.inferer = TargetInferer(horizon=horizon, device=device, batch_size=batch_size)
+        self.device = self.inferer.device
 
     def build_from_replay(self, replay_path: str | Path, out_dir: str | Path) -> dict[str, Any]:
         replay_input = Path(replay_path)
@@ -123,6 +127,9 @@ class DatasetBuilder:
                 stats["states"] += 1
                 stats["owned_source_slots"] += len(owned_slots)
                 stats["raw_launches"] += len(action)
+                if action:
+                    stats["raw_launch_batches"] += 1
+                    stats["max_raw_launch_batch_size"] = max(int(stats["max_raw_launch_batch_size"]), len(action))
 
                 inferred_by_source: dict[int, list[dict[str, Any]]] = defaultdict(list)
                 inferred_moves = self.inferer.infer_moves(obs, player_id, action) if action else []
@@ -260,7 +267,10 @@ class DatasetBuilder:
             "replay_paths": [str(p) for p in replay_paths],
             "action_space": ActionSpaceSpec().as_dict(),
             "geometry_horizon": self.horizon,
-            "target_inference_mode": "exact_first_hit_with_angular_fallback",
+            "device": self.device,
+            "geometry_device": self.device,
+            "inference_batch_size": self.batch_size,
+            "target_inference_mode": "batched_exact_first_hit_with_angular_fallback",
             "replay_action_alignment": "action at replay index t is paired with observation at replay index t-1",
             "include_loser_actions": self.include_loser_actions,
             "max_replay_files": self.max_replay_files,
@@ -287,13 +297,15 @@ def main() -> None:
     ap.add_argument("--replay", required=True, help="Replay JSON file or directory containing replay JSON files.")
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--horizon", type=int, default=160)
-    ap.add_argument("--device", default="cpu")
+    ap.add_argument("--device", default="auto")
+    ap.add_argument("--batch-size", type=int, default=256, help="Maximum number of valid launches to exact-simulate per GPU/CPU batch.")
     ap.add_argument("--winner-only", action="store_true")
     ap.add_argument("--max-files", type=int, default=None, help="Maximum number of replay files to include from a replay directory.")
     args = ap.parse_args()
     builder = DatasetBuilder(
         horizon=args.horizon,
         device=args.device,
+        batch_size=args.batch_size,
         include_loser_actions=not args.winner_only,
         max_replay_files=args.max_files,
     )
