@@ -20,30 +20,61 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def iter_jsonl(path: Path):
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                yield json.loads(line)
+
+
 def validate_dataset(out_dir: str | Path) -> dict[str, Any]:
     out_dir = Path(out_dir)
-    launch_rows = read_jsonl(out_dir / "launch_rows.jsonl") if (out_dir / "launch_rows.jsonl").exists() else []
-    source_rows = read_jsonl(out_dir / "source_turn_rows.jsonl") if (out_dir / "source_turn_rows.jsonl").exists() else []
-    pair_rows = read_jsonl(out_dir / "pair_rank_rows.jsonl") if (out_dir / "pair_rank_rows.jsonl").exists() else []
     metadata = json.load(open(out_dir / "metadata.json", "r", encoding="utf-8")) if (out_dir / "metadata.json").exists() else {}
 
-    methods = Counter(str(r.get("target_inference_method")) for r in launch_rows)
-    amount_bins = Counter(str(r.get("amount_bin_name", AMOUNT_BIN_NAMES[int(r.get("amount_bin_label", 0))] if "amount_bin_label" in r else r.get("amount_bin", 0))) for r in source_rows)
-    launch_valid = sum(1 for r in launch_rows if r.get("valid_source"))
-    contact = sum(1 for r in launch_rows if r.get("target_inference_method") == "first_contact")
-    angular = sum(1 for r in launch_rows if r.get("target_inference_method") == "angular_nearest")
-    geometry_viable = sum(1 for r in source_rows if r.get("geometry_viable"))
-    ambiguous = sum(1 for r in source_rows if r.get("ambiguous_multi_launch"))
-    drop_v1 = sum(1 for r in source_rows if r.get("drop_for_v1_bc"))
-    positives = sum(1 for r in source_rows if int(r.get("target_slot_label", NOOP_TARGET_SLOT)) != NOOP_TARGET_SLOT)
-    noops = sum(1 for r in source_rows if int(r.get("target_slot_label", NOOP_TARGET_SLOT)) == NOOP_TARGET_SLOT)
+    launch_count = 0
+    methods: Counter[str] = Counter()
+    launch_valid = 0
+    contact = 0
+    angular = 0
+    launch_path = out_dir / "launch_rows.jsonl"
+    if launch_path.exists():
+        for row in iter_jsonl(launch_path):
+            launch_count += 1
+            methods[str(row.get("target_inference_method"))] += 1
+            launch_valid += int(bool(row.get("valid_source")))
+            contact += int(row.get("target_inference_method") == "first_contact")
+            angular += int(row.get("target_inference_method") == "angular_nearest")
+
+    source_count = 0
+    amount_bins: Counter[str] = Counter()
+    geometry_viable = 0
+    ambiguous = 0
+    drop_v1 = 0
+    positives = 0
+    noops = 0
+    source_path = out_dir / "source_turn_rows.jsonl"
+    if source_path.exists():
+        for row in iter_jsonl(source_path):
+            source_count += 1
+            amount_name = row.get("amount_bin_name", AMOUNT_BIN_NAMES[int(row.get("amount_bin_label", 0))] if "amount_bin_label" in row else row.get("amount_bin", 0))
+            amount_bins[str(amount_name)] += 1
+            geometry_viable += int(bool(row.get("geometry_viable")))
+            ambiguous += int(bool(row.get("ambiguous_multi_launch")))
+            drop_v1 += int(bool(row.get("drop_for_v1_bc")))
+            is_positive = int(row.get("target_slot_label", NOOP_TARGET_SLOT)) != NOOP_TARGET_SLOT
+            positives += int(is_positive)
+            noops += int(not is_positive)
 
     groups = defaultdict(int)
     positives_by_group = defaultdict(int)
-    for r in pair_rows:
-        gid = str(r.get("group_uid"))
-        groups[gid] += 1
-        positives_by_group[gid] += int(r.get("label", 0))
+    pair_count = 0
+    pair_path = out_dir / "pair_rank_rows.jsonl"
+    if pair_path.exists():
+        for row in iter_jsonl(pair_path):
+            pair_count += 1
+            gid = str(row.get("group_uid"))
+            groups[gid] += 1
+            positives_by_group[gid] += int(row.get("label", 0))
     group_positive_hist = Counter(positives_by_group.values())
     bad_pair_groups = [g for g, c in positives_by_group.items() if c != 1]
 
@@ -53,13 +84,13 @@ def validate_dataset(out_dir: str | Path) -> dict[str, Any]:
         arr = np.load(npz_path, allow_pickle=True)
         arr_info = {k: list(v.shape) for k, v in arr.items() if hasattr(v, "shape")}
 
-    denom_launch = max(len(launch_rows), 1)
-    denom_source = max(len(source_rows), 1)
+    denom_launch = max(launch_count, 1)
+    denom_source = max(source_count, 1)
     report = {
         "counts": {
-            "launch_rows": len(launch_rows),
-            "source_turn_rows": len(source_rows),
-            "pair_rank_rows": len(pair_rows),
+            "launch_rows": launch_count,
+            "source_turn_rows": source_count,
+            "pair_rank_rows": pair_count,
             "pair_groups": len(groups),
             "valid_launches": launch_valid,
             "positive_source_turns": positives,
