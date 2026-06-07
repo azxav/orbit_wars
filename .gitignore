@@ -3,7 +3,10 @@ __pycache__/
 .pytest_cache/
 replays
 orbit_dataset_work
+dataset
 bc_checkpoints
+ppo_checkpoints
+ppo_eval_debug
 *.json
 *.jsonl
 *.csv

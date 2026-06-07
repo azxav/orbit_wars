@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from collections import Counter, defaultdict
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -65,19 +65,6 @@ def validate_dataset(out_dir: str | Path) -> dict[str, Any]:
             positives += int(is_positive)
             noops += int(not is_positive)
 
-    groups = defaultdict(int)
-    positives_by_group = defaultdict(int)
-    pair_count = 0
-    pair_path = out_dir / "pair_rank_rows.jsonl"
-    if pair_path.exists():
-        for row in iter_jsonl(pair_path):
-            pair_count += 1
-            gid = str(row.get("group_uid"))
-            groups[gid] += 1
-            positives_by_group[gid] += int(row.get("label", 0))
-    group_positive_hist = Counter(positives_by_group.values())
-    bad_pair_groups = [g for g, c in positives_by_group.items() if c != 1]
-
     arr_info = {}
     npz_path = out_dir / "dense_bc_arrays.npz"
     if npz_path.exists():
@@ -90,8 +77,6 @@ def validate_dataset(out_dir: str | Path) -> dict[str, Any]:
         "counts": {
             "launch_rows": launch_count,
             "source_turn_rows": source_count,
-            "pair_rank_rows": pair_count,
-            "pair_groups": len(groups),
             "valid_launches": launch_valid,
             "positive_source_turns": positives,
             "noop_source_turns": noops,
@@ -108,8 +93,6 @@ def validate_dataset(out_dir: str | Path) -> dict[str, Any]:
         },
         "target_inference_methods": dict(methods),
         "amount_bin_distribution_source_turns": dict(amount_bins),
-        "pair_group_positive_label_hist": {str(k): int(v) for k, v in group_positive_hist.items()},
-        "bad_pair_group_count": len(bad_pair_groups),
         "dense_array_shapes": arr_info,
         "metadata_stats": metadata.get("stats", {}),
         "decision_checks": {
@@ -118,7 +101,6 @@ def validate_dataset(out_dir: str | Path) -> dict[str, Any]:
             "amount_bins": metadata.get("action_space", {}).get("amount_bins"),
             "angle_policy": metadata.get("action_space", {}).get("angle_policy"),
             "primary_train_rows": "source_turn_rows.jsonl",
-            "baseline_ranker_rows": "pair_rank_rows.jsonl",
             "dense_bc_arrays": "dense_bc_arrays.npz",
         },
     }

@@ -27,6 +27,10 @@ class RolloutMetrics:
     no_op_source_decisions: int = 0
     predicted_launches: int = 0
     returned_move_count: int = 0
+    skip_reason_counts: dict[str, int] = field(default_factory=dict)
+    opening_prediction_target_counts: dict[str, int] = field(default_factory=dict)
+    opening_prediction_amount_counts: dict[str, int] = field(default_factory=dict)
+    opening_prediction_target_amount_counts: dict[str, int] = field(default_factory=dict)
     sun_bounds_suspected_waste: int = 0
     owned_planets_samples: list[int] = field(default_factory=list)
     total_ships_samples: list[float] = field(default_factory=list)
@@ -61,6 +65,17 @@ class RolloutMetrics:
         self.skipped_invalid_decoded_actions += int(runtime_debug.get("skipped_invalid_decoded_actions", 0) or 0)
         self.no_op_source_decisions += int(runtime_debug.get("no_op_source_decisions", 0) or 0)
         self.predicted_launches += int(runtime_debug.get("predicted_launches", 0) or 0)
+        for reason, value in (runtime_debug.get("skip_reasons", {}) or {}).items():
+            self.skip_reason_counts[str(reason)] = self.skip_reason_counts.get(str(reason), 0) + int(value or 0)
+        opening_counts = runtime_debug.get("opening_prediction_counts", {}) or {}
+        for key, attr in (
+            ("target", "opening_prediction_target_counts"),
+            ("amount", "opening_prediction_amount_counts"),
+            ("target_amount", "opening_prediction_target_amount_counts"),
+        ):
+            target = getattr(self, attr)
+            for name, value in (opening_counts.get(key, {}) or {}).items():
+                target[str(name)] = target.get(str(name), 0) + int(value or 0)
         self.timeout_count += 1 if runtime_debug.get("timeout") else 0
         self.error_count += 1 if runtime_debug.get("error") else 0
 
@@ -89,9 +104,14 @@ class RolloutMetrics:
             **self.bucket_counts,
             "illegal_actions": int(self.illegal_actions),
             "skipped_invalid_decoded_actions": int(self.skipped_invalid_decoded_actions),
+            "skip_reason_counts": dict(sorted(self.skip_reason_counts.items())),
+            "opening_prediction_target_counts": dict(sorted(self.opening_prediction_target_counts.items())),
+            "opening_prediction_amount_counts": dict(sorted(self.opening_prediction_amount_counts.items())),
+            "opening_prediction_target_amount_counts": dict(sorted(self.opening_prediction_target_amount_counts.items())),
             "timeout_count": int(self.timeout_count),
             "error_count": int(self.error_count),
             "no_op_source_decisions": int(self.no_op_source_decisions),
+            "predicted_launches": int(self.predicted_launches),
             "predicted_launch_rate": self.predicted_launches / max(1, self.predicted_launches + self.no_op_source_decisions),
             "actual_returned_move_count": int(self.returned_move_count),
             "sun_bounds_suspected_waste": int(self.sun_bounds_suspected_waste),

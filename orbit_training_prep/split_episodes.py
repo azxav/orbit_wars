@@ -9,7 +9,6 @@ from typing import Any
 
 EPISODE_ROW_FILES = (
     "source_turn_rows.jsonl",
-    "pair_rank_rows.jsonl",
     "state_rows.jsonl",
     "launch_rows.jsonl",
 )

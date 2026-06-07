@@ -79,3 +79,6 @@ def test_dataset_builder_records_device_and_batched_inference_mode(tmp_path: Pat
     assert metadata["stats"]["raw_launch_batches"] == 1
     assert metadata["stats"]["max_raw_launch_batch_size"] == 2
     assert [row["target_inference_method"] for row in launch_rows] == ["first_contact", "angular_nearest"]
+    assert "pair_rank_rows" not in metadata["files"]
+    assert "pair_feature_names" not in metadata
+    assert not (out_dir / "pair_rank_rows.jsonl").exists()

@@ -13,7 +13,7 @@ from orbit_bc_training.decode_policy import decode_bc_prediction
 from orbit_bc_training.losses import masked_argmax
 from orbit_training_prep.features import all_planet_features
 from orbit_training_prep.geometry_bridge import make_geometry
-from orbit_training_prep.schema import P_MAX, NOOP_TARGET_SLOT, owned_source_slots, safe_float
+from orbit_training_prep.schema import AMOUNT_BIN_NAMES, P_MAX, NOOP_TARGET_SLOT, capture_needed_ships, decode_amount_bin, owned_source_slots, safe_float
 
 from .config import DEFAULT_DEVICE, DEFAULT_GEOMETRY_HORIZON
 
@@ -144,6 +144,36 @@ def _act_timeout_seconds(config: Any) -> float:
         return 1.0
 
 
+def _target_count_key(target: int) -> str:
+    return "noop" if int(target) == NOOP_TARGET_SLOT else f"slot_{int(target)}"
+
+
+def _amount_count_key(amount: int) -> str:
+    if 0 <= int(amount) < len(AMOUNT_BIN_NAMES):
+        return str(AMOUNT_BIN_NAMES[int(amount)])
+    return f"bin_{int(amount)}"
+
+
+def _increment_count(counts: dict[str, int], key: str, value: int = 1) -> None:
+    counts[str(key)] = int(counts.get(str(key), 0)) + int(value)
+
+
+def _decode_none_reason(obs: dict[str, Any], player_id: int, source_slot: int, target: int, amount_bin: int) -> str:
+    if int(target) == NOOP_TARGET_SLOT:
+        return "noop"
+    planets = obs.get("planets", [])
+    if source_slot >= len(planets):
+        return "source_missing"
+    source = planets[source_slot]
+    if len(source) < 7 or int(source[1]) != int(player_id):
+        return "source_not_owned"
+    target_planet = planets[target] if 0 <= int(target) < len(planets) else None
+    ships = decode_amount_bin(int(amount_bin), float(source[5]), capture_needed_ships(source, target_planet, int(player_id)))
+    if ships <= 0:
+        return "amount_decoded_non_positive"
+    return "geometry_no_viable_move"
+
+
 def agent(obs, config):
     global LAST_DEBUG
     obs = dict(obs or {})
@@ -161,6 +191,8 @@ def agent(obs, config):
         "player_id": player_id,
         "predictions": [],
         "skipped": [],
+        "skip_reasons": {},
+        "opening_prediction_counts": {"target": {}, "amount": {}, "target_amount": {}},
         "skipped_invalid_decoded_actions": 0,
         "no_op_source_decisions": 0,
         "predicted_launches": 0,
@@ -186,6 +218,12 @@ def agent(obs, config):
                 debug["no_op_source_decisions"] += 1
             else:
                 debug["predicted_launches"] += 1
+            if 0 <= int(debug["step"]) < 100:
+                target_key = _target_count_key(target_pred)
+                amount_key = _amount_count_key(amount_pred)
+                _increment_count(debug["opening_prediction_counts"]["target"], target_key)
+                _increment_count(debug["opening_prediction_counts"]["amount"], amount_key)
+                _increment_count(debug["opening_prediction_counts"]["target_amount"], f"{target_key}|{amount_key}")
             move = decode_bc_prediction(obs, player_id, source_planet_id, target_logits, amount_logits, geometry)
             pred_row = {
                 "source_slot": int(source_slot),
@@ -195,15 +233,17 @@ def agent(obs, config):
                 "decoded_move": move,
             }
             if move is None:
-                reason = "noop" if target_pred == NOOP_TARGET_SLOT else "geometry_or_amount_invalid"
+                reason = _decode_none_reason(obs, player_id, int(source_slot), target_pred, amount_pred)
                 if reason != "noop":
                     debug["skipped_invalid_decoded_actions"] += 1
+                    _increment_count(debug["skip_reasons"], reason)
                 debug["skipped"].append({"source_slot": int(source_slot), "reason": reason})
                 debug["predictions"].append(pred_row)
                 continue
             validation = validate_env_move(obs, player_id, move)
             if not validation.ok:
                 debug["skipped_invalid_decoded_actions"] += 1
+                _increment_count(debug["skip_reasons"], validation.reason)
                 debug["skipped"].append({"source_slot": int(source_slot), "reason": validation.reason, "move": move})
                 debug["predictions"].append(pred_row)
                 continue
@@ -213,5 +253,15 @@ def agent(obs, config):
         debug["error"] = f"{type(exc).__name__}: {exc}"
         moves = []
     debug["returned_moves"] = len(moves)
-    LAST_DEBUG = debug if debug_enabled else {k: debug[k] for k in ("skipped_invalid_decoded_actions", "no_op_source_decisions", "predicted_launches", "returned_moves", "timeout", "error")}
+    compact_keys = (
+        "skipped_invalid_decoded_actions",
+        "skip_reasons",
+        "opening_prediction_counts",
+        "no_op_source_decisions",
+        "predicted_launches",
+        "returned_moves",
+        "timeout",
+        "error",
+    )
+    LAST_DEBUG = debug if debug_enabled else {k: debug[k] for k in compact_keys}
     return moves

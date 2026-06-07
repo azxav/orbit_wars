@@ -8,9 +8,6 @@ from typing import Any
 from .schema import NOOP_TARGET_ID, NOOP_TARGET_SLOT
 
 
-ROW_FILES = ("source_turn_rows.jsonl", "pair_rank_rows.jsonl")
-
-
 def load_json(path: str | Path) -> dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -74,7 +71,7 @@ def write_split_file(
             for row in iter_jsonl(path):
                 if str(row.get("episode_id")) not in episode_ids:
                     continue
-                uid = row.get("pair_uid") or row.get("source_turn_uid")
+                uid = row.get("source_turn_uid")
                 if uid is not None:
                     uid = str(uid)
                     if uid in seen_uids:
@@ -97,7 +94,6 @@ def materialize_splits(dataset_root: str | Path, splits_path: str | Path, out_di
         raise ValueError(f"Episode ids cannot appear in both train and valid: {sorted(overlap)[:5]}")
 
     source_paths = row_file_paths(dataset_root, "source_turn_rows.jsonl", out_dir=out_dir)
-    pair_paths = row_file_paths(dataset_root, "pair_rank_rows.jsonl", out_dir=out_dir)
     out = Path(out_dir)
     summary: dict[str, dict[str, int]] = {}
     for split_name, episode_ids in (("train", train_ids), ("valid", valid_ids)):
@@ -107,12 +103,6 @@ def materialize_splits(dataset_root: str | Path, splits_path: str | Path, out_di
                 out_path=out / split_name / "source_turn_rows.jsonl",
                 episode_ids=episode_ids,
                 add_sample_weight=True,
-            ),
-            "pair_rank_rows": write_split_file(
-                paths=pair_paths,
-                out_path=out / split_name / "pair_rank_rows.jsonl",
-                episode_ids=episode_ids,
-                add_sample_weight=False,
             ),
         }
     return summary

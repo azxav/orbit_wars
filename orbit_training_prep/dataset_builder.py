@@ -10,7 +10,7 @@ from typing import Any
 
 import numpy as np
 
-from .features import PLANET_FEATURE_NAMES, PAIR_FEATURE_NAMES, all_planet_features, pair_features
+from .features import PLANET_FEATURE_NAMES, all_planet_features
 from .replay_io import iter_actual_launches, iter_player_steps, load_replay
 from .schema import (
     AMOUNT_BIN_NAMES,
@@ -18,7 +18,6 @@ from .schema import (
     NOOP_TARGET_SLOT,
     P_MAX,
     ActionSpaceSpec,
-    alive_target_slots,
     build_planet_slot_maps,
     owned_source_slots,
     safe_float,
@@ -163,7 +162,6 @@ class DatasetBuilder:
             with (
                 JsonlWriter(out_dir / "launch_rows.jsonl") as launch_rows,
                 JsonlWriter(out_dir / "source_turn_rows.jsonl") as source_turn_rows,
-                JsonlWriter(out_dir / "pair_rank_rows.jsonl") as pair_rows,
                 JsonlWriter(out_dir / "state_rows.jsonl") as state_rows,
             ):
                 for replay_path in replay_paths:
@@ -289,30 +287,6 @@ class DatasetBuilder:
                             stats["positive_source_turns"] += int(primary is not None)
                             stats["ambiguous_multi_launch_sources"] += int(ambiguous)
 
-                            # Pair-ranker rows share the same target candidates and target label as the policy.
-                            # One group = all candidate targets for one source at one state.
-                            candidate_slots = alive_target_slots(obs, include_noop=True, exclude_slot=source_slot)
-                            for cand in candidate_slots:
-                                label = 1 if int(cand) == int(target_slot) else 0
-                                candidate_id = NOOP_TARGET_ID if cand == NOOP_TARGET_SLOT else int(obs["planets"][cand][0])
-                                pair_rows.write({
-                                    "pair_uid": f"{obs_uid}:s{source_slot}:t{cand}",
-                                    "group_uid": f"{obs_uid}:s{source_slot}",
-                                    "obs_uid": obs_uid,
-                                    "source_turn_uid": row["source_turn_uid"],
-                                    "episode_id": sample["episode_id"],
-                                    "step_index": sample["step_index"],
-                                    "player_id": player_id,
-                                    "source_slot": int(source_slot),
-                                    "candidate_target_slot": int(cand),
-                                    "candidate_target_id": int(candidate_id),
-                                    "label": int(label),
-                                    "amount_bin_label": int(amount_bin),
-                                    "ships_label": int(ships),
-                                    "train_weight": float(row["train_weight"]),
-                                    "drop_for_v1_bc": bool(row["drop_for_v1_bc"]),
-                                    "features": pair_features(obs, player_id, source_slot, cand, ships),
-                                })
                         if dense_planet_features is not None:
                             dense_planet_features[dense_index] = np.asarray(pfeat, dtype=np.float32)
                             dense_source_labels[dense_index] = np.asarray(source_labels, dtype=np.int64)
@@ -352,12 +326,10 @@ class DatasetBuilder:
             "files": {
                 "launch_rows": "launch_rows.jsonl",
                 "source_turn_rows": "source_turn_rows.jsonl",
-                "pair_rank_rows": "pair_rank_rows.jsonl",
                 "state_rows": "state_rows.jsonl",
                 "dense_bc_arrays": "dense_bc_arrays.npz",
             },
             "planet_feature_names": PLANET_FEATURE_NAMES,
-            "pair_feature_names": PAIR_FEATURE_NAMES,
             "stats": dict(stats),
             "target_inference_methods": dict(inference_methods),
             "amount_bin_counts": {AMOUNT_BIN_NAMES[int(k)]: int(v) for k, v in amount_bins.items() if int(k) < len(AMOUNT_BIN_NAMES)},

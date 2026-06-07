@@ -11,6 +11,14 @@ def _mean(rows: list[dict[str, Any]], key: str) -> float:
     return sum(values) / len(values) if values else 0.0
 
 
+def _sum_count_maps(rows: list[dict[str, Any]], key: str) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for row in rows:
+        for name, value in (row.get(key, {}) or {}).items():
+            out[str(name)] = out.get(str(name), 0) + int(value or 0)
+    return dict(sorted(out.items()))
+
+
 def write_eval_report(
     game_rows: list[dict[str, Any]],
     *,
@@ -25,6 +33,10 @@ def write_eval_report(
     notes_out = list(notes or [])
     total_launch_decisions = sum(float(r.get("launches", 0) or 0) + float(r.get("no_op_source_decisions", 0) or 0) for r in game_rows)
     early_launches = sum(float(r.get("launches_0_100", 0) or 0) for r in game_rows)
+    total_launches = sum(int(r.get("launches", 0) or 0) for r in game_rows)
+    total_predicted_launches = sum(int(r.get("predicted_launches", 0) or 0) for r in game_rows)
+    total_no_ops = sum(int(r.get("no_op_source_decisions", 0) or 0) for r in game_rows)
+    total_returned_moves = sum(int(r.get("actual_returned_move_count", 0) or 0) for r in game_rows)
     if game_rows and _mean(game_rows, "launches") <= 0:
         notes_out.append("BC returned no launches on average; check no-op bias and checkpoint path.")
     if sum(int(r.get("illegal_actions", 0) or 0) for r in game_rows):
@@ -38,6 +50,12 @@ def write_eval_report(
         "average_rank": _mean(game_rows, "rank"),
         "average_launches_per_game": _mean(game_rows, "launches"),
         "early_launch_rate": early_launches / max(1.0, total_launch_decisions),
+        "total_launch_decisions": float(total_launch_decisions),
+        "total_launches": int(total_launches),
+        "early_launches_0_100": int(early_launches),
+        "total_predicted_launches": int(total_predicted_launches),
+        "total_no_op_source_decisions": int(total_no_ops),
+        "total_actual_returned_move_count": int(total_returned_moves),
         "timeout_count": int(sum(int(r.get("timeout_count", 0) or 0) for r in game_rows)),
         "illegal_action_count": int(sum(int(r.get("illegal_actions", 0) or 0) for r in game_rows)),
         "average_final_reward": _mean(game_rows, "reward"),
@@ -47,6 +65,11 @@ def write_eval_report(
         "average_planets_captured": _mean(game_rows, "planets_captured"),
         "average_predicted_launch_rate": _mean(game_rows, "predicted_launch_rate"),
         "average_actual_returned_move_count": _mean(game_rows, "actual_returned_move_count"),
+        "total_skipped_invalid_decoded_actions": int(sum(int(r.get("skipped_invalid_decoded_actions", 0) or 0) for r in game_rows)),
+        "skip_reason_counts": _sum_count_maps(game_rows, "skip_reason_counts"),
+        "opening_prediction_target_counts": _sum_count_maps(game_rows, "opening_prediction_target_counts"),
+        "opening_prediction_amount_counts": _sum_count_maps(game_rows, "opening_prediction_amount_counts"),
+        "opening_prediction_target_amount_counts": _sum_count_maps(game_rows, "opening_prediction_target_amount_counts"),
         "notes_warnings": notes_out,
     }
     with open(out / "summary.json", "w", encoding="utf-8") as f:

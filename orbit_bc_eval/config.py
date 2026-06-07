@@ -4,7 +4,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_BC_CHECKPOINT = PROJECT_ROOT / "checkpoint.pt"
+DEFAULT_BC_CHECKPOINT = PROJECT_ROOT / "bc_checkpoints" / "full_bc_v1" / "best" / "checkpoint.pt"
+DEFAULT_OPPONENT_BC_CHECKPOINT = PROJECT_ROOT / "checkpoint.pt"
 DEFAULT_HEURISTIC_PATH = PROJECT_ROOT / "orbit_wars_base.py"
 DEFAULT_ENVIRONMENT = "orbit_wars"
 DEFAULT_EPISODE_STEPS = 500
@@ -17,11 +18,12 @@ STEP_BUCKETS: tuple[tuple[int, int], ...] = ((0, 100), (100, 250), (250, 430), (
 @dataclass(frozen=True)
 class EvalConfig:
     bc_checkpoint: Path = DEFAULT_BC_CHECKPOINT
-    opponent: str = "heuristic_path"
+    opponent: str = "bc_checkpoint"
+    opponent_bc_checkpoint: Path = DEFAULT_OPPONENT_BC_CHECKPOINT
     num_games: int = 20
-    players: int | str = "both"
+    players: int | str = "2"
     seed_start: int = 0
-    out_dir: Path = Path("bc_eval_runs/checkpoint_vs_orbit_wars_base")
+    out_dir: Path = Path("bc_eval_runs/full_bc_v1_best_vs_checkpoint")
     device: str = DEFAULT_DEVICE
     environment: str = DEFAULT_ENVIRONMENT
     episode_steps: int = DEFAULT_EPISODE_STEPS

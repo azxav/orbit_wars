@@ -31,7 +31,7 @@ class SplitMaterializeTest(unittest.TestCase):
         self.assertEqual(source_turn_sample_weight({"target_slot_label": 3, "winner_action": True, "step_index": 12}), 1.25)
         self.assertEqual(source_turn_sample_weight({"target_slot_label": 3, "winner_action": True, "step_index": 431}), 0.625)
 
-    def test_materialize_splits_filters_by_episode_and_adds_sample_weight(self) -> None:
+    def test_materialize_splits_filters_source_rows_by_episode_and_adds_sample_weight(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             dataset = root / "dataset"
@@ -45,14 +45,6 @@ class SplitMaterializeTest(unittest.TestCase):
                     {"source_turn_uid": "b", "episode_id": "episode_b", "target_slot_label": NOOP_TARGET_SLOT, "winner_action": False, "step_index": 5},
                 ],
             )
-            write_jsonl(
-                dataset / "pair_rank_rows.jsonl",
-                [
-                    {"pair_uid": "a0", "source_turn_uid": "a", "episode_id": "episode_a", "label": 1, "features": [1.0]},
-                    {"pair_uid": "a1", "source_turn_uid": "a", "episode_id": "episode_a", "label": 0, "features": [0.0]},
-                    {"pair_uid": "b0", "episode_id": "episode_b", "label": 1, "features": [0.0]},
-                ],
-            )
 
             summary = materialize_splits(dataset_root=dataset, splits_path=splits_path, out_dir=out)
 
@@ -62,8 +54,9 @@ class SplitMaterializeTest(unittest.TestCase):
             self.assertEqual(json.loads(train_source[0])["episode_id"], "episode_a")
             self.assertEqual(json.loads(train_source[0])["sample_weight"], 1.25)
             self.assertEqual(json.loads(valid_source[0])["sample_weight"], 0.2)
-            self.assertEqual(summary["train"]["pair_rank_rows"], 2)
-            self.assertEqual(json.loads((out / "valid" / "pair_rank_rows.jsonl").read_text(encoding="utf-8").strip())["episode_id"], "episode_b")
+            self.assertNotIn("pair_rank_rows", summary["train"])
+            self.assertFalse((out / "train" / "pair_rank_rows.jsonl").exists())
+            self.assertFalse((out / "valid" / "pair_rank_rows.jsonl").exists())
 
 
 if __name__ == "__main__":

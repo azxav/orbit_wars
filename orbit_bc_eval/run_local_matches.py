@@ -14,7 +14,8 @@ from .rollout_metrics import RolloutMetrics
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_BC_CHECKPOINT = PROJECT_ROOT / "checkpoint.pt"
+DEFAULT_BC_CHECKPOINT = PROJECT_ROOT / "bc_checkpoints" / "full_bc_v1" / "best" / "checkpoint.pt"
+DEFAULT_OPPONENT_BC_CHECKPOINT = PROJECT_ROOT / "checkpoint.pt"
 DEFAULT_HEURISTIC_PATH = PROJECT_ROOT / "orbit_wars_base.py"
 
 
@@ -128,6 +129,8 @@ def _normalize_players(players: Any) -> int:
 
 
 def _opponent_label(args: argparse.Namespace) -> str:
+    if args.opponent == "bc_checkpoint":
+        return f"bc_checkpoint:{Path(args.opponent_bc_checkpoint).name}"
     if args.opponent == "heuristic_path" and Path(args.heuristic_path).name == "orbit_wars_base.py":
         return "orbit_wars_base"
     return str(args.opponent)
@@ -137,6 +140,29 @@ def _make_opponent_for_seat(args: argparse.Namespace) -> Callable:
     # Stateful heuristic agents (orbit_wars_base.py) keep globals such as plans
     # and step counters, so each opponent seat must get a fresh module instance.
     return make_opponent(args.opponent, heuristic_path=args.heuristic_path)
+
+
+def _make_bc_agent_for_checkpoint(
+    *,
+    checkpoint: str | Path,
+    device: str,
+    geometry_horizon: int,
+    debug: bool,
+    player_id: int,
+) -> RecordingAgent:
+    def call_bc(obs, config):
+        bc_config = dict(config or {})
+        bc_config.update(
+            {
+                "bc_checkpoint": str(checkpoint),
+                "device": str(device),
+                "geometry_horizon": int(geometry_horizon),
+                "debug": bool(debug),
+            }
+        )
+        return bc_agent_runtime.agent(obs, bc_config)
+
+    return RecordingAgent(call_bc, player_id=player_id, is_bc=True)
 
 
 def run_games(args: argparse.Namespace) -> dict[str, Any]:
@@ -161,10 +187,29 @@ def run_games(args: argparse.Namespace) -> dict[str, Any]:
         bc_seat = _bc_seat_for(game_index, players)
         seats.append(bc_seat)
         bc_agent_runtime.reset_runtime_state()
-        bc_wrapper = RecordingAgent(bc_agent_runtime.agent, player_id=bc_seat, is_bc=True)
+        bc_wrapper = _make_bc_agent_for_checkpoint(
+            checkpoint=args.bc_checkpoint,
+            device=args.device,
+            geometry_horizon=args.geometry_horizon,
+            debug=args.debug_game,
+            player_id=bc_seat,
+        )
         agents: list[Any] = []
         for seat in range(players):
-            agents.append(bc_wrapper if seat == bc_seat else RecordingAgent(_make_opponent_for_seat(args), player_id=seat))
+            if seat == bc_seat:
+                agents.append(bc_wrapper)
+            elif args.opponent == "bc_checkpoint":
+                agents.append(
+                    _make_bc_agent_for_checkpoint(
+                        checkpoint=args.opponent_bc_checkpoint,
+                        device=args.device,
+                        geometry_horizon=args.geometry_horizon,
+                        debug=args.debug_game,
+                        player_id=seat,
+                    )
+                )
+            else:
+                agents.append(RecordingAgent(_make_opponent_for_seat(args), player_id=seat))
         env = make(args.environment, configuration=_configuration(args), debug=bool(args.debug_game))
         try:
             if hasattr(env, "seed"):
@@ -226,12 +271,13 @@ def run_suite(args: argparse.Namespace) -> dict[str, Any]:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Run real local Orbit Wars matches for the trained BC policy.")
-    ap.add_argument("--bc_checkpoint", default=str(DEFAULT_BC_CHECKPOINT), help="Checkpoint file or training run dir (default: ./checkpoint.pt).")
-    ap.add_argument("--opponent", choices=["random", "passive", "simple_expand", "heuristic_path"], default="heuristic_path")
+    ap.add_argument("--bc_checkpoint", default=str(DEFAULT_BC_CHECKPOINT), help="Primary BC checkpoint file or training run dir.")
+    ap.add_argument("--opponent", choices=["random", "passive", "simple_expand", "heuristic_path", "bc_checkpoint"], default="bc_checkpoint")
+    ap.add_argument("--opponent_bc_checkpoint", default=str(DEFAULT_OPPONENT_BC_CHECKPOINT), help="Opponent BC checkpoint used when --opponent bc_checkpoint.")
     ap.add_argument("--num_games", type=int, default=20)
-    ap.add_argument("--players", default="both", help="2, 4, or both (default: both).")
+    ap.add_argument("--players", default="2", help="2, 4, or both (default: 2).")
     ap.add_argument("--seed_start", type=int, default=0)
-    ap.add_argument("--out_dir", default="bc_eval_runs/checkpoint_vs_orbit_wars_base")
+    ap.add_argument("--out_dir", default="bc_eval_runs/full_bc_v1_best_vs_checkpoint")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--environment", default=DEFAULT_ENVIRONMENT)
     ap.add_argument("--episode_steps", type=int, default=DEFAULT_EPISODE_STEPS)

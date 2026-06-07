@@ -4,7 +4,7 @@ This project contains both pieces needed to prepare BC/RL-compatible Orbit Wars
 datasets:
 
 - `orbit_geometry_skeleton/`: deterministic game geometry and mechanics.
-- `orbit_training_prep/`: replay loading, label inference, dataset building, and validation.
+- `orbit_training_prep/`: replay loading, label inference, BC dataset building, and validation.
 
 The packages live side by side so the training pipeline can import the geometry
 skeleton directly. No separate checkout or hard-coded `PYTHONPATH` is required
@@ -32,7 +32,7 @@ between behavior cloning and PPO fine-tuning.
 - `orbit_geometry_skeleton/geometry_skeleton.py` - public geometry/mechanics interface.
 - `orbit_training_prep/replay_io.py` - Kaggle replay loader and normalized per-player step iterator.
 - `orbit_training_prep/target_inference.py` - maps raw `[from_planet_id, angle, ships]` moves to `(source_slot, inferred_target_slot, amount_bin)` labels using fast projected-angle geometry.
-- `orbit_training_prep/features.py` - stable planet/pair features for baseline checks.
+- `orbit_training_prep/features.py` - stable planet features for BC training.
 - `orbit_training_prep/dataset_builder.py` - builds all JSONL/NPZ datasets.
 - `orbit_training_prep/validate_dataset.py` - sanity report for label quality and trainability.
 - `TRAINING_CONTRACT.md` - exact model/training assumptions to keep IL and RL aligned.
@@ -76,28 +76,26 @@ python -m orbit_training_prep.validate_dataset `
 
 - `launch_rows.jsonl`: one row per actual replay launch. Used to debug action inference.
 - `source_turn_rows.jsonl`: primary BC dataset, one row per owned source per player step.
-- `pair_rank_rows.jsonl`: pairwise source-target candidate dataset for an MLP/ranker baseline.
 - `dense_bc_arrays.npz`: fixed-size arrays for direct neural training.
 - `metadata.json`: schema, action space, feature names, stats.
 - `validation_report.{json,md}`: quality checks.
 
 ## First training usage
 
-1. Train a pairwise MLP/ranker on `pair_rank_rows.jsonl` to verify labels.
-2. Train the entity policy on `dense_bc_arrays.npz` / `source_turn_rows.jsonl`.
-3. Decode model output through the geometry skeleton, not through learned angle prediction.
-4. Initialize PPO from the BC checkpoint.
+1. Train the entity policy on `dense_bc_arrays.npz` / `source_turn_rows.jsonl`.
+2. Decode model output through the geometry skeleton, not through learned angle prediction.
+3. Initialize PPO from the BC checkpoint.
 
 ## Training IO helpers
 
 `orbit_training_prep/training_io.py` provides framework-neutral loaders:
 
 ```python
-from orbit_training_prep.training_io import load_dense_bc_arrays, make_pair_rank_numpy
+from orbit_training_prep.training_io import load_dense_bc_arrays, load_source_turn_rows
 
 bc = load_dense_bc_arrays(r".\orbit_dataset_work\combined")
-rank = make_pair_rank_numpy(r".\orbit_dataset_work\combined")
+rows = load_source_turn_rows(r".\orbit_dataset_work\combined")
 ```
 
-Use these in JAX, PyTorch, LightGBM, or quick NumPy checks without changing the
-dataset schema.
+Use these in JAX, PyTorch, or quick NumPy checks without changing the dataset
+schema.
