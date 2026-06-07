@@ -13,6 +13,11 @@ from .eval_report import write_eval_report
 from .rollout_metrics import RolloutMetrics
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_BC_CHECKPOINT = PROJECT_ROOT / "checkpoint.pt"
+DEFAULT_HEURISTIC_PATH = PROJECT_ROOT / "orbit_wars_base.py"
+
+
 class RecordingAgent:
     def __init__(self, fn: Callable, *, player_id: int | None = None, is_bc: bool = False):
         self.fn = fn
@@ -111,9 +116,32 @@ def _bc_seat_for(game_index: int, players: int) -> int:
     return int(game_index % players)
 
 
+def _normalize_players(players: Any) -> int:
+    if isinstance(players, (list, tuple)):
+        if len(players) != 1:
+            raise RuntimeError("run_games expects exactly one player count; use run_suite for 2P+4P.")
+        players = players[0]
+    value = int(players)
+    if value not in (2, 4):
+        raise RuntimeError(f"Unsupported player count {players!r}; expected 2 or 4")
+    return value
+
+
+def _opponent_label(args: argparse.Namespace) -> str:
+    if args.opponent == "heuristic_path" and Path(args.heuristic_path).name == "orbit_wars_base.py":
+        return "orbit_wars_base"
+    return str(args.opponent)
+
+
+def _make_opponent_for_seat(args: argparse.Namespace) -> Callable:
+    # Stateful heuristic agents (orbit_wars_base.py) keep globals such as plans
+    # and step counters, so each opponent seat must get a fresh module instance.
+    return make_opponent(args.opponent, heuristic_path=args.heuristic_path)
+
+
 def run_games(args: argparse.Namespace) -> dict[str, Any]:
     make = _import_make()
-    opponent_fn = make_opponent(args.opponent, heuristic_path=args.heuristic_path)
+    players = _normalize_players(args.players)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     debug_dir = out_dir / "debug"
@@ -130,13 +158,13 @@ def run_games(args: argparse.Namespace) -> dict[str, Any]:
     notes: list[str] = []
     for game_index in range(int(args.num_games)):
         seed = int(args.seed_start) + game_index
-        bc_seat = _bc_seat_for(game_index, int(args.players))
+        bc_seat = _bc_seat_for(game_index, players)
         seats.append(bc_seat)
         bc_agent_runtime.reset_runtime_state()
         bc_wrapper = RecordingAgent(bc_agent_runtime.agent, player_id=bc_seat, is_bc=True)
         agents: list[Any] = []
-        for seat in range(int(args.players)):
-            agents.append(bc_wrapper if seat == bc_seat else RecordingAgent(opponent_fn, player_id=seat))
+        for seat in range(players):
+            agents.append(bc_wrapper if seat == bc_seat else RecordingAgent(_make_opponent_for_seat(args), player_id=seat))
         env = make(args.environment, configuration=_configuration(args), debug=bool(args.debug_game))
         try:
             if hasattr(env, "seed"):
@@ -145,7 +173,7 @@ def run_games(args: argparse.Namespace) -> dict[str, Any]:
             notes.append(f"Environment did not accept seed {seed}.")
         env.run(agents)
         rewards, statuses, final_obs = _final_state(env)
-        metrics = RolloutMetrics(game_id=f"game_{game_index:05d}", bc_player_id=bc_seat, players=args.players, opponent=args.opponent)
+        metrics = RolloutMetrics(game_id=f"game_{game_index:05d}", bc_player_id=bc_seat, players=players, opponent=_opponent_label(args))
         for record in bc_wrapper.records:
             metrics.record_observation(dict(record.get("obs", {}) or {}))
             metrics.record_step(
@@ -170,30 +198,53 @@ def run_games(args: argparse.Namespace) -> dict[str, Any]:
                 debug_payload["replay_error"] = f"{type(exc).__name__}: {exc}"
             with open(debug_dir / f"{row['game_id']}.json", "w", encoding="utf-8") as f:
                 json.dump(debug_payload, f, indent=2, sort_keys=True)
-    return write_eval_report(rows, out_dir=out_dir, opponent=args.opponent, players=args.players, bc_seats=seats, notes=notes)
+    return write_eval_report(rows, out_dir=out_dir, opponent=_opponent_label(args), players=players, bc_seats=seats, notes=notes)
+
+
+def _player_counts(value: str) -> list[int]:
+    key = str(value).lower()
+    if key in {"both", "all", "2,4", "2p,4p"}:
+        return [2, 4]
+    return [_normalize_players(key.removesuffix("p"))]
+
+
+def run_suite(args: argparse.Namespace) -> dict[str, Any]:
+    counts = _player_counts(args.players)
+    if len(counts) == 1:
+        single_args = argparse.Namespace(**vars(args))
+        single_args.players = counts[0]
+        return run_games(single_args)
+
+    summaries: dict[str, Any] = {}
+    for players in counts:
+        child_args = argparse.Namespace(**vars(args))
+        child_args.players = players
+        child_args.out_dir = str(Path(args.out_dir) / f"{players}p")
+        summaries[f"{players}p"] = run_games(child_args)
+    return {"runs": summaries, "players": counts, "opponent": _opponent_label(args), "bc_checkpoint": str(args.bc_checkpoint)}
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(description="Run local Orbit Wars matches for a trained BC policy.")
-    ap.add_argument("--bc_checkpoint", required=True)
-    ap.add_argument("--opponent", choices=["random", "passive", "simple_expand", "heuristic_path"], default="simple_expand")
+    ap = argparse.ArgumentParser(description="Run real local Orbit Wars matches for the trained BC policy.")
+    ap.add_argument("--bc_checkpoint", default=str(DEFAULT_BC_CHECKPOINT), help="Checkpoint file or training run dir (default: ./checkpoint.pt).")
+    ap.add_argument("--opponent", choices=["random", "passive", "simple_expand", "heuristic_path"], default="heuristic_path")
     ap.add_argument("--num_games", type=int, default=20)
-    ap.add_argument("--players", type=int, choices=[2, 4], default=4)
+    ap.add_argument("--players", default="both", help="2, 4, or both (default: both).")
     ap.add_argument("--seed_start", type=int, default=0)
-    ap.add_argument("--out_dir", required=True)
+    ap.add_argument("--out_dir", default="bc_eval_runs/checkpoint_vs_orbit_wars_base")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--environment", default=DEFAULT_ENVIRONMENT)
     ap.add_argument("--episode_steps", type=int, default=DEFAULT_EPISODE_STEPS)
     ap.add_argument("--act_timeout", type=float, default=DEFAULT_ACT_TIMEOUT)
     ap.add_argument("--geometry_horizon", type=int, default=DEFAULT_GEOMETRY_HORIZON)
-    ap.add_argument("--heuristic_path")
+    ap.add_argument("--heuristic_path", default=str(DEFAULT_HEURISTIC_PATH), help="Heuristic opponent module (default: ./orbit_wars_base.py).")
     ap.add_argument("--debug_game", action="store_true")
     return ap
 
 
 def main() -> None:
     args = build_arg_parser().parse_args()
-    summary = run_games(args)
+    summary = run_suite(args)
     print(json.dumps(summary, indent=2, sort_keys=True))
 
 
