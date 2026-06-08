@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 import shutil
+import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
@@ -107,10 +108,60 @@ class DatasetBuilder:
         self.inferer = TargetInferer(horizon=horizon, device=device, batch_size=batch_size)
         self.device = self.inferer.device
 
-    def _count_dense_states(self, replay_paths: list[Path]) -> int:
+    def _load_replay_or_none(self, replay_path: Path, *, invalid_json_paths: set[str], unreadable_paths: set[str]) -> dict[str, Any] | None:
+        try:
+            return load_replay(replay_path)
+        except json.JSONDecodeError as exc:
+            path_str = str(replay_path)
+            if path_str not in invalid_json_paths:
+                invalid_json_paths.add(path_str)
+                print(
+                    json.dumps(
+                        {
+                            "warning": "Skipping replay with invalid JSON",
+                            "replay_path": path_str,
+                            "error": str(exc),
+                        },
+                        sort_keys=True,
+                    ),
+                    file=sys.stderr,
+                )
+            return None
+        except OSError as exc:
+            path_str = str(replay_path)
+            if path_str not in unreadable_paths:
+                unreadable_paths.add(path_str)
+                print(
+                    json.dumps(
+                        {
+                            "warning": "Skipping unreadable replay file",
+                            "replay_path": path_str,
+                            "error": str(exc),
+                        },
+                        sort_keys=True,
+                    ),
+                    file=sys.stderr,
+                )
+            return None
+
+    def _count_dense_states(
+        self,
+        replay_paths: list[Path],
+        *,
+        invalid_json_paths: set[str],
+        unreadable_paths: set[str],
+    ) -> tuple[int, list[Path]]:
         count = 0
+        valid_paths: list[Path] = []
         for replay_path in replay_paths:
-            replay = load_replay(replay_path)
+            replay = self._load_replay_or_none(
+                replay_path,
+                invalid_json_paths=invalid_json_paths,
+                unreadable_paths=unreadable_paths,
+            )
+            if replay is None:
+                continue
+            valid_paths.append(replay_path)
             for sample in iter_player_steps(replay):
                 final_reward = float(sample["final_reward"])
                 if not self.include_loser_actions and final_reward <= 0:
@@ -120,14 +171,20 @@ class DatasetBuilder:
                 if not owned_slots and not action:
                     continue
                 count += 1
-        return count
+        return count, valid_paths
 
     def build_from_replay(self, replay_path: str | Path, out_dir: str | Path) -> dict[str, Any]:
         replay_input = Path(replay_path)
         replay_paths = resolve_replay_paths(replay_input, self.max_replay_files)
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
-        dense_state_count = self._count_dense_states(replay_paths)
+        invalid_json_paths: set[str] = set()
+        unreadable_paths: set[str] = set()
+        dense_state_count, valid_replay_paths = self._count_dense_states(
+            replay_paths,
+            invalid_json_paths=invalid_json_paths,
+            unreadable_paths=unreadable_paths,
+        )
         dense_tmp_dir = out_dir / ".dense_bc_arrays_tmp"
         if dense_tmp_dir.exists():
             shutil.rmtree(dense_tmp_dir)
@@ -193,8 +250,14 @@ class DatasetBuilder:
                 JsonlWriter(out_dir / "source_turn_rows.jsonl") as source_turn_rows,
                 JsonlWriter(out_dir / "state_rows.jsonl") as state_rows,
             ):
-                for replay_path in replay_paths:
-                    replay = load_replay(replay_path)
+                for replay_path in valid_replay_paths:
+                    replay = self._load_replay_or_none(
+                        replay_path,
+                        invalid_json_paths=invalid_json_paths,
+                        unreadable_paths=unreadable_paths,
+                    )
+                    if replay is None:
+                        continue
                     for sample in iter_player_steps(replay):
                         obs = sample["obs"]
                         player_id = int(sample["player_id"])
@@ -357,7 +420,8 @@ class DatasetBuilder:
             shutil.rmtree(dense_tmp_dir, ignore_errors=True)
         metadata = {
             "replay_path": str(replay_input),
-            "replay_paths": [str(p) for p in replay_paths],
+            "replay_paths": [str(p) for p in valid_replay_paths],
+            "replay_paths_requested": [str(p) for p in replay_paths],
             "action_space": ActionSpaceSpec().as_dict(),
             "geometry_horizon": self.horizon,
             "device": self.device,
@@ -380,6 +444,14 @@ class DatasetBuilder:
             "target_state_feature_names_v2": TARGET_STATE_FEATURE_NAMES_V2,
             "pair_feature_names_v2": PAIR_FEATURE_NAMES_V2,
             "stats": dict(stats),
+            "input_replay_files": {
+                "requested": len(replay_paths),
+                "used": len(valid_replay_paths),
+                "skipped_invalid_json": len(invalid_json_paths),
+                "skipped_unreadable": len(unreadable_paths),
+                "skipped_invalid_json_paths": sorted(invalid_json_paths),
+                "skipped_unreadable_paths": sorted(unreadable_paths),
+            },
             "target_inference_methods": dict(inference_methods),
             "amount_bin_counts": {AMOUNT_BIN_NAMES[int(k)]: int(v) for k, v in amount_bins.items() if int(k) < len(AMOUNT_BIN_NAMES)},
         }
