@@ -3,9 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import multiprocessing as mp
 import shutil
 import sys
 from collections import Counter, defaultdict
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -89,6 +91,26 @@ class JsonlWriter:
         self.close()
 
 
+def _build_single_replay_shard(
+    replay_path: str,
+    out_dir: str,
+    *,
+    horizon: int,
+    device: str,
+    batch_size: int | None,
+    include_loser_actions: bool,
+) -> dict[str, Any]:
+    builder = DatasetBuilder(
+        horizon=horizon,
+        device=device,
+        batch_size=batch_size,
+        include_loser_actions=include_loser_actions,
+        max_replay_files=1,
+        workers=1,
+    )
+    return builder.build_from_replay(replay_path, out_dir)
+
+
 class DatasetBuilder:
     def __init__(
         self,
@@ -98,13 +120,17 @@ class DatasetBuilder:
         batch_size: int | None = 256,
         include_loser_actions: bool = True,
         max_replay_files: int | None = None,
+        workers: int = 1,
     ):
         self.horizon = int(horizon)
         if batch_size is not None and int(batch_size) < 1:
             raise ValueError("batch_size must be at least 1")
+        if int(workers) < 1:
+            raise ValueError("workers must be at least 1")
         self.batch_size = None if batch_size is None else int(batch_size)
         self.include_loser_actions = bool(include_loser_actions)
         self.max_replay_files = None if max_replay_files is None else int(max_replay_files)
+        self.workers = int(workers)
         self.inferer = TargetInferer(horizon=horizon, device=device, batch_size=batch_size)
         self.device = self.inferer.device
 
@@ -173,11 +199,269 @@ class DatasetBuilder:
                 count += 1
         return count, valid_paths
 
+    def _concat_jsonl_files(self, out_path: Path, input_paths: list[Path]) -> None:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "w", encoding="utf-8") as out_f:
+            for input_path in input_paths:
+                if not input_path.exists():
+                    continue
+                with open(input_path, "r", encoding="utf-8") as in_f:
+                    shutil.copyfileobj(in_f, out_f)
+
+    def _merge_dense_arrays_from_shards(
+        self,
+        *,
+        shard_dirs: list[Path],
+        shard_state_counts: list[int],
+        out_dir: Path,
+        dense_state_count: int,
+    ) -> None:
+        dense_tmp_dir = out_dir / ".dense_bc_arrays_tmp"
+        if dense_tmp_dir.exists():
+            shutil.rmtree(dense_tmp_dir)
+        dense_tmp_dir.mkdir(parents=True, exist_ok=True)
+
+        dense_planet_features = None
+        dense_planet_features_v2 = None
+        dense_global_features_v2 = None
+        dense_target_state_features_v2 = None
+        dense_source_labels = None
+        dense_amount_labels = None
+        dense_source_mask = None
+        dense_index = 0
+        try:
+            if dense_state_count:
+                dense_planet_features = np.lib.format.open_memmap(
+                    dense_tmp_dir / "planet_features.npy",
+                    mode="w+",
+                    dtype=np.float32,
+                    shape=(dense_state_count, P_MAX, len(PLANET_FEATURE_NAMES)),
+                )
+                dense_planet_features_v2 = np.lib.format.open_memmap(
+                    dense_tmp_dir / "planet_features_v2.npy",
+                    mode="w+",
+                    dtype=np.float32,
+                    shape=(dense_state_count, P_MAX, len(PLANET_FEATURE_NAMES_V2)),
+                )
+                dense_global_features_v2 = np.lib.format.open_memmap(
+                    dense_tmp_dir / "global_features_v2.npy",
+                    mode="w+",
+                    dtype=np.float32,
+                    shape=(dense_state_count, len(GLOBAL_FEATURE_NAMES_V2)),
+                )
+                dense_target_state_features_v2 = np.lib.format.open_memmap(
+                    dense_tmp_dir / "target_state_features_v2.npy",
+                    mode="w+",
+                    dtype=np.float32,
+                    shape=(dense_state_count, P_MAX, len(TARGET_STATE_FEATURE_NAMES_V2)),
+                )
+                dense_source_labels = np.lib.format.open_memmap(
+                    dense_tmp_dir / "target_labels.npy",
+                    mode="w+",
+                    dtype=np.int64,
+                    shape=(dense_state_count, P_MAX),
+                )
+                dense_amount_labels = np.lib.format.open_memmap(
+                    dense_tmp_dir / "amount_labels.npy",
+                    mode="w+",
+                    dtype=np.int64,
+                    shape=(dense_state_count, P_MAX),
+                )
+                dense_source_mask = np.lib.format.open_memmap(
+                    dense_tmp_dir / "source_mask.npy",
+                    mode="w+",
+                    dtype=np.float32,
+                    shape=(dense_state_count, P_MAX),
+                )
+
+                for shard_dir, shard_state_count in zip(shard_dirs, shard_state_counts, strict=True):
+                    if int(shard_state_count) <= 0:
+                        continue
+                    shard_dense = shard_dir / "dense_bc_arrays.npz"
+                    if not shard_dense.exists():
+                        raise RuntimeError(f"Expected dense shard file is missing: {shard_dense}")
+                    with np.load(shard_dense, mmap_mode="r", allow_pickle=False) as shard:
+                        shard_n = int(shard["planet_features"].shape[0])
+                        if shard_n != int(shard_state_count):
+                            raise RuntimeError(
+                                f"Dense shard row count mismatch for {shard_dense}: expected {int(shard_state_count)}, got {shard_n}"
+                            )
+                        end = dense_index + shard_n
+                        dense_planet_features[dense_index:end] = shard["planet_features"]
+                        dense_planet_features_v2[dense_index:end] = shard["planet_features_v2"]
+                        dense_global_features_v2[dense_index:end] = shard["global_features_v2"]
+                        dense_target_state_features_v2[dense_index:end] = shard["target_state_features_v2"]
+                        dense_source_labels[dense_index:end] = shard["target_labels"]
+                        dense_amount_labels[dense_index:end] = shard["amount_labels"]
+                        dense_source_mask[dense_index:end] = shard["source_mask"]
+                        dense_index = end
+
+                if dense_index != dense_state_count:
+                    raise RuntimeError(
+                        f"Dense row count changed while merging worker shards: expected {dense_state_count}, wrote {dense_index}"
+                    )
+
+                dense_planet_features.flush()
+                dense_planet_features_v2.flush()
+                dense_global_features_v2.flush()
+                dense_target_state_features_v2.flush()
+                dense_source_labels.flush()
+                dense_amount_labels.flush()
+                dense_source_mask.flush()
+                np.savez(
+                    out_dir / "dense_bc_arrays.npz",
+                    planet_features=np.load(dense_tmp_dir / "planet_features.npy", mmap_mode="r"),
+                    planet_features_v2=np.load(dense_tmp_dir / "planet_features_v2.npy", mmap_mode="r"),
+                    global_features_v2=np.load(dense_tmp_dir / "global_features_v2.npy", mmap_mode="r"),
+                    target_state_features_v2=np.load(dense_tmp_dir / "target_state_features_v2.npy", mmap_mode="r"),
+                    target_labels=np.load(dense_tmp_dir / "target_labels.npy", mmap_mode="r"),
+                    amount_labels=np.load(dense_tmp_dir / "amount_labels.npy", mmap_mode="r"),
+                    source_mask=np.load(dense_tmp_dir / "source_mask.npy", mmap_mode="r"),
+                    planet_feature_names=np.asarray(PLANET_FEATURE_NAMES),
+                    planet_feature_names_v2=np.asarray(PLANET_FEATURE_NAMES_V2),
+                    global_feature_names_v2=np.asarray(GLOBAL_FEATURE_NAMES_V2),
+                    target_state_feature_names_v2=np.asarray(TARGET_STATE_FEATURE_NAMES_V2),
+                    pair_feature_names_v2=np.asarray(PAIR_FEATURE_NAMES_V2),
+                    feature_version=np.asarray("v2"),
+                )
+        finally:
+            shutil.rmtree(dense_tmp_dir, ignore_errors=True)
+
+    def _build_from_replay_parallel(self, replay_input: Path, replay_paths: list[Path], out_dir: Path) -> dict[str, Any]:
+        shard_root = out_dir / ".dataset_builder_worker_shards"
+        if shard_root.exists():
+            shutil.rmtree(shard_root)
+        shard_root.mkdir(parents=True, exist_ok=True)
+
+        worker_count = min(int(self.workers), len(replay_paths))
+        shard_dirs = [shard_root / f"shard_{i:06d}" for i in range(len(replay_paths))]
+        shard_metas: list[dict[str, Any]] = [dict() for _ in replay_paths]
+        try:
+            with ProcessPoolExecutor(max_workers=worker_count, mp_context=mp.get_context("spawn")) as pool:
+                futures = [
+                    pool.submit(
+                        _build_single_replay_shard,
+                        str(replay_path),
+                        str(shard_dirs[i]),
+                        horizon=self.horizon,
+                        device=self.device,
+                        batch_size=self.batch_size,
+                        include_loser_actions=self.include_loser_actions,
+                    )
+                    for i, replay_path in enumerate(replay_paths)
+                ]
+                for i, future in enumerate(futures):
+                    replay_path = replay_paths[i]
+                    try:
+                        shard_metas[i] = future.result()
+                    except Exception as exc:  # pragma: no cover - exercised in integration runs
+                        raise RuntimeError(f"Worker failed while processing replay: {replay_path}") from exc
+
+            self._concat_jsonl_files(out_dir / "launch_rows.jsonl", [d / "launch_rows.jsonl" for d in shard_dirs])
+            self._concat_jsonl_files(out_dir / "source_turn_rows.jsonl", [d / "source_turn_rows.jsonl" for d in shard_dirs])
+            self._concat_jsonl_files(out_dir / "state_rows.jsonl", [d / "state_rows.jsonl" for d in shard_dirs])
+
+            stats = Counter()
+            inference_methods = Counter()
+            amount_bin_counts = Counter()
+            invalid_json_paths: set[str] = set()
+            unreadable_paths: set[str] = set()
+            valid_replay_paths: list[Path] = []
+            shard_state_counts: list[int] = []
+
+            for replay_path, shard_meta in zip(replay_paths, shard_metas, strict=True):
+                if not shard_meta:
+                    continue
+                used = int(shard_meta.get("input_replay_files", {}).get("used", 0))
+                if used > 0:
+                    valid_replay_paths.append(replay_path)
+                mstats = shard_meta.get("stats", {})
+                shard_state_count = int(mstats.get("states", 0) or 0)
+                shard_state_counts.append(shard_state_count)
+                for key, value in mstats.items():
+                    if key == "max_raw_launch_batch_size":
+                        stats[key] = max(int(stats.get(key, 0) or 0), int(value or 0))
+                    else:
+                        stats[key] += int(value or 0)
+                for method, value in shard_meta.get("target_inference_methods", {}).items():
+                    inference_methods[str(method)] += int(value or 0)
+                for name, value in shard_meta.get("amount_bin_counts", {}).items():
+                    amount_bin_counts[str(name)] += int(value or 0)
+                input_meta = shard_meta.get("input_replay_files", {})
+                invalid_json_paths.update(str(p) for p in input_meta.get("skipped_invalid_json_paths", []) if p)
+                unreadable_paths.update(str(p) for p in input_meta.get("skipped_unreadable_paths", []) if p)
+
+            dense_state_count = int(stats.get("states", 0) or 0)
+            self._merge_dense_arrays_from_shards(
+                shard_dirs=shard_dirs,
+                shard_state_counts=shard_state_counts,
+                out_dir=out_dir,
+                dense_state_count=dense_state_count,
+            )
+
+            metadata = {
+                "replay_path": str(replay_input),
+                "replay_paths": [str(p) for p in valid_replay_paths],
+                "replay_paths_requested": [str(p) for p in replay_paths],
+                "action_space": ActionSpaceSpec().as_dict(),
+                "geometry_horizon": self.horizon,
+                "device": self.device,
+                "geometry_device": self.device,
+                "inference_batch_size": self.batch_size,
+                "target_inference_mode": "batched_exact_first_hit_with_angular_fallback",
+                "replay_action_alignment": "action at replay index t is paired with observation at replay index t-1",
+                "include_loser_actions": self.include_loser_actions,
+                "max_replay_files": self.max_replay_files,
+                "files": {
+                    "launch_rows": "launch_rows.jsonl",
+                    "source_turn_rows": "source_turn_rows.jsonl",
+                    "state_rows": "state_rows.jsonl",
+                    "dense_bc_arrays": "dense_bc_arrays.npz",
+                },
+                "planet_feature_names": PLANET_FEATURE_NAMES,
+                "feature_version": "v2",
+                "planet_feature_names_v2": PLANET_FEATURE_NAMES_V2,
+                "global_feature_names_v2": GLOBAL_FEATURE_NAMES_V2,
+                "target_state_feature_names_v2": TARGET_STATE_FEATURE_NAMES_V2,
+                "pair_feature_names_v2": PAIR_FEATURE_NAMES_V2,
+                "stats": dict(stats),
+                "input_replay_files": {
+                    "requested": len(replay_paths),
+                    "used": len(valid_replay_paths),
+                    "skipped_invalid_json": len(invalid_json_paths),
+                    "skipped_unreadable": len(unreadable_paths),
+                    "skipped_invalid_json_paths": sorted(invalid_json_paths),
+                    "skipped_unreadable_paths": sorted(unreadable_paths),
+                },
+                "target_inference_methods": dict(inference_methods),
+                "amount_bin_counts": {str(k): int(v) for k, v in amount_bin_counts.items()},
+            }
+            with open(out_dir / "metadata.json", "w", encoding="utf-8") as f:
+                json.dump(metadata, f, indent=2, sort_keys=True)
+            return metadata
+        finally:
+            shutil.rmtree(shard_root, ignore_errors=True)
+
     def build_from_replay(self, replay_path: str | Path, out_dir: str | Path) -> dict[str, Any]:
         replay_input = Path(replay_path)
         replay_paths = resolve_replay_paths(replay_input, self.max_replay_files)
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
+        if self.workers > 1 and len(replay_paths) > 1:
+            if str(self.device).lower().startswith("cuda"):
+                print(
+                    json.dumps(
+                        {
+                            "warning": "workers>1 is disabled for CUDA target inference to avoid spawning multiple GPU contexts; falling back to serial build",
+                            "workers": int(self.workers),
+                            "device": str(self.device),
+                        },
+                        sort_keys=True,
+                    ),
+                    file=sys.stderr,
+                )
+            else:
+                return self._build_from_replay_parallel(replay_input, replay_paths, out_dir)
         invalid_json_paths: set[str] = set()
         unreadable_paths: set[str] = set()
         dense_state_count, valid_replay_paths = self._count_dense_states(
@@ -469,6 +753,7 @@ def main() -> None:
     ap.add_argument("--batch-size", type=int, default=256, help="Maximum number of valid launches to exact-simulate per GPU/CPU batch.")
     ap.add_argument("--winner-only", action="store_true")
     ap.add_argument("--max-files", type=int, default=None, help="Maximum number of replay files to include from a replay directory.")
+    ap.add_argument("--workers", type=int, default=6, help="Number of replay files to process in parallel (CPU mode only).")
     args = ap.parse_args()
     builder = DatasetBuilder(
         horizon=args.horizon,
@@ -476,6 +761,7 @@ def main() -> None:
         batch_size=args.batch_size,
         include_loser_actions=not args.winner_only,
         max_replay_files=args.max_files,
+        workers=args.workers,
     )
     meta = builder.build_from_replay(args.replay, args.out_dir)
     print(json.dumps({"out_dir": args.out_dir, "stats": meta["stats"], "target_inference_methods": meta["target_inference_methods"]}, indent=2, sort_keys=True))

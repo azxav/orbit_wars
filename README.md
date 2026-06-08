@@ -59,11 +59,14 @@ Put replay JSON files in `replays/` under this project folder, then run:
 python -m orbit_training_prep.dataset_builder `
   --replay .\replays `
   --out-dir .\orbit_dataset_work\combined `
-  --horizon 160
+  --horizon 160 `
+  --workers 8
 ```
 
 `--replay` can also point to one replay JSON file if you want to build a dataset
-from a single episode.
+from a single episode. `--workers` parallelizes by replay file on CPU. If
+`--device cuda...` is selected, the builder automatically falls back to serial
+execution to avoid multi-process GPU contention.
 
 ## Validate
 
