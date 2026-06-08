@@ -62,27 +62,16 @@ class PPOPolicy(nn.Module):
         planet_tokens = self.bc.planet_encoder(planets)
         global_token = self.bc.global_encoder(global_features).unsqueeze(1)
         encoded = self.bc.encoder(torch.cat([global_token, planet_tokens], dim=1))
-        return encoded[:, 0], encoded[:, 1 : pmax + 1], planets
+        planet_ctx = encoded[:, 1 : pmax + 1]
+        target_state_features = batch.get("target_state_features")
+        if getattr(self.bc, "target_state_encoder", None) is not None and target_state_features is not None and target_state_features.shape[-1] > 0:
+            planet_ctx = planet_ctx + self.bc.target_state_encoder(target_state_features.to(planets.dtype))
+        return encoded[:, 0], planet_ctx, planets
 
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        global_ctx, planet_ctx, planets = self._encode(batch)
-        bsz, pmax, _ = planets.shape
-        source_idx = batch["source_slot"].clamp(0, pmax - 1)
-        source_ctx = planet_ctx[torch.arange(bsz, device=planets.device), source_idx]
-        source_expanded = source_ctx.unsqueeze(1).expand(-1, pmax, -1)
-        target_logits = self.bc.target_pair(torch.cat([source_expanded, planet_ctx], dim=-1)).squeeze(-1)
-        noop_logit = self.bc.noop_head(source_ctx)
-        target_logits = torch.cat([target_logits, noop_logit], dim=1)
-        teacher_target = batch.get("target_label")
-        if teacher_target is None:
-            mask = batch.get("target_mask")
-            teacher_target = masked_argmax(target_logits, mask) if mask is not None else target_logits.argmax(dim=1)
-        target_idx = teacher_target.clamp(0, pmax - 1)
-        target_ctx = planet_ctx[torch.arange(bsz, device=planets.device), target_idx]
-        noop_ctx = self.bc.noop_target_context.unsqueeze(0).expand(bsz, -1)
-        target_ctx = torch.where((teacher_target == self.config.noop_target_slot).unsqueeze(1), noop_ctx, target_ctx)
-        amount_logits = self.bc.amount_head(torch.cat([source_ctx, target_ctx], dim=1))
-        return {"target_logits": target_logits, "amount_logits": amount_logits, "value": self.value_head(global_ctx)}
+        global_ctx, _, _ = self._encode(batch)
+        out = self.bc(batch)
+        return {"target_logits": out["target_logits"], "amount_logits": out["amount_logits"], "value": self.value_head(global_ctx)}
 
     def evaluate_actions(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         out = self.forward(batch)
@@ -182,6 +171,8 @@ class PPOPolicy(nn.Module):
                 DecisionRecord(
                     planet_features=batch["planet_features"][0].detach().cpu(),
                     global_features=batch["global_features"][0].detach().cpu(),
+                    target_state_features=batch["target_state_features"][0].detach().cpu(),
+                    pair_features=batch["pair_features"][0].detach().cpu(),
                     source_slot=int(source_slot),
                     target_action=int(target),
                     amount_action=int(amount),

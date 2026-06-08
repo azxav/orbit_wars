@@ -8,6 +8,12 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from orbit_training_prep.features import (
+    GLOBAL_FEATURE_NAMES_V2,
+    PAIR_FEATURE_NAMES_V2,
+    TARGET_STATE_FEATURE_NAMES_V2,
+    pair_features_from_dense_v2,
+)
 from orbit_training_prep.schema import NOOP_TARGET_SLOT, P_MAX
 
 
@@ -63,13 +69,25 @@ class OrbitBCDataset(Dataset):
         self._dense: dict[str, np.ndarray] | None = None
         self._obs_uid_to_dense: dict[str, int] = {}
         self.planet_feature_dim = 13
+        self.global_feature_dim = 5
+        self.target_state_feature_dim = 0
+        self.pair_feature_dim = 0
+        self.feature_version = "v1"
         if dense_path is not None:
             loaded = np.load(dense_path, allow_pickle=True)
             self._dense = {k: loaded[k] for k in loaded.files}
-            self.planet_feature_dim = int(self._dense["planet_features"].shape[-1])
+            if "planet_features_v2" in self._dense:
+                self.feature_version = "v2"
+                self.planet_feature_dim = int(self._dense["planet_features_v2"].shape[-1])
+                self.global_feature_dim = int(self._dense.get("global_features_v2", np.zeros((1, len(GLOBAL_FEATURE_NAMES_V2)))).shape[-1])
+                self.target_state_feature_dim = int(
+                    self._dense.get("target_state_features_v2", np.zeros((1, P_MAX, len(TARGET_STATE_FEATURE_NAMES_V2)))).shape[-1]
+                )
+                self.pair_feature_dim = len(PAIR_FEATURE_NAMES_V2)
+            elif "planet_features" in self._dense:
+                self.planet_feature_dim = int(self._dense["planet_features"].shape[-1])
             if state_rows:
                 self._obs_uid_to_dense = {str(r["obs_uid"]): i for i, r in enumerate(state_rows)}
-        self.global_feature_dim = 5
 
     def _load_rows(self) -> list[dict[str, Any]]:
         rows = _read_jsonl(self.dataset_dir / "source_turn_rows.jsonl")
@@ -100,8 +118,40 @@ class OrbitBCDataset(Dataset):
     def _planet_features(self, row: dict[str, Any]) -> np.ndarray:
         idx = self._dense_index(row)
         if self._dense is not None and idx is not None:
+            if self.feature_version == "v2" and "planet_features_v2" in self._dense:
+                return np.asarray(self._dense["planet_features_v2"][idx], dtype=np.float32)
             return np.asarray(self._dense["planet_features"][idx], dtype=np.float32)
         return np.zeros((P_MAX, self.planet_feature_dim), dtype=np.float32)
+
+    def _global_features(self, row: dict[str, Any]) -> np.ndarray:
+        idx = self._dense_index(row)
+        if self._dense is not None and idx is not None and self.feature_version == "v2" and "global_features_v2" in self._dense:
+            return np.asarray(self._dense["global_features_v2"][idx], dtype=np.float32)
+        step = int(row.get("step_index", row.get("step", row.get("obs_step", 0))) or 0)
+        if self.feature_version == "v2":
+            out = np.zeros(len(GLOBAL_FEATURE_NAMES_V2), dtype=np.float32)
+            out[0] = step / 500.0
+            out[1] = 1.0 - out[0]
+            out[2] = float(row.get("player_id", 0)) / 4.0
+            out[3] = 0.5
+            out[4] = 1.0
+            return out
+        return np.asarray(
+            [
+                step / 500.0,
+                float(row.get("player_id", 0)) / 4.0,
+                float(row.get("source_slot", 0)) / float(P_MAX),
+                0.0,
+                0.0,
+            ],
+            dtype=np.float32,
+        )
+
+    def _target_state_features(self, row: dict[str, Any]) -> np.ndarray:
+        idx = self._dense_index(row)
+        if self._dense is not None and idx is not None and self.feature_version == "v2" and "target_state_features_v2" in self._dense:
+            return np.asarray(self._dense["target_state_features_v2"][idx], dtype=np.float32)
+        return np.zeros((P_MAX, self.target_state_feature_dim), dtype=np.float32)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         row = self.rows[idx]
@@ -112,6 +162,12 @@ class OrbitBCDataset(Dataset):
         if is_noop:
             amount_label = 0
         planet_features = self._planet_features(row)
+        target_state_features = self._target_state_features(row)
+        pair_features = (
+            pair_features_from_dense_v2(planet_features, target_state_features, source_slot)
+            if self.feature_version == "v2"
+            else np.zeros((P_MAX + 1, 0), dtype=np.float32)
+        )
         alive = planet_features[:, 0] > 0.0 if planet_features.size else np.ones(P_MAX, dtype=bool)
         target_mask = np.zeros(P_MAX + 1, dtype=bool)
         target_mask[:P_MAX] = alive
@@ -127,21 +183,13 @@ class OrbitBCDataset(Dataset):
         else:
             amount_mask[0] = False
         step = int(row.get("step_index", row.get("step", row.get("obs_step", 0))) or 0)
-        final_reward = float(row.get("final_reward", 0.0) or 0.0)
-        global_features = np.asarray(
-            [
-                step / 500.0,
-                float(row.get("player_id", 0)) / 4.0,
-                source_slot / float(P_MAX),
-                final_reward,
-                1.0 if final_reward > 0 else 0.0,
-            ],
-            dtype=np.float32,
-        )
+        global_features = self._global_features(row)
         return {
             "planet_features": planet_features,
             "fleet_features": np.zeros((0, 0), dtype=np.float32),
             "global_features": global_features,
+            "target_state_features": target_state_features,
+            "pair_features": pair_features,
             "source_slot": np.int64(source_slot),
             "target_label": np.int64(target_label),
             "amount_label": np.int64(amount_label),
@@ -151,6 +199,7 @@ class OrbitBCDataset(Dataset):
             "is_noop": bool(is_noop),
             "episode_id": str(row.get("episode_id", "")),
             "step": np.int64(step),
+            "feature_version": self.feature_version,
         }
 
 
@@ -158,6 +207,8 @@ def collate_bc_samples(samples: list[dict[str, Any]]) -> dict[str, Any]:
     tensor_keys = {
         "planet_features": torch.float32,
         "global_features": torch.float32,
+        "target_state_features": torch.float32,
+        "pair_features": torch.float32,
         "source_slot": torch.long,
         "target_label": torch.long,
         "amount_label": torch.long,
@@ -171,4 +222,5 @@ def collate_bc_samples(samples: list[dict[str, Any]]) -> dict[str, Any]:
     for key, dtype in tensor_keys.items():
         batch[key] = torch.as_tensor(np.stack([s[key] for s in samples]), dtype=dtype)
     batch["episode_id"] = [s["episode_id"] for s in samples]
+    batch["feature_version"] = samples[0].get("feature_version", "v1")
     return batch

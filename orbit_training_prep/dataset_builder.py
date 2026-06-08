@@ -10,7 +10,15 @@ from typing import Any
 
 import numpy as np
 
-from .features import PLANET_FEATURE_NAMES, all_planet_features
+from .features import (
+    GLOBAL_FEATURE_NAMES_V2,
+    PAIR_FEATURE_NAMES_V2,
+    PLANET_FEATURE_NAMES,
+    PLANET_FEATURE_NAMES_V2,
+    TARGET_STATE_FEATURE_NAMES_V2,
+    all_planet_features,
+    build_feature_state_v2,
+)
 from .replay_io import iter_actual_launches, iter_player_steps, load_replay
 from .schema import (
     AMOUNT_BIN_NAMES,
@@ -125,6 +133,9 @@ class DatasetBuilder:
             shutil.rmtree(dense_tmp_dir)
         dense_tmp_dir.mkdir(parents=True, exist_ok=True)
         dense_planet_features = None
+        dense_planet_features_v2 = None
+        dense_global_features_v2 = None
+        dense_target_state_features_v2 = None
         dense_source_labels = None
         dense_amount_labels = None
         dense_source_mask = None
@@ -134,6 +145,24 @@ class DatasetBuilder:
                 mode="w+",
                 dtype=np.float32,
                 shape=(dense_state_count, P_MAX, len(PLANET_FEATURE_NAMES)),
+            )
+            dense_planet_features_v2 = np.lib.format.open_memmap(
+                dense_tmp_dir / "planet_features_v2.npy",
+                mode="w+",
+                dtype=np.float32,
+                shape=(dense_state_count, P_MAX, len(PLANET_FEATURE_NAMES_V2)),
+            )
+            dense_global_features_v2 = np.lib.format.open_memmap(
+                dense_tmp_dir / "global_features_v2.npy",
+                mode="w+",
+                dtype=np.float32,
+                shape=(dense_state_count, len(GLOBAL_FEATURE_NAMES_V2)),
+            )
+            dense_target_state_features_v2 = np.lib.format.open_memmap(
+                dense_tmp_dir / "target_state_features_v2.npy",
+                mode="w+",
+                dtype=np.float32,
+                shape=(dense_state_count, P_MAX, len(TARGET_STATE_FEATURE_NAMES_V2)),
             )
             dense_source_labels = np.lib.format.open_memmap(
                 dense_tmp_dir / "target_labels.npy",
@@ -178,6 +207,7 @@ class DatasetBuilder:
                             continue
                         obs_uid = f"{sample['episode_id']}:{sample['step_index']}:p{player_id}"
                         pfeat = all_planet_features(obs, player_id, P_MAX)
+                        feature_state_v2 = build_feature_state_v2(obs, player_id, P_MAX)
                         source_labels = [NOOP_TARGET_SLOT] * P_MAX
                         amount_labels = [0] * P_MAX
                         source_mask = [1.0 if s in owned_slots else 0.0 for s in range(P_MAX)]
@@ -289,6 +319,9 @@ class DatasetBuilder:
 
                         if dense_planet_features is not None:
                             dense_planet_features[dense_index] = np.asarray(pfeat, dtype=np.float32)
+                            dense_planet_features_v2[dense_index] = feature_state_v2.planet_features
+                            dense_global_features_v2[dense_index] = feature_state_v2.global_features
+                            dense_target_state_features_v2[dense_index] = feature_state_v2.target_state_features
                             dense_source_labels[dense_index] = np.asarray(source_labels, dtype=np.int64)
                             dense_amount_labels[dense_index] = np.asarray(amount_labels, dtype=np.int64)
                             dense_source_mask[dense_index] = np.asarray(source_mask, dtype=np.float32)
@@ -298,16 +331,27 @@ class DatasetBuilder:
 
             if dense_planet_features is not None:
                 dense_planet_features.flush()
+                dense_planet_features_v2.flush()
+                dense_global_features_v2.flush()
+                dense_target_state_features_v2.flush()
                 dense_source_labels.flush()
                 dense_amount_labels.flush()
                 dense_source_mask.flush()
                 np.savez(
                     out_dir / "dense_bc_arrays.npz",
                     planet_features=np.load(dense_tmp_dir / "planet_features.npy", mmap_mode="r"),
+                    planet_features_v2=np.load(dense_tmp_dir / "planet_features_v2.npy", mmap_mode="r"),
+                    global_features_v2=np.load(dense_tmp_dir / "global_features_v2.npy", mmap_mode="r"),
+                    target_state_features_v2=np.load(dense_tmp_dir / "target_state_features_v2.npy", mmap_mode="r"),
                     target_labels=np.load(dense_tmp_dir / "target_labels.npy", mmap_mode="r"),
                     amount_labels=np.load(dense_tmp_dir / "amount_labels.npy", mmap_mode="r"),
                     source_mask=np.load(dense_tmp_dir / "source_mask.npy", mmap_mode="r"),
                     planet_feature_names=np.asarray(PLANET_FEATURE_NAMES),
+                    planet_feature_names_v2=np.asarray(PLANET_FEATURE_NAMES_V2),
+                    global_feature_names_v2=np.asarray(GLOBAL_FEATURE_NAMES_V2),
+                    target_state_feature_names_v2=np.asarray(TARGET_STATE_FEATURE_NAMES_V2),
+                    pair_feature_names_v2=np.asarray(PAIR_FEATURE_NAMES_V2),
+                    feature_version=np.asarray("v2"),
                 )
         finally:
             shutil.rmtree(dense_tmp_dir, ignore_errors=True)
@@ -330,6 +374,11 @@ class DatasetBuilder:
                 "dense_bc_arrays": "dense_bc_arrays.npz",
             },
             "planet_feature_names": PLANET_FEATURE_NAMES,
+            "feature_version": "v2",
+            "planet_feature_names_v2": PLANET_FEATURE_NAMES_V2,
+            "global_feature_names_v2": GLOBAL_FEATURE_NAMES_V2,
+            "target_state_feature_names_v2": TARGET_STATE_FEATURE_NAMES_V2,
+            "pair_feature_names_v2": PAIR_FEATURE_NAMES_V2,
             "stats": dict(stats),
             "target_inference_methods": dict(inference_methods),
             "amount_bin_counts": {AMOUNT_BIN_NAMES[int(k)]: int(v) for k, v in amount_bins.items() if int(k) < len(AMOUNT_BIN_NAMES)},

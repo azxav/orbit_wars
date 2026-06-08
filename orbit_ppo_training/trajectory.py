@@ -10,6 +10,8 @@ import torch
 class DecisionRecord:
     planet_features: torch.Tensor
     global_features: torch.Tensor
+    target_state_features: torch.Tensor
+    pair_features: torch.Tensor
     source_slot: int
     target_action: int
     amount_action: int
@@ -31,6 +33,8 @@ def collate_decisions(records: list[DecisionRecord], device: torch.device | str 
     return {
         "planet_features": torch.stack([r.planet_features for r in records]).to(device),
         "global_features": torch.stack([r.global_features for r in records]).to(device),
+        "target_state_features": torch.stack([r.target_state_features for r in records]).to(device),
+        "pair_features": torch.stack([r.pair_features for r in records]).to(device),
         "source_slot": torch.as_tensor([r.source_slot for r in records], dtype=torch.long, device=device),
         "target_label": torch.as_tensor([r.target_action for r in records], dtype=torch.long, device=device),
         "amount_label": torch.as_tensor([r.amount_action for r in records], dtype=torch.long, device=device),
@@ -41,4 +45,3 @@ def collate_decisions(records: list[DecisionRecord], device: torch.device | str 
         "reward": torch.as_tensor([r.reward for r in records], dtype=torch.float32, device=device),
         "done": torch.as_tensor([r.done for r in records], dtype=torch.float32, device=device),
     }
-

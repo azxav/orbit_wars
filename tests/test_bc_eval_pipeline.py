@@ -26,12 +26,19 @@ def _obs(step: int = 0) -> dict:
 
 def test_runtime_batch_uses_training_feature_contract() -> None:
     from orbit_bc_eval.bc_agent_runtime import build_source_batch
-    from orbit_training_prep.features import PLANET_FEATURE_NAMES
+    from orbit_training_prep.features import (
+        GLOBAL_FEATURE_NAMES_V2,
+        PAIR_FEATURE_NAMES_V2,
+        PLANET_FEATURE_NAMES_V2,
+        TARGET_STATE_FEATURE_NAMES_V2,
+    )
 
     batch = build_source_batch(_obs(step=25), player_id=0, source_slot=0)
 
-    assert tuple(batch["planet_features"].shape) == (1, 64, len(PLANET_FEATURE_NAMES))
-    assert tuple(batch["global_features"].shape) == (1, 5)
+    assert tuple(batch["planet_features"].shape) == (1, 64, len(PLANET_FEATURE_NAMES_V2))
+    assert tuple(batch["global_features"].shape) == (1, len(GLOBAL_FEATURE_NAMES_V2))
+    assert tuple(batch["target_state_features"].shape) == (1, 64, len(TARGET_STATE_FEATURE_NAMES_V2))
+    assert tuple(batch["pair_features"].shape) == (1, 65, len(PAIR_FEATURE_NAMES_V2))
     assert int(batch["source_slot"][0]) == 0
     assert abs(float(batch["global_features"][0, 0]) - 0.05) < 1e-6
 

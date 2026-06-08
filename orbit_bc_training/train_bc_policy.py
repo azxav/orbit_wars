@@ -56,6 +56,9 @@ def train(config: BCTrainConfig) -> dict[str, float]:
     model_cfg = BCModelConfig(
         planet_feature_dim=int(sample["planet_features"].shape[-1]),
         global_feature_dim=int(sample["global_features"].shape[-1]),
+        target_state_feature_dim=int(sample.get("target_state_features", np.zeros((0, 0))).shape[-1]),
+        pair_feature_dim=int(sample.get("pair_features", np.zeros((0, 0))).shape[-1]),
+        feature_version=str(sample.get("feature_version", "v1")),
         hidden_size=config.hidden_size,
         num_layers=config.num_layers,
         num_heads=config.num_heads,

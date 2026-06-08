@@ -13,6 +13,9 @@ from orbit_training_prep.schema import AMOUNT_BIN_NAMES, NOOP_TARGET_SLOT, P_MAX
 class BCModelConfig:
     planet_feature_dim: int
     global_feature_dim: int
+    target_state_feature_dim: int = 0
+    pair_feature_dim: int = 0
+    feature_version: str = "v1"
     fleet_feature_dim: int = 0
     max_planets: int = P_MAX
     target_classes: int = P_MAX + 1

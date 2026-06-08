@@ -11,7 +11,7 @@ import torch
 from orbit_bc_training.checkpoints import load_checkpoint
 from orbit_bc_training.decode_policy import decode_bc_prediction
 from orbit_bc_training.losses import masked_argmax
-from orbit_training_prep.features import all_planet_features
+from orbit_training_prep.features import build_feature_state_v2, pair_features_from_dense_v2
 from orbit_training_prep.geometry_bridge import make_geometry
 from orbit_training_prep.schema import AMOUNT_BIN_NAMES, P_MAX, NOOP_TARGET_SLOT, capture_needed_ships, decode_amount_bin, owned_source_slots, safe_float
 
@@ -84,17 +84,13 @@ def _geometry_once(horizon: int, device: str = "cpu"):
 
 
 def build_source_batch(obs: dict[str, Any], player_id: int, source_slot: int, *, device: str = "cpu") -> dict[str, torch.Tensor]:
-    step = int(obs.get("step", 0) or 0)
-    episode_steps = max(int(obs.get("episode_steps", 500) or 500), 1)
-    planet_features = torch.as_tensor([all_planet_features(obs, int(player_id), P_MAX)], dtype=torch.float32, device=device)
-    global_features = torch.as_tensor(
-        [[step / float(episode_steps), float(player_id) / 4.0, float(source_slot) / float(P_MAX), 0.0, 0.0]],
-        dtype=torch.float32,
-        device=device,
-    )
+    feature_state = build_feature_state_v2(obs, int(player_id), P_MAX)
+    pair_features = pair_features_from_dense_v2(feature_state.planet_features, feature_state.target_state_features, int(source_slot))
     return {
-        "planet_features": planet_features,
-        "global_features": global_features,
+        "planet_features": torch.as_tensor(feature_state.planet_features[None, ...], dtype=torch.float32, device=device),
+        "global_features": torch.as_tensor(feature_state.global_features[None, ...], dtype=torch.float32, device=device),
+        "target_state_features": torch.as_tensor(feature_state.target_state_features[None, ...], dtype=torch.float32, device=device),
+        "pair_features": torch.as_tensor(pair_features[None, ...], dtype=torch.float32, device=device),
         "source_slot": torch.as_tensor([int(source_slot)], dtype=torch.long, device=device),
     }
 
