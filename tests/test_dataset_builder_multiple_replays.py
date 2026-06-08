@@ -70,6 +70,24 @@ class DatasetBuilderMultipleReplaysTest(unittest.TestCase):
             self.assertEqual(metadata["stats"]["states"], 1)
             self.assertEqual(metadata["stats"]["source_turn_rows"], 1)
 
+    def test_skips_invalid_json_replay_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            replay_dir = root / "replays"
+            replay_dir.mkdir()
+            write_minimal_replay(replay_dir / "good.json", "episode-good")
+            (replay_dir / "bad.json").write_text("", encoding="utf-8")
+
+            out_dir = root / "dataset"
+            metadata = DatasetBuilder(horizon=8).build_from_replay(replay_dir, out_dir)
+
+            self.assertEqual(metadata["replay_paths"], [str(replay_dir / "good.json")])
+            self.assertEqual(metadata["input_replay_files"]["requested"], 2)
+            self.assertEqual(metadata["input_replay_files"]["used"], 1)
+            self.assertEqual(metadata["input_replay_files"]["skipped_invalid_json"], 1)
+            self.assertEqual(metadata["stats"]["states"], 1)
+            self.assertEqual(metadata["stats"]["source_turn_rows"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
