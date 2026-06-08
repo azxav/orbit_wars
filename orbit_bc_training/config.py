@@ -33,6 +33,7 @@ class BCTrainConfig:
     train_dir: str
     valid_dir: str
     out_dir: str
+    feature_version: str = "v2"
     batch_size: int = 512
     epochs: int = 20
     lr: float = 3e-4

@@ -99,6 +99,39 @@ def test_runtime_compact_debug_counts_opening_predictions_and_skip_reasons(monke
     assert debug["opening_prediction_counts"]["target_amount"] == {"slot_1|none": 1}
 
 
+def test_runtime_uses_v1_feature_contract_for_v1_checkpoint(monkeypatch) -> None:
+    import torch
+
+    from orbit_bc_eval import bc_agent_runtime
+    from orbit_bc_training.config import BCModelConfig
+    from orbit_training_prep.schema import AMOUNT_BIN_NONE, NOOP_TARGET_SLOT
+
+    class FakeV1Model:
+        config = BCModelConfig(planet_feature_dim=13, global_feature_dim=5)
+
+        def __call__(self, batch):
+            assert tuple(batch["planet_features"].shape) == (1, 64, 13)
+            assert tuple(batch["global_features"].shape) == (1, 5)
+            target_logits = torch.full((1, NOOP_TARGET_SLOT + 1), -10.0)
+            target_logits[0, NOOP_TARGET_SLOT] = 10.0
+            amount_logits = torch.full((1, 7), -10.0)
+            amount_logits[0, AMOUNT_BIN_NONE] = 10.0
+            return {"target_logits": target_logits, "amount_logits": amount_logits}
+
+    monkeypatch.setattr(bc_agent_runtime, "_load_model_once", lambda checkpoint, device: (FakeV1Model(), {"model_config": FakeV1Model.config.__dict__}))
+    monkeypatch.setattr(bc_agent_runtime, "_geometry_once", lambda horizon, device="cpu": object())
+
+    moves = bc_agent_runtime.agent(
+        _obs(step=25),
+        {"bc_checkpoint": "fake-v1.pt", "device": "cpu", "geometry_horizon": 1, "debug": True},
+    )
+    debug = bc_agent_runtime.get_last_debug()
+
+    assert moves == []
+    assert debug["error"] is None
+    assert debug["no_op_source_decisions"] == 1
+
+
 def test_simple_expand_agent_targets_nearest_capturable_neutral() -> None:
     from orbit_bc_eval.base_agents import simple_expand_agent
 

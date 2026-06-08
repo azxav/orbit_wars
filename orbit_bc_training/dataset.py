@@ -52,6 +52,8 @@ def _row_weight(row: dict[str, Any], is_noop: bool) -> float:
     if bool(row.get("winner_action", False)) or float(row.get("final_reward", 0.0) or 0.0) > 0.0:
         weight *= 1.25
     step = int(row.get("step_index", row.get("step", row.get("obs_step", 0))) or 0)
+    if not is_noop and step <= 100:
+        weight *= 3.0
     if step > 430:
         weight *= 0.5
     return float(weight)
@@ -62,8 +64,11 @@ class OrbitBCDataset(Dataset):
 
     noop_target_slot = NOOP_TARGET_SLOT
 
-    def __init__(self, dataset_dir: str | Path):
+    def __init__(self, dataset_dir: str | Path, *, feature_version: str = "auto"):
         self.dataset_dir = Path(dataset_dir)
+        requested_feature_version = str(feature_version or "auto").lower()
+        if requested_feature_version not in {"auto", "v1", "v2"}:
+            raise ValueError("feature_version must be one of: auto, v1, v2")
         self.rows = self._load_rows()
         dense_path, state_rows = _find_dense_source(self.dataset_dir)
         self._dense: dict[str, np.ndarray] | None = None
@@ -88,6 +93,22 @@ class OrbitBCDataset(Dataset):
                 self.planet_feature_dim = int(self._dense["planet_features"].shape[-1])
             if state_rows:
                 self._obs_uid_to_dense = {str(r["obs_uid"]): i for i, r in enumerate(state_rows)}
+        if requested_feature_version == "v2" and self.feature_version != "v2":
+            dense_label = str(dense_path) if dense_path is not None else "no dense_bc_arrays.npz found"
+            raise RuntimeError(
+                f"Training requires feature_version='v2', but {self.dataset_dir} resolved {dense_label} with feature_version='{self.feature_version}'. "
+                "Rebuild the dataset with the current dataset builder so dense_bc_arrays.npz contains planet_features_v2, "
+                "global_features_v2, and target_state_features_v2, or pass --feature_version auto/v1 for a legacy run."
+            )
+        if requested_feature_version == "v1" and self.feature_version != "v1":
+            self.feature_version = "v1"
+            if self._dense is not None and "planet_features" in self._dense:
+                self.planet_feature_dim = int(self._dense["planet_features"].shape[-1])
+            else:
+                self.planet_feature_dim = 13
+            self.global_feature_dim = 5
+            self.target_state_feature_dim = 0
+            self.pair_feature_dim = 0
 
     def _load_rows(self) -> list[dict[str, Any]]:
         rows = _read_jsonl(self.dataset_dir / "source_turn_rows.jsonl")

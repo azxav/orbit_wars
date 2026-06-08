@@ -50,8 +50,8 @@ def train(config: BCTrainConfig) -> dict[str, float]:
     print(json.dumps({"device": str(device), "cuda_available": torch.cuda.is_available(), "torch": torch.__version__}, sort_keys=True))
     out_dir = Path(config.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    train_ds = OrbitBCDataset(config.train_dir)
-    valid_ds = OrbitBCDataset(config.valid_dir)
+    train_ds = OrbitBCDataset(config.train_dir, feature_version=config.feature_version)
+    valid_ds = OrbitBCDataset(config.valid_dir, feature_version=config.feature_version)
     sample = train_ds[0]
     model_cfg = BCModelConfig(
         planet_feature_dim=int(sample["planet_features"].shape[-1]),
@@ -98,6 +98,7 @@ def main() -> None:
     ap.add_argument("--train_dir", required=True)
     ap.add_argument("--valid_dir", required=True)
     ap.add_argument("--out_dir", required=True)
+    ap.add_argument("--feature_version", choices=["auto", "v1", "v2"], default="v2")
     ap.add_argument("--batch_size", type=int, default=512)
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--lr", type=float, default=3e-4)

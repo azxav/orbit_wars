@@ -161,6 +161,42 @@ def test_dataset_loads_required_fields_and_labels(tmp_path: Path) -> None:
     assert int(ds.noop_target_slot) == NOOP_TARGET_SLOT
 
 
+def test_dataset_rejects_v1_dense_arrays_when_v2_required(tmp_path: Path) -> None:
+    import pytest
+
+    from orbit_bc_training.dataset import OrbitBCDataset
+
+    _make_dense_dataset(tmp_path)
+
+    with pytest.raises(RuntimeError, match="requires feature_version='v2'"):
+        OrbitBCDataset(tmp_path, feature_version="v2")
+
+
+def test_eval_requires_checkpoint_feature_contract(tmp_path: Path, monkeypatch) -> None:
+    import pytest
+
+    from orbit_bc_training import eval_bc_policy
+    from orbit_bc_training.config import BCModelConfig
+
+    class FakeV2Model:
+        config = BCModelConfig(
+            planet_feature_dim=24,
+            global_feature_dim=12,
+            target_state_feature_dim=7,
+            pair_feature_dim=11,
+            feature_version="v2",
+        )
+
+        def __call__(self, batch):
+            raise AssertionError("eval should reject the legacy dataset before model inference")
+
+    _make_dense_dataset(tmp_path)
+    monkeypatch.setattr(eval_bc_policy, "load_checkpoint", lambda checkpoint, device="cpu": (FakeV2Model(), {}))
+
+    with pytest.raises(RuntimeError, match="requires feature_version='v2'"):
+        eval_bc_policy.evaluate("fake.pt", tmp_path, device="cpu")
+
+
 def test_v2_dataset_loads_pair_features_and_leakage_free_globals(tmp_path: Path) -> None:
     from torch.utils.data import DataLoader
 
