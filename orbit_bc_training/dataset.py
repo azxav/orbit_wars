@@ -36,6 +36,7 @@ def _find_dense_source(dataset_dir: Path) -> tuple[Path | None, list[dict[str, A
         return local, _read_jsonl(state_path) if state_path.exists() else None
     candidates = [
         dataset_dir.parent / "dense_bc_arrays.npz",
+        dataset_dir.parent.parent / "dense_bc_arrays.npz",
         dataset_dir.parent.parent / "combined" / "dense_bc_arrays.npz",
     ]
     for dense in candidates:

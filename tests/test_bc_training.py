@@ -172,6 +172,21 @@ def test_dataset_rejects_v1_dense_arrays_when_v2_required(tmp_path: Path) -> Non
         OrbitBCDataset(tmp_path, feature_version="v2")
 
 
+def test_v2_dataset_resolves_dense_arrays_from_combined_split_layout(tmp_path: Path) -> None:
+    from orbit_bc_training.dataset import OrbitBCDataset
+
+    combined = tmp_path / "combined"
+    train = combined / "splits" / "train"
+    train.mkdir(parents=True)
+    _make_dense_v2_dataset(combined)
+    (train / "source_turn_rows.jsonl").write_text((combined / "source_turn_rows.jsonl").read_text(encoding="utf-8"), encoding="utf-8")
+
+    ds = OrbitBCDataset(train, feature_version="v2")
+
+    assert ds.feature_version == "v2"
+    assert ds[0]["planet_features"].shape[-1] == ds.planet_feature_dim
+
+
 def test_eval_requires_checkpoint_feature_contract(tmp_path: Path, monkeypatch) -> None:
     import pytest
 
