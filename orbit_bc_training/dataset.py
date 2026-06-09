@@ -49,14 +49,14 @@ def _find_dense_source(dataset_dir: Path) -> tuple[Path | None, list[dict[str, A
 def _row_weight(row: dict[str, Any], is_noop: bool) -> float:
     if "sample_weight" in row:
         return float(row["sample_weight"])
-    weight = 0.2 if is_noop else 1.0
+    weight = 0.8 if is_noop else 1.0
     if bool(row.get("winner_action", False)) or float(row.get("final_reward", 0.0) or 0.0) > 0.0:
-        weight *= 1.25
+        weight *= 1.1
     step = int(row.get("step_index", row.get("step", row.get("obs_step", 0))) or 0)
     if not is_noop and step <= 100:
-        weight *= 3.0
+        weight *= 1.1
     if step > 430:
-        weight *= 0.5
+        weight *= 0.8
     return float(weight)
 
 
