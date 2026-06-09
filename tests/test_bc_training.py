@@ -18,9 +18,20 @@ def _write_jsonl(path: Path, rows: list[dict]) -> None:
 
 
 def _make_dense_dataset(path: Path, *, rows: int = 16) -> None:
+    from orbit_training_prep.features import (
+        GLOBAL_FEATURE_NAMES,
+        PAIR_FEATURE_NAMES,
+        PLANET_FEATURE_NAMES,
+        TARGET_STATE_FEATURE_NAMES,
+    )
+
     pmax = 64
     rng = np.random.default_rng(7)
-    planet_features = rng.normal(size=(rows, pmax, 13)).astype(np.float32)
+    planet_features = rng.normal(size=(rows, pmax, len(PLANET_FEATURE_NAMES))).astype(np.float32)
+    planet_features[:, :, 0] = 1.0
+    planet_features[:, :, 7] = np.clip(planet_features[:, :, 7], 0.0, 1.0)
+    global_features = rng.normal(size=(rows, len(GLOBAL_FEATURE_NAMES))).astype(np.float32)
+    target_state_features = rng.normal(size=(rows, pmax, len(TARGET_STATE_FEATURE_NAMES))).astype(np.float32)
     target_labels = np.full((rows, pmax), NOOP_TARGET_SLOT, dtype=np.int64)
     amount_labels = np.zeros((rows, pmax), dtype=np.int64)
     source_mask = np.zeros((rows, pmax), dtype=np.float32)
@@ -52,76 +63,22 @@ def _make_dense_dataset(path: Path, *, rows: int = 16) -> None:
     np.savez_compressed(
         path / "dense_bc_arrays.npz",
         planet_features=planet_features,
+        global_features=global_features,
+        target_state_features=target_state_features,
         target_labels=target_labels,
         amount_labels=amount_labels,
         source_mask=source_mask,
+        planet_feature_names=np.asarray(PLANET_FEATURE_NAMES),
+        global_feature_names=np.asarray(GLOBAL_FEATURE_NAMES),
+        target_state_feature_names=np.asarray(TARGET_STATE_FEATURE_NAMES),
+        pair_feature_names=np.asarray(PAIR_FEATURE_NAMES),
     )
     _write_jsonl(path / "state_rows.jsonl", state_rows)
     _write_jsonl(path / "source_turn_rows.jsonl", source_rows)
 
 
-def _make_dense_v2_dataset(path: Path, *, rows: int = 8) -> None:
-    from orbit_training_prep.features import (
-        GLOBAL_FEATURE_NAMES_V2,
-        PAIR_FEATURE_NAMES_V2,
-        PLANET_FEATURE_NAMES_V2,
-        TARGET_STATE_FEATURE_NAMES_V2,
-    )
-
-    pmax = 64
-    rng = np.random.default_rng(11)
-    planet_features = rng.normal(size=(rows, pmax, len(PLANET_FEATURE_NAMES_V2))).astype(np.float32)
-    planet_features[:, :, 0] = 1.0
-    global_features = rng.normal(size=(rows, len(GLOBAL_FEATURE_NAMES_V2))).astype(np.float32)
-    target_state_features = rng.normal(size=(rows, pmax, len(TARGET_STATE_FEATURE_NAMES_V2))).astype(np.float32)
-    target_labels = np.full((rows, pmax), NOOP_TARGET_SLOT, dtype=np.int64)
-    amount_labels = np.zeros((rows, pmax), dtype=np.int64)
-    source_mask = np.zeros((rows, pmax), dtype=np.float32)
-    source_rows = []
-    state_rows = []
-    for i in range(rows):
-        source = i % 4
-        target = (source + 1) % 4 if i % 2 else NOOP_TARGET_SLOT
-        amount = 0 if target == NOOP_TARGET_SLOT else 2
-        source_mask[i, source] = 1.0
-        target_labels[i, source] = target
-        amount_labels[i, source] = amount
-        obs_uid = f"v2e{i // 4}:{i}:p0"
-        state_rows.append({"obs_uid": obs_uid, "episode_id": f"v2e{i // 4}", "step_index": i, "player_id": 0})
-        source_rows.append(
-            {
-                "source_turn_uid": f"{obs_uid}:s{source}",
-                "obs_uid": obs_uid,
-                "episode_id": f"v2e{i // 4}",
-                "step_index": i,
-                "player_id": 0,
-                "source_slot": source,
-                "target_slot_label": target,
-                "amount_bin_label": amount,
-                "sample_weight": 1.0,
-                "drop_for_v1_bc": False,
-            }
-        )
-    np.savez_compressed(
-        path / "dense_bc_arrays.npz",
-        planet_features_v2=planet_features,
-        global_features_v2=global_features,
-        target_state_features_v2=target_state_features,
-        target_labels=target_labels,
-        amount_labels=amount_labels,
-        source_mask=source_mask,
-        feature_version=np.asarray("v2"),
-        planet_feature_names_v2=np.asarray(PLANET_FEATURE_NAMES_V2),
-        global_feature_names_v2=np.asarray(GLOBAL_FEATURE_NAMES_V2),
-        target_state_feature_names_v2=np.asarray(TARGET_STATE_FEATURE_NAMES_V2),
-        pair_feature_names_v2=np.asarray(PAIR_FEATURE_NAMES_V2),
-    )
-    _write_jsonl(path / "state_rows.jsonl", state_rows)
-    _write_jsonl(path / "source_turn_rows.jsonl", source_rows)
-
-
-def test_v2_feature_contract_excludes_future_labels() -> None:
-    from orbit_training_prep.features import GLOBAL_FEATURE_NAMES_V2, build_feature_state_v2
+def test_feature_contract_excludes_future_labels() -> None:
+    from orbit_training_prep.features import GLOBAL_FEATURE_NAMES, build_feature_state
 
     obs = {
         "player": 0,
@@ -137,10 +94,11 @@ def test_v2_feature_contract_excludes_future_labels() -> None:
     }
 
     forbidden = {"final_reward", "winner", "winner_action", "target_label", "expert_action"}
-    assert forbidden.isdisjoint(set(GLOBAL_FEATURE_NAMES_V2))
-    state = build_feature_state_v2(obs, player_id=0, max_planets=64)
-    assert state.planet_features.shape[0] == 64
-    assert state.global_features.shape == (len(GLOBAL_FEATURE_NAMES_V2),)
+    assert forbidden.isdisjoint(set(GLOBAL_FEATURE_NAMES))
+    state = build_feature_state(obs, player_id=0, max_planets=64)
+    assert state.planet_features.shape == (64, 16)
+    assert state.global_features.shape == (10,)
+    assert state.target_state_features.shape == (64, 9)
     assert np.isfinite(state.planet_features).all()
     assert np.isfinite(state.global_features).all()
     assert np.isfinite(state.target_state_features).all()
@@ -153,84 +111,93 @@ def test_dataset_loads_required_fields_and_labels(tmp_path: Path) -> None:
     ds = OrbitBCDataset(tmp_path)
     sample = ds[0]
 
-    assert sample["planet_features"].shape == (64, 13)
-    assert sample["global_features"].shape[0] > 0
+    assert sample["planet_features"].shape == (64, 16)
+    assert sample["global_features"].shape == (10,)
+    assert sample["target_state_features"].shape == (64, 9)
+    assert sample["pair_features"].shape == (65, 22)
     assert sample["target_mask"].shape == (65,)
     assert sample["target_mask"][NOOP_TARGET_SLOT]
     assert 0 <= int(sample["target_label"]) <= NOOP_TARGET_SLOT
     assert int(ds.noop_target_slot) == NOOP_TARGET_SLOT
 
 
-def test_dataset_rejects_v1_dense_arrays_when_v2_required(tmp_path: Path) -> None:
+def test_dataset_rejects_old_contract_dense_arrays(tmp_path: Path) -> None:
     import pytest
 
     from orbit_bc_training.dataset import OrbitBCDataset
 
     _make_dense_dataset(tmp_path)
+    dense = dict(np.load(tmp_path / "dense_bc_arrays.npz"))
+    dense["planet_features" + "_" + "v2"] = dense.pop("planet_features")
+    dense["global_features" + "_" + "v2"] = dense.pop("global_features")
+    dense["target_state_features" + "_" + "v2"] = dense.pop("target_state_features")
+    dense["feature" + "_version"] = np.asarray("old")
+    np.savez_compressed(tmp_path / "dense_bc_arrays.npz", **dense)
 
-    with pytest.raises(RuntimeError, match="requires feature_version='v2'"):
-        OrbitBCDataset(tmp_path, feature_version="v2")
+    with pytest.raises(RuntimeError, match="Old feature-versioned dataset detected"):
+        OrbitBCDataset(tmp_path)
 
 
-def test_v2_dataset_resolves_dense_arrays_from_combined_split_layout(tmp_path: Path) -> None:
+def test_dataset_resolves_dense_arrays_from_combined_split_layout(tmp_path: Path) -> None:
     from orbit_bc_training.dataset import OrbitBCDataset
 
     combined = tmp_path / "combined"
     train = combined / "splits" / "train"
     train.mkdir(parents=True)
-    _make_dense_v2_dataset(combined)
+    _make_dense_dataset(combined)
     (train / "source_turn_rows.jsonl").write_text((combined / "source_turn_rows.jsonl").read_text(encoding="utf-8"), encoding="utf-8")
 
-    ds = OrbitBCDataset(train, feature_version="v2")
+    ds = OrbitBCDataset(train)
 
-    assert ds.feature_version == "v2"
     assert ds[0]["planet_features"].shape[-1] == ds.planet_feature_dim
 
 
-def test_eval_requires_checkpoint_feature_contract(tmp_path: Path, monkeypatch) -> None:
+def test_eval_rejects_old_dense_arrays(tmp_path: Path, monkeypatch) -> None:
     import pytest
 
     from orbit_bc_training import eval_bc_policy
     from orbit_bc_training.config import BCModelConfig
 
-    class FakeV2Model:
+    class FakeModel:
         config = BCModelConfig(
-            planet_feature_dim=24,
-            global_feature_dim=12,
-            target_state_feature_dim=7,
-            pair_feature_dim=11,
-            feature_version="v2",
+            planet_feature_dim=16,
+            global_feature_dim=10,
+            target_state_feature_dim=9,
+            pair_feature_dim=22,
         )
 
         def __call__(self, batch):
-            raise AssertionError("eval should reject the legacy dataset before model inference")
+            raise AssertionError("eval should reject the old dataset before model inference")
 
     _make_dense_dataset(tmp_path)
-    monkeypatch.setattr(eval_bc_policy, "load_checkpoint", lambda checkpoint, device="cpu": (FakeV2Model(), {}))
+    dense = dict(np.load(tmp_path / "dense_bc_arrays.npz"))
+    dense["feature" + "_version"] = np.asarray("old")
+    np.savez_compressed(tmp_path / "dense_bc_arrays.npz", **dense)
+    monkeypatch.setattr(eval_bc_policy, "load_checkpoint", lambda checkpoint, device="cpu": (FakeModel(), {}))
 
-    with pytest.raises(RuntimeError, match="requires feature_version='v2'"):
+    with pytest.raises(RuntimeError, match="Old feature-versioned dataset detected"):
         eval_bc_policy.evaluate("fake.pt", tmp_path, device="cpu")
 
 
-def test_v2_dataset_loads_pair_features_and_leakage_free_globals(tmp_path: Path) -> None:
+def test_dataset_loads_pair_features_and_leakage_free_globals(tmp_path: Path) -> None:
     from torch.utils.data import DataLoader
 
     from orbit_bc_training.dataset import OrbitBCDataset, collate_bc_samples
-    from orbit_training_prep.features import GLOBAL_FEATURE_NAMES_V2, PAIR_FEATURE_NAMES_V2
+    from orbit_training_prep.features import GLOBAL_FEATURE_NAMES, PAIR_FEATURE_NAMES
 
-    _make_dense_v2_dataset(tmp_path)
+    _make_dense_dataset(tmp_path)
     ds = OrbitBCDataset(tmp_path)
     sample = ds[1]
-    assert sample["feature_version"] == "v2"
-    assert sample["pair_features"].shape == (65, len(PAIR_FEATURE_NAMES_V2))
+    assert "feature" + "_version" not in sample
+    assert sample["pair_features"].shape == (65, len(PAIR_FEATURE_NAMES))
     assert sample["target_state_features"].shape[0] == 64
     assert np.isfinite(sample["pair_features"]).all()
     assert np.allclose(sample["pair_features"][NOOP_TARGET_SLOT, :-1], 0.0)
     assert sample["pair_features"][NOOP_TARGET_SLOT, -1] == 1.0
-    assert sample["global_features"].shape == (len(GLOBAL_FEATURE_NAMES_V2),)
+    assert sample["global_features"].shape == (len(GLOBAL_FEATURE_NAMES),)
 
     batch = next(iter(DataLoader(ds, batch_size=4, collate_fn=collate_bc_samples)))
-    assert tuple(batch["pair_features"].shape) == (4, 65, len(PAIR_FEATURE_NAMES_V2))
+    assert tuple(batch["pair_features"].shape) == (4, 65, len(PAIR_FEATURE_NAMES))
 
 
 def test_masked_target_argmax_ignores_invalid_logits() -> None:
@@ -252,7 +219,17 @@ def test_loss_backward_has_finite_gradients(tmp_path: Path) -> None:
 
     _make_dense_dataset(tmp_path)
     batch = next(iter(DataLoader(OrbitBCDataset(tmp_path), batch_size=8, collate_fn=collate_bc_samples)))
-    model = EntityBCPolicy(BCModelConfig(planet_feature_dim=13, global_feature_dim=batch["global_features"].shape[1], hidden_size=32, num_layers=1, num_heads=4))
+    model = EntityBCPolicy(
+        BCModelConfig(
+            planet_feature_dim=batch["planet_features"].shape[-1],
+            global_feature_dim=batch["global_features"].shape[-1],
+            target_state_feature_dim=batch["target_state_features"].shape[-1],
+            pair_feature_dim=batch["pair_features"].shape[-1],
+            hidden_size=32,
+            num_layers=1,
+            num_heads=4,
+        )
+    )
     out = model(batch)
     loss, metrics = bc_loss_and_metrics(out, batch)
     loss.backward()
@@ -262,14 +239,14 @@ def test_loss_backward_has_finite_gradients(tmp_path: Path) -> None:
     assert all(p.grad is None or torch.isfinite(p.grad).all().item() for p in model.parameters())
 
 
-def test_v2_model_forward_uses_pair_features(tmp_path: Path) -> None:
+def test_model_forward_uses_pair_features(tmp_path: Path) -> None:
     from torch.utils.data import DataLoader
 
     from orbit_bc_training.config import BCModelConfig
     from orbit_bc_training.dataset import OrbitBCDataset, collate_bc_samples
     from orbit_bc_training.model import EntityBCPolicy
 
-    _make_dense_v2_dataset(tmp_path)
+    _make_dense_dataset(tmp_path)
     batch = next(iter(DataLoader(OrbitBCDataset(tmp_path), batch_size=4, collate_fn=collate_bc_samples)))
     model = EntityBCPolicy(
         BCModelConfig(
@@ -300,7 +277,17 @@ def test_tiny_batch_can_overfit(tmp_path: Path) -> None:
     _make_dense_dataset(tmp_path, rows=32)
     loader = DataLoader(OrbitBCDataset(tmp_path), batch_size=32, shuffle=True, collate_fn=collate_bc_samples)
     batch = next(iter(loader))
-    model = EntityBCPolicy(BCModelConfig(planet_feature_dim=13, global_feature_dim=batch["global_features"].shape[1], hidden_size=64, num_layers=1, num_heads=4))
+    model = EntityBCPolicy(
+        BCModelConfig(
+            planet_feature_dim=batch["planet_features"].shape[-1],
+            global_feature_dim=batch["global_features"].shape[-1],
+            target_state_feature_dim=batch["target_state_features"].shape[-1],
+            pair_feature_dim=batch["pair_features"].shape[-1],
+            hidden_size=64,
+            num_layers=1,
+            num_heads=4,
+        )
+    )
     opt = torch.optim.AdamW(model.parameters(), lr=3e-3)
     first = None
     last = None

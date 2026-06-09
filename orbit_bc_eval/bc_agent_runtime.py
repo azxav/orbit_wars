@@ -6,13 +6,12 @@ import time
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import torch
 
 from orbit_bc_training.checkpoints import load_checkpoint
 from orbit_bc_training.decode_policy import decode_bc_prediction
 from orbit_bc_training.losses import masked_argmax
-from orbit_training_prep.features import all_planet_features, build_feature_state_v2, pair_features_from_dense_v2
+from orbit_training_prep.features import build_feature_state, pair_features_from_dense
 from orbit_training_prep.geometry_bridge import make_geometry
 from orbit_training_prep.schema import AMOUNT_BIN_NAMES, P_MAX, NOOP_TARGET_SLOT, capture_needed_ships, decode_amount_bin, owned_source_slots, safe_float
 
@@ -84,29 +83,6 @@ def _geometry_once(horizon: int, device: str = "cpu"):
     return _GEOMETRY
 
 
-def _model_config_value(model_config: Any, name: str, default: Any = None) -> Any:
-    if isinstance(model_config, dict):
-        return model_config.get(name, default)
-    return getattr(model_config, name, default)
-
-
-def _build_v1_source_batch(obs: dict[str, Any], player_id: int, source_slot: int, *, device: str = "cpu") -> dict[str, torch.Tensor]:
-    step = safe_float(obs.get("step"), 0.0)
-    episode_steps = max(safe_float(obs.get("episode_steps"), 500.0), 1.0)
-    planet_features = np.asarray(all_planet_features(obs, int(player_id), P_MAX), dtype=np.float32)
-    return {
-        "planet_features": torch.as_tensor(planet_features[None, ...], dtype=torch.float32, device=device),
-        "global_features": torch.as_tensor(
-            [[step / episode_steps, float(player_id) / 4.0, float(source_slot) / float(P_MAX), 0.0, 0.0]],
-            dtype=torch.float32,
-            device=device,
-        ),
-        "target_state_features": torch.zeros((1, P_MAX, 0), dtype=torch.float32, device=device),
-        "pair_features": torch.zeros((1, P_MAX + 1, 0), dtype=torch.float32, device=device),
-        "source_slot": torch.as_tensor([int(source_slot)], dtype=torch.long, device=device),
-    }
-
-
 def build_source_batch(
     obs: dict[str, Any],
     player_id: int,
@@ -115,11 +91,9 @@ def build_source_batch(
     device: str = "cpu",
     model_config: Any = None,
 ) -> dict[str, torch.Tensor]:
-    feature_version = str(_model_config_value(model_config, "feature_version", "v2")).lower() if model_config is not None else "v2"
-    if feature_version == "v1":
-        return _build_v1_source_batch(obs, player_id, source_slot, device=device)
-    feature_state = build_feature_state_v2(obs, int(player_id), P_MAX)
-    pair_features = pair_features_from_dense_v2(feature_state.planet_features, feature_state.target_state_features, int(source_slot))
+    del model_config
+    feature_state = build_feature_state(obs, int(player_id), P_MAX)
+    pair_features = pair_features_from_dense(feature_state.planet_features, feature_state.target_state_features, int(source_slot))
     return {
         "planet_features": torch.as_tensor(feature_state.planet_features[None, ...], dtype=torch.float32, device=device),
         "global_features": torch.as_tensor(feature_state.global_features[None, ...], dtype=torch.float32, device=device),

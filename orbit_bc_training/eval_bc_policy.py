@@ -24,8 +24,7 @@ def _safe_div(num: int, den: int) -> float:
 def evaluate(checkpoint: str | Path, valid_dir: str | Path, device: str = "auto") -> dict:
     resolved_device = resolve_device(device)
     model, _ = load_checkpoint(checkpoint, device=str(resolved_device))
-    feature_version = str(getattr(model.config, "feature_version", "v2") or "v2")
-    ds = OrbitBCDataset(valid_dir, feature_version=feature_version)
+    ds = OrbitBCDataset(valid_dir)
     loader = DataLoader(ds, batch_size=512, shuffle=False, collate_fn=collate_bc_samples)
     all_rows: list[dict] = []
     metric_rows: list[dict[str, float]] = []

@@ -55,9 +55,8 @@ def test_dataset_builder_parallel_workers_matches_serial_output(tmp_path: Path) 
     with np.load(serial_out / "dense_bc_arrays.npz") as serial_npz, np.load(parallel_out / "dense_bc_arrays.npz") as parallel_npz:
         for key in (
             "planet_features",
-            "planet_features_v2",
-            "global_features_v2",
-            "target_state_features_v2",
+            "global_features",
+            "target_state_features",
             "target_labels",
             "amount_labels",
             "source_mask",

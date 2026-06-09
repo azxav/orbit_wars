@@ -15,7 +15,6 @@ class BCModelConfig:
     global_feature_dim: int
     target_state_feature_dim: int = 0
     pair_feature_dim: int = 0
-    feature_version: str = "v1"
     fleet_feature_dim: int = 0
     max_planets: int = P_MAX
     target_classes: int = P_MAX + 1
@@ -34,7 +33,6 @@ class BCTrainConfig:
     valid_dir: str
     out_dir: str
     selection_eval_dir: str | None = None
-    feature_version: str = "v2"
     batch_size: int = 512
     epochs: int = 20
     lr: float = 3e-4

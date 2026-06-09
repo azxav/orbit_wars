@@ -12,3 +12,4 @@ ppo_eval_debug
 *.csv
 *.log
 *.zip
+*.pt
