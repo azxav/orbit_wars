@@ -354,3 +354,48 @@ def test_resolve_device_cuda_fails_loudly_when_cpu_torch(monkeypatch) -> None:
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     with pytest.raises(RuntimeError, match="CUDA was requested"):
         resolve_device("cuda")
+
+
+def test_checkpoint_selection_without_eval_dir_is_debug_fallback(tmp_path: Path) -> None:
+    from orbit_bc_training.train_bc_policy import checkpoint_selection_metrics
+
+    metrics = checkpoint_selection_metrics(
+        valid_metrics={"target_non_noop_accuracy": 0.99},
+        selection_eval_dir=None,
+    )
+
+    assert metrics["best_selection_mode"] == "validation_debug_fallback"
+    assert metrics["true_best"] is False
+    assert "gameplay_score" not in metrics
+
+
+def test_checkpoint_selection_uses_gameplay_eval_dir(tmp_path: Path) -> None:
+    from orbit_bc_training.train_bc_policy import checkpoint_selection_metrics
+
+    eval_dir = tmp_path / "eval"
+    eval_dir.mkdir()
+    (eval_dir / "games.jsonl").write_text(
+        json.dumps(
+            {
+                "game_id": "g1",
+                "players": 2,
+                "reward": 1.0,
+                "rank": 1,
+                "owned_planets_auc": 4.0,
+                "total_ships_auc": 40.0,
+                "decode_success_rate": 0.75,
+                "invalid_decode_rate": 0.25,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    metrics = checkpoint_selection_metrics(
+        valid_metrics={"target_non_noop_accuracy": 0.01},
+        selection_eval_dir=str(eval_dir),
+    )
+
+    assert metrics["best_selection_mode"] == "gameplay_eval"
+    assert metrics["true_best"] is True
+    assert metrics["gameplay_score"] > 0.0

@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .gameplay_score import score_game_rows
+
 
 def _mean(rows: list[dict[str, Any]], key: str) -> float:
     values = [float(r.get(key, 0.0) or 0.0) for r in rows]
@@ -60,11 +62,25 @@ def write_eval_report(
         "illegal_action_count": int(sum(int(r.get("illegal_actions", 0) or 0) for r in game_rows)),
         "average_final_reward": _mean(game_rows, "reward"),
         "average_owned_planets": _mean(game_rows, "avg_owned_planets"),
+        "average_final_owned_planets": _mean(game_rows, "final_owned_planets"),
+        "average_owned_planets_auc": _mean(game_rows, "owned_planets_auc"),
+        "average_owned_planets_auc_0_100": _mean(game_rows, "owned_planets_auc_0_100"),
+        "average_planet_control_delta": _mean(game_rows, "planet_control_delta"),
+        "average_first_capture_step": _mean(game_rows, "first_capture_step"),
+        "average_capture_efficiency": _mean(game_rows, "capture_efficiency"),
         "average_total_ships": _mean(game_rows, "avg_total_ships"),
+        "average_total_ships_auc": _mean(game_rows, "total_ships_auc"),
+        "average_total_ships_auc_0_100": _mean(game_rows, "total_ships_auc_0_100"),
+        "average_ship_delta_final_vs_initial": _mean(game_rows, "ship_delta_final_vs_initial"),
         "average_final_ship_count": _mean(game_rows, "final_ship_count"),
         "average_planets_captured": _mean(game_rows, "planets_captured"),
         "average_predicted_launch_rate": _mean(game_rows, "predicted_launch_rate"),
+        "average_decode_success_rate": _mean(game_rows, "decode_success_rate"),
+        "average_invalid_decode_rate": _mean(game_rows, "invalid_decode_rate"),
+        "average_actual_launch_rate": _mean(game_rows, "actual_launch_rate"),
+        "average_noop_decision_rate": _mean(game_rows, "noop_decision_rate"),
         "average_actual_returned_move_count": _mean(game_rows, "actual_returned_move_count"),
+        "gameplay_score": score_game_rows(game_rows),
         "total_skipped_invalid_decoded_actions": int(sum(int(r.get("skipped_invalid_decoded_actions", 0) or 0) for r in game_rows)),
         "skip_reason_counts": _sum_count_maps(game_rows, "skip_reason_counts"),
         "opening_prediction_target_counts": _sum_count_maps(game_rows, "opening_prediction_target_counts"),

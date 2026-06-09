@@ -34,10 +34,15 @@ class RolloutMetrics:
     sun_bounds_suspected_waste: int = 0
     owned_planets_samples: list[int] = field(default_factory=list)
     total_ships_samples: list[float] = field(default_factory=list)
+    sample_steps: list[int] = field(default_factory=list)
     planets_captured: int = 0
+    first_capture_step: int | None = None
+    _initial_owned_count: int | None = None
+    _initial_ship_count: float | None = None
     _last_owned_ids: set[int] = field(default_factory=set)
 
     def record_observation(self, obs: dict[str, Any]) -> None:
+        step = int(obs.get("step", len(self.sample_steps)) or 0)
         owned_ids: set[int] = set()
         total_ships = 0.0
         for p in obs.get("planets", [])[:P_MAX]:
@@ -46,9 +51,16 @@ class RolloutMetrics:
             if int(p[1]) == int(self.bc_player_id):
                 owned_ids.add(int(p[0]))
                 total_ships += max(0.0, safe_float(p[5]))
+        if self._initial_owned_count is None:
+            self._initial_owned_count = len(owned_ids)
+            self._initial_ship_count = total_ships
         if self._last_owned_ids:
-            self.planets_captured += len(owned_ids - self._last_owned_ids)
+            captured = len(owned_ids - self._last_owned_ids)
+            self.planets_captured += captured
+            if captured and self.first_capture_step is None:
+                self.first_capture_step = step
         self._last_owned_ids = owned_ids
+        self.sample_steps.append(step)
         self.owned_planets_samples.append(len(owned_ids))
         self.total_ships_samples.append(total_ships)
 
@@ -91,6 +103,13 @@ class RolloutMetrics:
             self.error_count += sum(1 for s in statuses if str(s).upper() == "ERROR")
         avg_owned = sum(self.owned_planets_samples) / len(self.owned_planets_samples) if self.owned_planets_samples else 0.0
         avg_ships = sum(self.total_ships_samples) / len(self.total_ships_samples) if self.total_ships_samples else 0.0
+        opening_owned = [v for step, v in zip(self.sample_steps, self.owned_planets_samples) if step < 100]
+        opening_ships = [v for step, v in zip(self.sample_steps, self.total_ships_samples) if step < 100]
+        final_owned = self.owned_planets_samples[-1] if self.owned_planets_samples else 0
+        final_ships = self.total_ships_samples[-1] if self.total_ships_samples else 0.0
+        initial_owned = self._initial_owned_count or 0
+        initial_ships = self._initial_ship_count or 0.0
+        launch_decisions = self.predicted_launches + self.no_op_source_decisions
         return {
             "game_id": self.game_id,
             "bc_seat": int(self.bc_player_id),
@@ -99,7 +118,16 @@ class RolloutMetrics:
             "reward": reward,
             "rank": int(rank),
             "win": win,
-            "final_ship_count": self.total_ships_samples[-1] if self.total_ships_samples else 0.0,
+            "final_ship_count": final_ships,
+            "final_owned_planets": int(final_owned),
+            "owned_planets_auc": float(avg_owned),
+            "owned_planets_auc_0_100": float(sum(opening_owned) / len(opening_owned) if opening_owned else 0.0),
+            "planet_control_delta": int(final_owned - initial_owned),
+            "first_capture_step": int(self.first_capture_step) if self.first_capture_step is not None else -1,
+            "capture_efficiency": self.planets_captured / max(1, self.launches),
+            "total_ships_auc": float(avg_ships),
+            "total_ships_auc_0_100": float(sum(opening_ships) / len(opening_ships) if opening_ships else 0.0),
+            "ship_delta_final_vs_initial": float(final_ships - initial_ships),
             "launches": int(self.launches),
             **self.bucket_counts,
             "illegal_actions": int(self.illegal_actions),
@@ -113,6 +141,10 @@ class RolloutMetrics:
             "no_op_source_decisions": int(self.no_op_source_decisions),
             "predicted_launches": int(self.predicted_launches),
             "predicted_launch_rate": self.predicted_launches / max(1, self.predicted_launches + self.no_op_source_decisions),
+            "decode_success_rate": self.returned_move_count / max(1, self.predicted_launches),
+            "invalid_decode_rate": self.skipped_invalid_decoded_actions / max(1, self.predicted_launches),
+            "actual_launch_rate": self.returned_move_count / max(1, launch_decisions),
+            "noop_decision_rate": self.no_op_source_decisions / max(1, launch_decisions),
             "actual_returned_move_count": int(self.returned_move_count),
             "sun_bounds_suspected_waste": int(self.sun_bounds_suspected_waste),
             "planets_captured": int(self.planets_captured),

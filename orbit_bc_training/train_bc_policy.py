@@ -14,6 +14,7 @@ from .config import BCModelConfig, BCTrainConfig, resolve_device, save_json_data
 from .dataset import OrbitBCDataset, collate_bc_samples
 from .losses import bc_loss_and_metrics
 from .model import EntityBCPolicy
+from orbit_bc_eval.gameplay_score import score_eval_dir
 
 
 def _seed(seed: int) -> None:
@@ -44,6 +45,20 @@ def run_epoch(model, loader, device, optimizer=None, grad_clip: float = 1.0) -> 
     return _mean_metrics(metrics)
 
 
+def checkpoint_selection_metrics(*, valid_metrics: dict[str, float], selection_eval_dir: str | None) -> dict:
+    gameplay_score = score_eval_dir(selection_eval_dir)
+    if gameplay_score is None:
+        return {
+            "best_selection_mode": "validation_debug_fallback",
+            "true_best": False,
+        }
+    return {
+        "best_selection_mode": "gameplay_eval",
+        "true_best": True,
+        "gameplay_score": float(gameplay_score),
+    }
+
+
 def train(config: BCTrainConfig) -> dict[str, float]:
     _seed(config.seed)
     device = resolve_device(config.device)
@@ -72,7 +87,7 @@ def train(config: BCTrainConfig) -> dict[str, float]:
     model = EntityBCPolicy(model_cfg).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(config.epochs, 1))
-    best_score = -1.0
+    best_score = float("-inf")
     latest_metrics: dict[str, float] = {}
     with open(out_dir / "metrics.jsonl", "w", encoding="utf-8") as metrics_file:
         for epoch in range(1, config.epochs + 1):
@@ -82,12 +97,16 @@ def train(config: BCTrainConfig) -> dict[str, float]:
             latest_metrics = {f"train_{k}": v for k, v in train_metrics.items()} | {f"valid_{k}": v for k, v in valid_metrics.items()}
             latest_metrics["epoch"] = epoch
             latest_metrics["lr"] = float(scheduler.get_last_lr()[0])
+            selection_metrics = checkpoint_selection_metrics(valid_metrics=valid_metrics, selection_eval_dir=config.selection_eval_dir)
+            latest_metrics.update(selection_metrics)
             metrics_file.write(json.dumps(latest_metrics, sort_keys=True) + "\n")
             metrics_file.flush()
             save_checkpoint(out_dir / "latest", model, optimizer, epoch, latest_metrics, model_cfg)
-            score = float(valid_metrics.get("target_non_noop_accuracy", 0.0))
-            if score >= best_score:
+            score = float(selection_metrics["gameplay_score"]) if selection_metrics.get("true_best") else float("-inf")
+            if selection_metrics.get("true_best") and score >= best_score:
                 best_score = score
+                save_checkpoint(out_dir / "best", model, optimizer, epoch, latest_metrics, model_cfg)
+            elif not selection_metrics.get("true_best"):
                 save_checkpoint(out_dir / "best", model, optimizer, epoch, latest_metrics, model_cfg)
             print(json.dumps(latest_metrics, sort_keys=True))
     return latest_metrics
@@ -98,6 +117,7 @@ def main() -> None:
     ap.add_argument("--train_dir", required=True)
     ap.add_argument("--valid_dir", required=True)
     ap.add_argument("--out_dir", required=True)
+    ap.add_argument("--selection_eval_dir", default=None)
     ap.add_argument("--feature_version", choices=["auto", "v1", "v2"], default="v2")
     ap.add_argument("--batch_size", type=int, default=512)
     ap.add_argument("--epochs", type=int, default=20)
