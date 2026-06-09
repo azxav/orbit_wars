@@ -24,6 +24,16 @@ def _obs(step: int = 0) -> dict:
     }
 
 
+def _capture_obs(step: int) -> dict:
+    obs = _obs(step=step)
+    obs["planets"] = [
+        [101, 0, 10.0, 10.0, 1.0, 25.0, 1.0],
+        [202, 0, 20.0, 10.0, 1.0, 6.0, 1.0],
+        [303, 1, 50.0, 50.0, 1.0, 30.0, 1.0],
+    ]
+    return obs
+
+
 def test_runtime_batch_uses_training_feature_contract() -> None:
     from orbit_bc_eval.bc_agent_runtime import build_source_batch
     from orbit_training_prep.features import (
@@ -184,6 +194,40 @@ def test_rollout_metrics_tracks_activity_legality_and_buckets() -> None:
     assert row["rank"] == 1
 
 
+def test_rollout_metrics_derives_gameplay_auc_and_action_rates() -> None:
+    from orbit_bc_eval.rollout_metrics import RolloutMetrics
+
+    metrics = RolloutMetrics(game_id="g1", bc_player_id=0, players=2, opponent="random")
+    metrics.record_observation(_obs(step=0))
+    metrics.record_step(
+        step=10,
+        actions=[[101, 0.0, 5], [101, 1.0, 4]],
+        illegal_actions=0,
+        runtime_debug={
+            "predicted_launches": 4,
+            "skipped_invalid_decoded_actions": 1,
+            "no_op_source_decisions": 6,
+            "returned_moves": 2,
+        },
+    )
+    metrics.record_observation(_capture_obs(step=50))
+    row = metrics.finalize(rewards=[1.0, -1.0], statuses=["DONE", "DONE"], final_obs=_capture_obs(step=499))
+
+    assert row["final_owned_planets"] == 2
+    assert row["owned_planets_auc"] == 5 / 3
+    assert row["owned_planets_auc_0_100"] == 1.5
+    assert row["planet_control_delta"] == 1
+    assert row["first_capture_step"] == 50
+    assert row["capture_efficiency"] == 0.5
+    assert row["total_ships_auc"] == 82 / 3
+    assert row["total_ships_auc_0_100"] == 25.5
+    assert row["ship_delta_final_vs_initial"] == 11.0
+    assert row["decode_success_rate"] == 0.5
+    assert row["invalid_decode_rate"] == 0.25
+    assert row["actual_launch_rate"] == 0.2
+    assert row["noop_decision_rate"] == 0.6
+
+
 def test_eval_report_writes_summary_jsonl_and_csv(tmp_path: Path) -> None:
     from orbit_bc_eval.eval_report import write_eval_report
 
@@ -201,9 +245,22 @@ def test_eval_report_writes_summary_jsonl_and_csv(tmp_path: Path) -> None:
             "timeout_count": 0,
             "illegal_actions": 0,
             "avg_owned_planets": 2.5,
+            "owned_planets_auc": 2.5,
+            "owned_planets_auc_0_100": 2.0,
+            "final_owned_planets": 3,
+            "planet_control_delta": 1,
+            "first_capture_step": 40,
+            "capture_efficiency": 0.5,
             "avg_total_ships": 30.0,
+            "total_ships_auc": 30.0,
+            "total_ships_auc_0_100": 25.0,
+            "ship_delta_final_vs_initial": 5.0,
             "no_op_source_decisions": 3,
             "actual_returned_move_count": 2,
+            "decode_success_rate": 0.5,
+            "invalid_decode_rate": 0.25,
+            "actual_launch_rate": 0.4,
+            "noop_decision_rate": 0.6,
             "predicted_launch_rate": 1.0,
             "predicted_launches": 4,
             "skipped_invalid_decoded_actions": 1,
@@ -225,6 +282,11 @@ def test_eval_report_writes_summary_jsonl_and_csv(tmp_path: Path) -> None:
     assert summary["total_no_op_source_decisions"] == 3
     assert summary["total_actual_returned_move_count"] == 2
     assert summary["total_skipped_invalid_decoded_actions"] == 1
+    assert summary["average_final_owned_planets"] == 3.0
+    assert summary["average_owned_planets_auc"] == 2.5
+    assert summary["average_total_ships_auc"] == 30.0
+    assert summary["average_decode_success_rate"] == 0.5
+    assert "gameplay_score" in summary
     assert summary["skip_reason_counts"] == {"geometry_no_viable_move": 1}
     assert summary["opening_prediction_target_counts"] == {"slot_1": 2}
     assert summary["opening_prediction_amount_counts"] == {"capture_plus_one": 2}
@@ -270,3 +332,39 @@ def test_bc_checkpoint_agent_wrapper_passes_its_checkpoint_config(monkeypatch) -
     assert calls[0]["device"] == "cpu"
     assert calls[0]["geometry_horizon"] == 80
     assert calls[0]["debug"] is True
+
+
+def test_compare_metric_relevance_pairs_runs_and_marks_keep_drop(tmp_path: Path, capsys) -> None:
+    from orbit_bc_eval.compare_metric_relevance import main
+
+    old = tmp_path / "old" / "games.jsonl"
+    new = tmp_path / "new" / "games.jsonl"
+    old.parent.mkdir()
+    new.parent.mkdir()
+    old.write_text(
+        "\n".join(
+            [
+                json.dumps({"game_id": "game_00000", "players": 2, "seed": 1, "bc_seat": 0, "opponent": "h", "reward": 0.0, "rank": 2, "owned_planets_auc": 1.0, "invalid_decode_rate": 0.5}),
+                json.dumps({"game_id": "game_00001", "players": 2, "seed": 2, "bc_seat": 1, "opponent": "h", "reward": 0.0, "rank": 2, "owned_planets_auc": 1.0, "invalid_decode_rate": 0.2}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    new.write_text(
+        "\n".join(
+            [
+                json.dumps({"game_id": "game_00000", "players": 2, "seed": 1, "bc_seat": 0, "opponent": "h", "reward": 1.0, "rank": 1, "owned_planets_auc": 3.0, "invalid_decode_rate": 0.1}),
+                json.dumps({"game_id": "game_00001", "players": 2, "seed": 2, "bc_seat": 1, "opponent": "h", "reward": -1.0, "rank": 2, "owned_planets_auc": 0.5, "invalid_decode_rate": 0.4}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    main([str(old.parent), str(new.parent)])
+
+    out = capsys.readouterr().out
+    assert "metric,spearman_corr_with_reward,spearman_corr_with_rank,direction,keep_drop" in out
+    assert "owned_planets_auc,1.0,-1.0,higher,keep" in out
+    assert "invalid_decode_rate,-1.0,1.0,lower,keep" in out
