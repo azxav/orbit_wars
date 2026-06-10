@@ -112,7 +112,16 @@ class PPOPolicy(nn.Module):
         horizon = int(getattr(getattr(geometry, "config", None), "movement_horizon", 160))
         turn_target_mask_np, turn_amount_mask_np = compute_viability_masks(obs, player_id, horizon=horizon, device="cpu", geometry=geometry)
         for source_slot in owned_source_slots(obs, player_id):
-            batch = build_source_batch(obs, player_id, source_slot, device=str(device))
+            batch = build_source_batch(
+                obs,
+                player_id,
+                source_slot,
+                device=str(device),
+                target_viability_mask=turn_target_mask_np[int(source_slot)],
+                amount_viability_mask=turn_amount_mask_np[int(source_slot)],
+                horizon=horizon,
+                geometry=geometry,
+            )
             target_mask = torch.as_tensor(turn_target_mask_np[int(source_slot)], dtype=torch.bool, device=device)
             amount_mask_table = torch.as_tensor(turn_amount_mask_np[int(source_slot)], dtype=torch.bool, device=device)
             amount_mask = torch.zeros(int(self.config.amount_bins), dtype=torch.bool, device=device)
