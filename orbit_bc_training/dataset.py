@@ -155,13 +155,20 @@ class OrbitBCDataset(Dataset):
         planet_features = np.asarray(self._dense["planet_features"][dense_idx], dtype=np.float32)
         global_features = np.asarray(self._dense["global_features"][dense_idx], dtype=np.float32)
         target_state_features = np.asarray(self._dense["target_state_features"][dense_idx], dtype=np.float32)
-        pair_features = pair_features_from_dense(planet_features, target_state_features, source_slot)
         target_mask = np.asarray(self._dense["target_viability_mask"][dense_idx, source_slot], dtype=bool).copy()
+        amount_mask_for_source = np.asarray(self._dense["amount_viability_mask"][dense_idx, source_slot], dtype=bool).copy()
+        pair_features = pair_features_from_dense(
+            planet_features,
+            target_state_features,
+            source_slot,
+            target_viability_mask=target_mask,
+            amount_viability_mask=amount_mask_for_source,
+        )
         if not bool(target_mask[target_label]):
             raise RuntimeError(
                 f"BC row {row.get('source_turn_uid', idx)!r} target label {target_label} is outside the geometry/capture viability mask for source {source_slot}."
             )
-        amount_mask = np.asarray(self._dense["amount_viability_mask"][dense_idx, source_slot, target_label], dtype=bool).copy()
+        amount_mask = amount_mask_for_source[target_label].copy()
         if not bool(amount_mask[amount_label]):
             raise RuntimeError(
                 f"BC row {row.get('source_turn_uid', idx)!r} amount label {amount_label} is outside the geometry/capture viability mask for source {source_slot}, target {target_label}."
