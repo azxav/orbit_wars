@@ -93,6 +93,17 @@ def test_runtime_compact_debug_counts_opening_predictions_and_skip_reasons(monke
 
     monkeypatch.setattr(bc_agent_runtime, "_load_model_once", lambda checkpoint, device: (FakeModel(), {}))
     monkeypatch.setattr(bc_agent_runtime, "_geometry_once", lambda horizon, device="cpu": object())
+    target_mask = torch.zeros((64, 65), dtype=torch.bool)
+    amount_mask = torch.zeros((64, 65, 7), dtype=torch.bool)
+    target_mask[:, NOOP_TARGET_SLOT] = True
+    amount_mask[:, NOOP_TARGET_SLOT, AMOUNT_BIN_NONE] = True
+    target_mask[0, 1] = True
+    amount_mask[0, 1, AMOUNT_BIN_NONE] = True
+    monkeypatch.setattr(
+        bc_agent_runtime,
+        "compute_viability_masks",
+        lambda obs, player_id, **kwargs: (target_mask.numpy(), amount_mask.numpy()),
+    )
 
     moves = bc_agent_runtime.agent(
         _obs(step=25),

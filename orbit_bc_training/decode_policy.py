@@ -32,6 +32,9 @@ def decode_bc_prediction(
     target_logits,
     amount_logits,
     geometry,
+    *,
+    target_mask: torch.Tensor | None = None,
+    amount_mask: torch.Tensor | None = None,
 ) -> Optional[list]:
     source_slot = _slot_for_planet_id(obs, int(source_planet_id))
     if source_slot is None:
@@ -39,11 +42,19 @@ def decode_bc_prediction(
     source = obs.get("planets", [])[source_slot]
     if len(source) < 7 or int(source[1]) != int(player_id):
         return None
-    mask = _target_mask(obs, source_slot).to(torch.as_tensor(target_logits).device)
+    mask = _target_mask(obs, source_slot) if target_mask is None else torch.as_tensor(target_mask, dtype=torch.bool)
+    mask = mask.to(torch.as_tensor(target_logits).device)
     target = int(masked_argmax(torch.as_tensor(target_logits).float().unsqueeze(0), mask.unsqueeze(0))[0].item())
     if target == NOOP_TARGET_SLOT:
         return None
-    amount_bin = int(torch.as_tensor(amount_logits).float().argmax().item())
+    amount_tensor = torch.as_tensor(amount_logits).float()
+    if amount_mask is not None:
+        amount_mask_t = torch.as_tensor(amount_mask, dtype=torch.bool, device=amount_tensor.device)
+        if not bool(amount_mask_t.any().item()):
+            return None
+        amount_bin = int(masked_argmax(amount_tensor.unsqueeze(0), amount_mask_t.unsqueeze(0))[0].item())
+    else:
+        amount_bin = int(amount_tensor.argmax().item())
     target_planet = obs.get("planets", [])[target] if target < len(obs.get("planets", [])) else None
     ships = decode_amount_bin(amount_bin, float(source[5]), capture_needed_ships(source, target_planet, int(player_id)))
     if ships <= 0:

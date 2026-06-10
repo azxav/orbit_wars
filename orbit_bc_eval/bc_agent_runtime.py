@@ -14,6 +14,7 @@ from orbit_bc_training.losses import masked_argmax
 from orbit_training_prep.features import build_feature_state, pair_features_from_dense
 from orbit_training_prep.geometry_bridge import make_geometry
 from orbit_training_prep.schema import AMOUNT_BIN_NAMES, P_MAX, NOOP_TARGET_SLOT, capture_needed_ships, decode_amount_bin, owned_source_slots, safe_float
+from orbit_training_prep.viability import compute_viability_masks
 
 from .config import DEFAULT_DEVICE, DEFAULT_GEOMETRY_HORIZON
 
@@ -103,17 +104,22 @@ def build_source_batch(
     }
 
 
-def target_mask_for_source(obs: dict[str, Any], source_slot: int) -> torch.Tensor:
-    mask = torch.zeros(P_MAX + 1, dtype=torch.bool)
-    for slot, p in enumerate(obs.get("planets", [])[:P_MAX]):
-        if len(p) >= 7 and int(p[0]) >= 0 and int(slot) != int(source_slot):
-            mask[slot] = True
-    mask[NOOP_TARGET_SLOT] = True
-    return mask
+def target_mask_for_source(
+    obs: dict[str, Any],
+    source_slot: int,
+    *,
+    player_id: int | None = None,
+    horizon: int = DEFAULT_GEOMETRY_HORIZON,
+    geometry: Any = None,
+) -> torch.Tensor:
+    pid = int(obs.get("player", 0) if player_id is None else player_id)
+    target_mask, _ = compute_viability_masks(obs, pid, horizon=int(horizon), device="cpu", geometry=geometry)
+    return torch.as_tensor(target_mask[int(source_slot)], dtype=torch.bool)
 
 
-def masked_target_prediction(obs: dict[str, Any], source_slot: int, target_logits: torch.Tensor) -> int:
-    mask = target_mask_for_source(obs, source_slot).to(torch.as_tensor(target_logits).device)
+def masked_target_prediction(obs: dict[str, Any], source_slot: int, target_logits: torch.Tensor, target_mask: torch.Tensor | None = None) -> int:
+    mask = target_mask_for_source(obs, source_slot) if target_mask is None else torch.as_tensor(target_mask, dtype=torch.bool)
+    mask = mask.to(torch.as_tensor(target_logits).device)
     return int(masked_argmax(torch.as_tensor(target_logits).float().unsqueeze(0), mask.unsqueeze(0))[0].item())
 
 
@@ -206,6 +212,7 @@ def agent(obs, config):
         "error": None,
     }
     try:
+        turn_target_mask_np, turn_amount_mask_np = compute_viability_masks(obs, player_id, horizon=horizon, device="cpu", geometry=geometry)
         for source_slot in owned_source_slots(obs, player_id):
             if time.monotonic() >= deadline:
                 debug["timeout"] = True
@@ -217,8 +224,10 @@ def agent(obs, config):
                 output = model(batch)
             target_logits = output["target_logits"][0].detach().cpu()
             amount_logits = output["amount_logits"][0].detach().cpu()
-            target_pred = masked_target_prediction(obs, source_slot, target_logits)
-            amount_pred = int(torch.argmax(amount_logits).item())
+            target_mask = torch.as_tensor(turn_target_mask_np[int(source_slot)], dtype=torch.bool)
+            target_pred = masked_target_prediction(obs, source_slot, target_logits, target_mask)
+            amount_mask = torch.as_tensor(turn_amount_mask_np[int(source_slot), int(target_pred)], dtype=torch.bool)
+            amount_pred = int(masked_argmax(amount_logits.float().unsqueeze(0), amount_mask.unsqueeze(0))[0].item())
             if target_pred == NOOP_TARGET_SLOT:
                 debug["no_op_source_decisions"] += 1
             else:
@@ -229,7 +238,16 @@ def agent(obs, config):
                 _increment_count(debug["opening_prediction_counts"]["target"], target_key)
                 _increment_count(debug["opening_prediction_counts"]["amount"], amount_key)
                 _increment_count(debug["opening_prediction_counts"]["target_amount"], f"{target_key}|{amount_key}")
-            move = decode_bc_prediction(obs, player_id, source_planet_id, target_logits, amount_logits, geometry)
+            move = decode_bc_prediction(
+                obs,
+                player_id,
+                source_planet_id,
+                target_logits,
+                amount_logits,
+                geometry,
+                target_mask=target_mask,
+                amount_mask=amount_mask,
+            )
             pred_row = {
                 "source_slot": int(source_slot),
                 "source_planet_id": source_planet_id,

@@ -99,11 +99,20 @@ class OrbitBCDataset(Dataset):
         self.global_feature_dim = int(self._dense["global_features"].shape[-1])
         self.target_state_feature_dim = int(self._dense["target_state_features"].shape[-1])
         self.pair_feature_dim = len(PAIR_FEATURE_NAMES)
+        self._has_viability_masks = "target_viability_mask" in self._dense and "amount_viability_mask" in self._dense
 
     def _load_rows(self) -> list[dict[str, Any]]:
         rows = _read_jsonl(self.dataset_dir / "source_turn_rows.jsonl")
         out: list[dict[str, Any]] = []
         for row in rows:
+            if bool(row.get("drop_for_v1_bc", False)):
+                continue
+            if not bool(row.get("geometry_viable", True)):
+                continue
+            if bool(row.get("ambiguous_multi_launch", False)):
+                continue
+            if str(row.get("target_inference_method", "") or "") == "angular_nearest":
+                continue
             first_hit = str(row.get("actual_first_hit_type", "") or "")
             if first_hit in BAD_FIRST_HITS:
                 continue
@@ -137,20 +146,32 @@ class OrbitBCDataset(Dataset):
         global_features = np.asarray(self._dense["global_features"][dense_idx], dtype=np.float32)
         target_state_features = np.asarray(self._dense["target_state_features"][dense_idx], dtype=np.float32)
         pair_features = pair_features_from_dense(planet_features, target_state_features, source_slot)
-        alive = planet_features[:, 0] > 0.0
-        target_mask = np.zeros(P_MAX + 1, dtype=bool)
-        target_mask[:P_MAX] = alive
-        if 0 <= source_slot < P_MAX:
-            target_mask[source_slot] = False
-        if 0 <= target_label < P_MAX:
-            target_mask[target_label] = True
-        target_mask[NOOP_TARGET_SLOT] = True
-        amount_mask = np.ones(7, dtype=bool)
-        if is_noop:
-            amount_mask[:] = False
-            amount_mask[0] = True
+        if self._has_viability_masks:
+            target_mask = np.asarray(self._dense["target_viability_mask"][dense_idx, source_slot], dtype=bool).copy()
+            if not bool(target_mask[target_label]):
+                raise RuntimeError(
+                    f"BC row {row.get('source_turn_uid', idx)!r} target label {target_label} is not geometry-viable for source {source_slot}."
+                )
+            amount_mask = np.asarray(self._dense["amount_viability_mask"][dense_idx, source_slot, target_label], dtype=bool).copy()
+            if not bool(amount_mask[amount_label]):
+                raise RuntimeError(
+                    f"BC row {row.get('source_turn_uid', idx)!r} amount label {amount_label} is not geometry-viable for source {source_slot}, target {target_label}."
+                )
         else:
-            amount_mask[0] = False
+            alive = planet_features[:, 0] > 0.0
+            target_mask = np.zeros(P_MAX + 1, dtype=bool)
+            target_mask[:P_MAX] = alive
+            if 0 <= source_slot < P_MAX:
+                target_mask[source_slot] = False
+            if 0 <= target_label < P_MAX:
+                target_mask[target_label] = True
+            target_mask[NOOP_TARGET_SLOT] = True
+            amount_mask = np.ones(7, dtype=bool)
+            if is_noop:
+                amount_mask[:] = False
+                amount_mask[0] = True
+            else:
+                amount_mask[0] = False
         step = int(row.get("step_index", row.get("step", row.get("obs_step", 0))) or 0)
         return {
             "planet_features": planet_features,

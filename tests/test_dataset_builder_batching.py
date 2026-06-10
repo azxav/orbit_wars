@@ -82,3 +82,43 @@ def test_dataset_builder_records_device_and_batched_inference_mode(tmp_path: Pat
     assert "pair_rank_rows" not in metadata["files"]
     assert "pair_feature_names" not in metadata
     assert not (out_dir / "pair_rank_rows.jsonl").exists()
+
+
+def test_dataset_builder_emits_geometry_viability_masks(tmp_path: Path) -> None:
+    obs = static_obs(
+        [
+            [1, 0, 10.0, 50.0, 1.0, 80.0, 1.0],
+            [2, -1, 30.0, 52.0, 3.0, 5.0, 1.0],
+            [3, -1, 80.0, 50.0, 2.0, 5.0, 1.0],
+        ]
+    )
+    replay_path = tmp_path / "replay.json"
+    out_dir = tmp_path / "dataset"
+    replay_with_actions(replay_path, obs, [[1, 0.0, 10]])
+
+    DatasetBuilder(horizon=80, device="cpu").build_from_replay(replay_path, out_dir)
+    dense = dict(__import__("numpy").load(out_dir / "dense_bc_arrays.npz"))
+
+    assert dense["target_viability_mask"].shape == (1, 64, 65)
+    assert dense["amount_viability_mask"].shape == (1, 64, 65, 7)
+    assert bool(dense["target_viability_mask"][0, 0, 1])
+    assert not bool(dense["target_viability_mask"][0, 0, 2])
+    assert bool(dense["target_viability_mask"][0, 0, 64])
+    assert dense["amount_viability_mask"][0, 0, 64].tolist() == [True, False, False, False, False, False, False]
+
+
+def test_viability_mask_is_amount_conditioned() -> None:
+    from orbit_training_prep.viability import compute_viability_masks
+
+    obs = static_obs(
+        [
+            [1, 0, 10.0, 10.0, 1.0, 80.0, 1.0],
+            [2, -1, 30.0, 10.0, 1.0, 5.0, 1.0],
+        ]
+    )
+
+    target_mask, amount_mask = compute_viability_masks(obs, 0, horizon=8, device="cpu")
+
+    assert bool(target_mask[0, 1])
+    assert not bool(amount_mask[0, 1, 1])
+    assert bool(amount_mask[0, 1, 6])

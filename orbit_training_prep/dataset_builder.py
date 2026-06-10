@@ -32,6 +32,7 @@ from .schema import (
     safe_float,
 )
 from .target_inference import TargetInferer
+from .viability import compute_viability_masks
 
 
 def resolve_replay_paths(replay_input: str | Path, max_files: int | None = None) -> list[Path]:
@@ -225,6 +226,8 @@ class DatasetBuilder:
         dense_source_labels = None
         dense_amount_labels = None
         dense_source_mask = None
+        dense_target_viability_mask = None
+        dense_amount_viability_mask = None
         dense_index = 0
         try:
             if dense_state_count:
@@ -264,6 +267,18 @@ class DatasetBuilder:
                     dtype=np.float32,
                     shape=(dense_state_count, P_MAX),
                 )
+                dense_target_viability_mask = np.lib.format.open_memmap(
+                    dense_tmp_dir / "target_viability_mask.npy",
+                    mode="w+",
+                    dtype=bool,
+                    shape=(dense_state_count, P_MAX, P_MAX + 1),
+                )
+                dense_amount_viability_mask = np.lib.format.open_memmap(
+                    dense_tmp_dir / "amount_viability_mask.npy",
+                    mode="w+",
+                    dtype=bool,
+                    shape=(dense_state_count, P_MAX, P_MAX + 1, len(AMOUNT_BIN_NAMES)),
+                )
 
                 for shard_dir, shard_state_count in zip(shard_dirs, shard_state_counts, strict=True):
                     if int(shard_state_count) <= 0:
@@ -284,6 +299,8 @@ class DatasetBuilder:
                         dense_source_labels[dense_index:end] = shard["target_labels"]
                         dense_amount_labels[dense_index:end] = shard["amount_labels"]
                         dense_source_mask[dense_index:end] = shard["source_mask"]
+                        dense_target_viability_mask[dense_index:end] = shard["target_viability_mask"]
+                        dense_amount_viability_mask[dense_index:end] = shard["amount_viability_mask"]
                         dense_index = end
 
                 if dense_index != dense_state_count:
@@ -297,6 +314,8 @@ class DatasetBuilder:
                 dense_source_labels.flush()
                 dense_amount_labels.flush()
                 dense_source_mask.flush()
+                dense_target_viability_mask.flush()
+                dense_amount_viability_mask.flush()
                 np.savez(
                     out_dir / "dense_bc_arrays.npz",
                     planet_features=np.load(dense_tmp_dir / "planet_features.npy", mmap_mode="r"),
@@ -305,6 +324,8 @@ class DatasetBuilder:
                     target_labels=np.load(dense_tmp_dir / "target_labels.npy", mmap_mode="r"),
                     amount_labels=np.load(dense_tmp_dir / "amount_labels.npy", mmap_mode="r"),
                     source_mask=np.load(dense_tmp_dir / "source_mask.npy", mmap_mode="r"),
+                    target_viability_mask=np.load(dense_tmp_dir / "target_viability_mask.npy", mmap_mode="r"),
+                    amount_viability_mask=np.load(dense_tmp_dir / "amount_viability_mask.npy", mmap_mode="r"),
                     planet_feature_names=np.asarray(PLANET_FEATURE_NAMES),
                     global_feature_names=np.asarray(GLOBAL_FEATURE_NAMES),
                     target_state_feature_names=np.asarray(TARGET_STATE_FEATURE_NAMES),
@@ -407,7 +428,6 @@ class DatasetBuilder:
                 "planet_feature_names": PLANET_FEATURE_NAMES,
                 "global_feature_names": GLOBAL_FEATURE_NAMES,
                 "target_state_feature_names": TARGET_STATE_FEATURE_NAMES,
-                "pair_feature_names": PAIR_FEATURE_NAMES,
                 "stats": dict(stats),
                 "input_replay_files": {
                     "requested": len(replay_paths),
@@ -463,6 +483,8 @@ class DatasetBuilder:
         dense_source_labels = None
         dense_amount_labels = None
         dense_source_mask = None
+        dense_target_viability_mask = None
+        dense_amount_viability_mask = None
         if dense_state_count:
             dense_planet_features = np.lib.format.open_memmap(
                 dense_tmp_dir / "planet_features.npy",
@@ -500,6 +522,18 @@ class DatasetBuilder:
                 dtype=np.float32,
                 shape=(dense_state_count, P_MAX),
             )
+            dense_target_viability_mask = np.lib.format.open_memmap(
+                dense_tmp_dir / "target_viability_mask.npy",
+                mode="w+",
+                dtype=bool,
+                shape=(dense_state_count, P_MAX, P_MAX + 1),
+            )
+            dense_amount_viability_mask = np.lib.format.open_memmap(
+                dense_tmp_dir / "amount_viability_mask.npy",
+                mode="w+",
+                dtype=bool,
+                shape=(dense_state_count, P_MAX, P_MAX + 1, len(AMOUNT_BIN_NAMES)),
+            )
         dense_index = 0
         stats = Counter()
         inference_methods = Counter()
@@ -531,6 +565,12 @@ class DatasetBuilder:
                             continue
                         obs_uid = f"{sample['episode_id']}:{sample['step_index']}:p{player_id}"
                         feature_state = build_feature_state(obs, player_id, P_MAX)
+                        target_viability_mask, amount_viability_mask = compute_viability_masks(
+                            obs,
+                            player_id,
+                            horizon=self.horizon,
+                            device=self.device,
+                        )
                         source_labels = [NOOP_TARGET_SLOT] * P_MAX
                         amount_labels = [0] * P_MAX
                         source_mask = [1.0 if s in owned_slots else 0.0 for s in range(P_MAX)]
@@ -647,6 +687,8 @@ class DatasetBuilder:
                             dense_source_labels[dense_index] = np.asarray(source_labels, dtype=np.int64)
                             dense_amount_labels[dense_index] = np.asarray(amount_labels, dtype=np.int64)
                             dense_source_mask[dense_index] = np.asarray(source_mask, dtype=np.float32)
+                            dense_target_viability_mask[dense_index] = target_viability_mask
+                            dense_amount_viability_mask[dense_index] = amount_viability_mask
                             dense_index += 1
             if dense_index != dense_state_count:
                 raise RuntimeError(f"Dense row count changed while building dataset: expected {dense_state_count}, wrote {dense_index}")
@@ -658,6 +700,8 @@ class DatasetBuilder:
                 dense_source_labels.flush()
                 dense_amount_labels.flush()
                 dense_source_mask.flush()
+                dense_target_viability_mask.flush()
+                dense_amount_viability_mask.flush()
                 np.savez(
                     out_dir / "dense_bc_arrays.npz",
                     planet_features=np.load(dense_tmp_dir / "planet_features.npy", mmap_mode="r"),
@@ -666,6 +710,8 @@ class DatasetBuilder:
                     target_labels=np.load(dense_tmp_dir / "target_labels.npy", mmap_mode="r"),
                     amount_labels=np.load(dense_tmp_dir / "amount_labels.npy", mmap_mode="r"),
                     source_mask=np.load(dense_tmp_dir / "source_mask.npy", mmap_mode="r"),
+                    target_viability_mask=np.load(dense_tmp_dir / "target_viability_mask.npy", mmap_mode="r"),
+                    amount_viability_mask=np.load(dense_tmp_dir / "amount_viability_mask.npy", mmap_mode="r"),
                     planet_feature_names=np.asarray(PLANET_FEATURE_NAMES),
                     global_feature_names=np.asarray(GLOBAL_FEATURE_NAMES),
                     target_state_feature_names=np.asarray(TARGET_STATE_FEATURE_NAMES),
@@ -695,7 +741,6 @@ class DatasetBuilder:
             "planet_feature_names": PLANET_FEATURE_NAMES,
             "global_feature_names": GLOBAL_FEATURE_NAMES,
             "target_state_feature_names": TARGET_STATE_FEATURE_NAMES,
-            "pair_feature_names": PAIR_FEATURE_NAMES,
             "stats": dict(stats),
             "input_replay_files": {
                 "requested": len(replay_paths),

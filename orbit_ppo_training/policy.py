@@ -13,7 +13,6 @@ from orbit_bc_eval.bc_agent_runtime import (
     _increment_count,
     _target_count_key,
     build_source_batch,
-    target_mask_for_source,
     validate_env_move,
 )
 from orbit_bc_training.checkpoints import load_checkpoint
@@ -21,6 +20,7 @@ from orbit_bc_training.losses import NEG_INF, apply_mask, masked_argmax
 from orbit_bc_training.decode_policy import decode_bc_prediction
 from orbit_training_prep.geometry_bridge import make_geometry
 from orbit_training_prep.schema import AMOUNT_BIN_NONE, NOOP_TARGET_SLOT, P_MAX, owned_source_slots
+from orbit_training_prep.viability import compute_viability_masks
 
 from .trajectory import DecisionRecord
 from .value_head import ValueHead
@@ -109,10 +109,14 @@ class PPOPolicy(nn.Module):
         opening_prediction_counts: dict[str, dict[str, int]] = {"target": {}, "amount": {}, "target_amount": {}}
         entropies: list[float] = []
         values: list[float] = []
+        horizon = int(getattr(getattr(geometry, "config", None), "movement_horizon", 160))
+        turn_target_mask_np, turn_amount_mask_np = compute_viability_masks(obs, player_id, horizon=horizon, device="cpu", geometry=geometry)
         for source_slot in owned_source_slots(obs, player_id):
             batch = build_source_batch(obs, player_id, source_slot, device=str(device))
-            target_mask = target_mask_for_source(obs, source_slot).to(device)
-            amount_mask = torch.ones(int(self.config.amount_bins), dtype=torch.bool, device=device)
+            target_mask = torch.as_tensor(turn_target_mask_np[int(source_slot)], dtype=torch.bool, device=device)
+            amount_mask_table = torch.as_tensor(turn_amount_mask_np[int(source_slot)], dtype=torch.bool, device=device)
+            amount_mask = torch.zeros(int(self.config.amount_bins), dtype=torch.bool, device=device)
+            amount_mask[AMOUNT_BIN_NONE] = True
             batch["target_mask"] = target_mask.unsqueeze(0)
             batch["amount_mask"] = amount_mask.unsqueeze(0)
             out = self.forward(batch)
@@ -126,8 +130,7 @@ class PPOPolicy(nn.Module):
                 noops += 1
             else:
                 predicted_launches += 1
-                amount_mask = amount_mask.clone()
-                amount_mask[AMOUNT_BIN_NONE] = False
+                amount_mask = amount_mask_table[int(target)].clone()
                 batch["amount_mask"] = amount_mask.unsqueeze(0)
                 amount_batch = dict(batch)
                 amount_batch["target_label"] = torch.as_tensor([target], dtype=torch.long, device=device)
@@ -153,6 +156,8 @@ class PPOPolicy(nn.Module):
                 F.one_hot(torch.as_tensor(target), num_classes=P_MAX + 1).float() * 1.0e6,
                 F.one_hot(torch.as_tensor(amount), num_classes=int(self.config.amount_bins)).float() * 1.0e6,
                 geometry,
+                target_mask=target_mask.detach().cpu(),
+                amount_mask=amount_mask.detach().cpu(),
             )
             decoded_moves: list[list[Any]] = []
             if move is not None:

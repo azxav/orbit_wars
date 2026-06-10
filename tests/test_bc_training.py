@@ -121,6 +121,150 @@ def test_dataset_loads_required_fields_and_labels(tmp_path: Path) -> None:
     assert int(ds.noop_target_slot) == NOOP_TARGET_SLOT
 
 
+def test_dataset_filters_v1_invalid_source_rows(tmp_path: Path) -> None:
+    from orbit_bc_training.dataset import OrbitBCDataset
+
+    _make_dense_dataset(tmp_path, rows=4)
+    rows = [
+        {
+            "source_turn_uid": "keep",
+            "obs_uid": "e0:0:p0",
+            "episode_id": "e0",
+            "step_index": 0,
+            "player_id": 0,
+            "source_slot": 0,
+            "target_slot_label": 1,
+            "amount_bin_label": 3,
+            "drop_for_v1_bc": False,
+            "geometry_viable": True,
+            "ambiguous_multi_launch": False,
+            "target_inference_method": "first_contact",
+        },
+        {
+            "source_turn_uid": "drop_flag",
+            "obs_uid": "e0:1:p0",
+            "episode_id": "e0",
+            "step_index": 1,
+            "player_id": 0,
+            "source_slot": 1,
+            "target_slot_label": 2,
+            "amount_bin_label": 3,
+            "drop_for_v1_bc": True,
+        },
+        {
+            "source_turn_uid": "drop_geometry",
+            "obs_uid": "e0:2:p0",
+            "episode_id": "e0",
+            "step_index": 2,
+            "player_id": 0,
+            "source_slot": 2,
+            "target_slot_label": 3,
+            "amount_bin_label": 3,
+            "geometry_viable": False,
+        },
+        {
+            "source_turn_uid": "drop_angular",
+            "obs_uid": "e0:3:p0",
+            "episode_id": "e0",
+            "step_index": 3,
+            "player_id": 0,
+            "source_slot": 3,
+            "target_slot_label": 4,
+            "amount_bin_label": 3,
+            "target_inference_method": "angular_nearest",
+        },
+    ]
+    _write_jsonl(tmp_path / "source_turn_rows.jsonl", rows)
+
+    ds = OrbitBCDataset(tmp_path)
+
+    assert len(ds) == 1
+    assert ds.rows[0]["source_turn_uid"] == "keep"
+
+
+def test_dataset_uses_dense_geometry_viability_masks(tmp_path: Path) -> None:
+    from orbit_bc_training.dataset import OrbitBCDataset
+
+    _make_dense_dataset(tmp_path, rows=1)
+    dense = dict(np.load(tmp_path / "dense_bc_arrays.npz"))
+    target_mask = np.zeros((1, 64, 65), dtype=bool)
+    amount_mask = np.zeros((1, 64, 65, 7), dtype=bool)
+    target_mask[:, :, NOOP_TARGET_SLOT] = True
+    amount_mask[:, :, NOOP_TARGET_SLOT, 0] = True
+    target_mask[0, 0, 2] = True
+    amount_mask[0, 0, 2, 4] = True
+    dense["target_viability_mask"] = target_mask
+    dense["amount_viability_mask"] = amount_mask
+    dense["target_labels"][0, 0] = 2
+    dense["amount_labels"][0, 0] = 4
+    np.savez_compressed(tmp_path / "dense_bc_arrays.npz", **dense)
+    _write_jsonl(
+        tmp_path / "source_turn_rows.jsonl",
+        [
+            {
+                "source_turn_uid": "masked",
+                "obs_uid": "e0:0:p0",
+                "episode_id": "e0",
+                "step_index": 0,
+                "player_id": 0,
+                "source_slot": 0,
+                "target_slot_label": 2,
+                "amount_bin_label": 4,
+                "drop_for_v1_bc": False,
+                "geometry_viable": True,
+                "target_inference_method": "first_contact",
+            }
+        ],
+    )
+
+    sample = OrbitBCDataset(tmp_path)[0]
+
+    assert sample["target_mask"][2]
+    assert not sample["target_mask"][1]
+    assert sample["target_mask"][NOOP_TARGET_SLOT]
+    assert sample["amount_mask"].tolist() == [False, False, False, False, True, False, False]
+
+
+def test_dataset_rejects_label_outside_dense_viability_mask(tmp_path: Path) -> None:
+    import pytest
+
+    from orbit_bc_training.dataset import OrbitBCDataset
+
+    _make_dense_dataset(tmp_path, rows=1)
+    dense = dict(np.load(tmp_path / "dense_bc_arrays.npz"))
+    target_mask = np.zeros((1, 64, 65), dtype=bool)
+    amount_mask = np.zeros((1, 64, 65, 7), dtype=bool)
+    target_mask[:, :, NOOP_TARGET_SLOT] = True
+    amount_mask[:, :, NOOP_TARGET_SLOT, 0] = True
+    dense["target_viability_mask"] = target_mask
+    dense["amount_viability_mask"] = amount_mask
+    dense["target_labels"][0, 0] = 2
+    dense["amount_labels"][0, 0] = 4
+    np.savez_compressed(tmp_path / "dense_bc_arrays.npz", **dense)
+    _write_jsonl(
+        tmp_path / "source_turn_rows.jsonl",
+        [
+            {
+                "source_turn_uid": "bad",
+                "obs_uid": "e0:0:p0",
+                "episode_id": "e0",
+                "step_index": 0,
+                "player_id": 0,
+                "source_slot": 0,
+                "target_slot_label": 2,
+                "amount_bin_label": 4,
+                "drop_for_v1_bc": False,
+                "geometry_viable": True,
+                "target_inference_method": "first_contact",
+            }
+        ],
+    )
+
+    ds = OrbitBCDataset(tmp_path)
+    with pytest.raises(RuntimeError, match="target label .* is not geometry-viable"):
+        _ = ds[0]
+
+
 def test_dataset_rejects_old_contract_dense_arrays(tmp_path: Path) -> None:
     import pytest
 
@@ -321,6 +465,39 @@ def test_decode_noop_and_launch_uses_geometry_angle() -> None:
     amount_logits = torch.full((7,), -10.0)
     amount_logits[4] = 5.0
     assert decode_bc_prediction(obs, 0, 101, launch_logits, amount_logits, FakeGeometry()) == [101, 1.2345, 7]
+
+
+def test_decode_prediction_respects_precomputed_target_and_amount_masks() -> None:
+    from orbit_bc_training.decode_policy import decode_bc_prediction
+
+    class FakeGeometry:
+        def to_env_moves(self, **kwargs):
+            return [[101, 0.0, int(kwargs["ships"][0].item())]]
+
+    obs = {"planets": [[101, 0, 0, 0, 1, 20, 1], [202, 1, 10, 0, 1, 5, 1], [303, 1, 20, 0, 1, 5, 1]]}
+    target_logits = torch.full((65,), -10.0)
+    target_logits[1] = 100.0
+    target_logits[2] = 10.0
+    amount_logits = torch.full((7,), -10.0)
+    amount_logits[1] = 100.0
+    amount_logits[4] = 10.0
+    target_mask = torch.zeros(65, dtype=torch.bool)
+    target_mask[2] = True
+    amount_mask = torch.zeros(7, dtype=torch.bool)
+    amount_mask[4] = True
+
+    move = decode_bc_prediction(
+        obs,
+        0,
+        101,
+        target_logits,
+        amount_logits,
+        FakeGeometry(),
+        target_mask=target_mask,
+        amount_mask=amount_mask,
+    )
+
+    assert move == [101, 0.0, 10]
 
 
 def test_resolve_device_auto_prefers_cuda_when_available(monkeypatch) -> None:
