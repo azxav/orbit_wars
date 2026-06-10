@@ -70,6 +70,9 @@ PAIR_FEATURE_NAMES = [
     "distance",
     "angle_sin",
     "angle_cos",
+    "geom_viable_any_amount",
+    "geom_viable_amount_frac",
+    "geom_no_viable_amount_flag",
     "safe_sendable_ships",
     "post_send_frac_capture",
     "overkill_ratio_capture",
@@ -350,6 +353,8 @@ def pair_features_from_dense(
     source_slot: int,
     *,
     max_planets: int = P_MAX,
+    target_viability_mask: np.ndarray | None = None,
+    amount_viability_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     out = np.zeros((max_planets + 1, len(PAIR_FEATURE_NAMES)), dtype=np.float32)
     name_to_idx = {name: i for i, name in enumerate(PLANET_FEATURE_NAMES)}
@@ -363,6 +368,9 @@ def pair_features_from_dense(
     source_ships = max(0.0, ships_from_log_norm(float(source[name_to_idx["ships_log_norm"]])))
     source_prod = max(0.0, float(source[name_to_idx["production_norm"]]) * 5.0)
     source_under_threat = float(source[name_to_idx["under_threat_20"]])
+    amount_bin_count = 0
+    if amount_viability_mask is not None:
+        amount_bin_count = max(1, int(np.asarray(amount_viability_mask).shape[-1]) - 1)
     for target_slot in range(max_planets):
         target = planet_features[target_slot]
         if float(target[name_to_idx["alive"]]) <= 0.0:
@@ -385,6 +393,12 @@ def pair_features_from_dense(
         nearest_enemy = float(ts[target_name_to_idx["nearest_enemy_eta_to_target"]])
         our_arrival = min(1.0, (distance * 10.0) / 50.0)
         projected_20 = float(ts[target_name_to_idx["projected_garrison_20"]])
+        geom_viable = 0.0
+        geom_amount_frac = 0.0
+        if target_viability_mask is not None:
+            geom_viable = 1.0 if bool(np.asarray(target_viability_mask)[target_slot]) else 0.0
+        if amount_viability_mask is not None and amount_bin_count > 0:
+            geom_amount_frac = float(np.asarray(amount_viability_mask)[target_slot, 1:].sum()) / float(amount_bin_count)
         row = [
             capture_needed / 100.0,
             capture_needed / max(1.0, source_ships),
@@ -398,6 +412,9 @@ def pair_features_from_dense(
             distance,
             math.sin(angle),
             math.cos(angle),
+            geom_viable,
+            geom_amount_frac,
+            1.0 if geom_amount_frac <= 0.0 else 0.0,
             safe_sendable / 100.0,
             (source_ships - capture_needed) / max(1.0, source_ships),
             source_ships / max(1.0, capture_needed),
