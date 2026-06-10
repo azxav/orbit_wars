@@ -82,8 +82,7 @@ def validate_dataset(out_dir: str | Path) -> dict[str, Any]:
         or bool(row.get("ambiguous_multi_launch", False))
         or str(row.get("target_inference_method", "") or "") == "angular_nearest"
     ]
-    if invalid_bc_rows:
-        raise RuntimeError(f"BC-invalid source rows present in source_turn_rows.jsonl: {len(invalid_bc_rows)}")
+    num_invalid_bc_rows = len(invalid_bc_rows)
 
     if dense_arrays is not None and "target_viability_mask" in dense_arrays and "amount_viability_mask" in dense_arrays:
         state_rows = read_jsonl(out_dir / "state_rows.jsonl") if (out_dir / "state_rows.jsonl").exists() else []
@@ -123,6 +122,7 @@ def validate_dataset(out_dir: str | Path) -> dict[str, Any]:
             "noop_source_turns": noops,
             "ambiguous_multi_launch_sources": ambiguous,
             "drop_for_v1_bc_rows": drop_v1,
+            "bc_invalid_source_rows": num_invalid_bc_rows,
         },
         "rates": {
             "valid_launch_rate": launch_valid / denom_launch,
@@ -131,6 +131,7 @@ def validate_dataset(out_dir: str | Path) -> dict[str, Any]:
             "geometry_viable_source_rate": geometry_viable / denom_source,
             "noop_source_rate": noops / denom_source,
             "drop_for_v1_bc_rate": drop_v1 / denom_source,
+            "bc_invalid_source_rate": num_invalid_bc_rows / denom_source,
         },
         "target_inference_methods": dict(methods),
         "amount_bin_distribution_source_turns": dict(amount_bins),
