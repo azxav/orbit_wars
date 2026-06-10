@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import numpy as np
@@ -19,6 +20,100 @@ from .schema import (
 )
 
 
+def _fleet_owner(fleet: Any) -> int | None:
+    if isinstance(fleet, dict):
+        for key in ("owner", "player", "player_id"):
+            if key in fleet:
+                return int(fleet[key])
+        return None
+    if isinstance(fleet, (list, tuple)) and len(fleet) >= 2:
+        return int(fleet[1])
+    return None
+
+
+def _fleet_target_id(fleet: Any) -> int | None:
+    if isinstance(fleet, dict):
+        for key in ("target_planet_id", "target", "to_planet_id", "destination"):
+            if key in fleet and fleet[key] is not None:
+                return int(fleet[key])
+        return None
+    if isinstance(fleet, (list, tuple)):
+        for idx in (3, 2):
+            if len(fleet) > idx:
+                try:
+                    return int(fleet[idx])
+                except Exception:
+                    pass
+    return None
+
+
+def _fleet_ships(fleet: Any) -> float:
+    if isinstance(fleet, dict):
+        for key in ("ships", "num_ships", "ship_count"):
+            if key in fleet:
+                return max(0.0, safe_float(fleet[key]))
+        return 0.0
+    if isinstance(fleet, (list, tuple)):
+        for idx in (5, 4, 3):
+            if len(fleet) > idx:
+                value = safe_float(fleet[idx], -1.0)
+                if value >= 0.0:
+                    return value
+    return 0.0
+
+
+def _fleet_eta(fleet: Any) -> float:
+    if isinstance(fleet, dict):
+        for key in ("eta", "remaining_turns", "turns_remaining", "remaining"):
+            if key in fleet:
+                return safe_float(fleet[key], math.inf)
+        return math.inf
+    if isinstance(fleet, (list, tuple)):
+        for idx in (6, 7, 8):
+            if len(fleet) > idx:
+                value = safe_float(fleet[idx], math.inf)
+                if math.isfinite(value):
+                    return value
+    return math.inf
+
+
+def projected_capture_needed_ships(
+    obs: dict[str, Any],
+    source: Any,
+    target: Any,
+    player_id: int,
+    *,
+    horizon: int = 20,
+) -> int:
+    """Ships required after already-visible incoming fleets up to horizon are applied.
+
+    This is deliberately conservative: owned targets stay reinforcement-viable with one ship,
+    while neutral/enemy targets require enough ships to beat projected hostile garrison.
+    """
+    if target is None or not isinstance(target, (list, tuple)) or len(target) < 7:
+        return capture_needed_ships(source, target, int(player_id))
+    owner = int(target[1])
+    if owner == int(player_id):
+        return 1
+    target_id = int(target[0])
+    base_ships = max(0.0, safe_float(target[5]))
+    friendly = 0.0
+    hostile = 0.0
+    for fleet in obs.get("fleets", []) or []:
+        if _fleet_target_id(fleet) != target_id:
+            continue
+        eta = _fleet_eta(fleet)
+        if not math.isfinite(eta) or eta > int(horizon):
+            continue
+        ships = _fleet_ships(fleet)
+        if _fleet_owner(fleet) == int(player_id):
+            friendly += ships
+        else:
+            hostile += ships
+    projected = max(0.0, base_ships + hostile - friendly)
+    return max(1, int(math.floor(projected)) + 1)
+
+
 def compute_viability_masks(
     obs: dict[str, Any],
     player_id: int,
@@ -26,8 +121,14 @@ def compute_viability_masks(
     horizon: int = 160,
     device: str = "cpu",
     geometry: Any = None,
+    require_capture_viability: bool = True,
+    capture_horizon: int = 20,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return deterministic source-target and source-target-amount viability masks."""
+    """Return deterministic source-target and source-target-amount viability masks.
+
+    A positive amount is valid only if the exact geometry reaches the intended target.
+    For non-owned targets, it must also send enough ships to beat projected garrison.
+    """
     amount_bins = len(AMOUNT_BIN_NAMES)
     target_mask = np.zeros((P_MAX, P_MAX + 1), dtype=bool)
     amount_mask = np.zeros((P_MAX, P_MAX + 1, amount_bins), dtype=bool)
@@ -56,10 +157,20 @@ def compute_viability_masks(
             if target_slot >= len(planets) or len(planets[target_slot]) < 7:
                 continue
             target = planets[target_slot]
-            capture_needed = capture_needed_ships(source, target, int(player_id))
+            current_needed = capture_needed_ships(source, target, int(player_id))
+            projected_needed = projected_capture_needed_ships(
+                obs,
+                source,
+                target,
+                int(player_id),
+                horizon=int(capture_horizon),
+            )
+            target_is_owned = int(target[1]) == int(player_id)
             for amount_bin in range(1, amount_bins):
-                ships = decode_amount_bin(amount_bin, available, capture_needed)
+                ships = decode_amount_bin(amount_bin, available, current_needed)
                 if ships <= 0:
+                    continue
+                if require_capture_viability and not target_is_owned and int(ships) < int(projected_needed):
                     continue
                 sources.append(int(source_slot))
                 targets.append(int(target_slot))
