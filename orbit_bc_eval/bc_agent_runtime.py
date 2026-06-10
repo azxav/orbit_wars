@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 
 from orbit_bc_training.checkpoints import load_checkpoint
@@ -26,7 +27,7 @@ class MoveValidation:
 
 
 _MODEL_CACHE: dict[tuple[str, str], tuple[Any, dict]] = {}
-_GEOMETRY = None
+_GEOMETRY_CACHE: dict[tuple[int, str], Any] = {}
 _RUNTIME_CONFIG: dict[str, Any] = {}
 LAST_DEBUG: dict[str, Any] = {}
 
@@ -78,10 +79,37 @@ def _load_model_once(checkpoint: str | Path, device: str) -> tuple[Any, dict]:
 
 
 def _geometry_once(horizon: int, device: str = "cpu"):
-    global _GEOMETRY
-    if _GEOMETRY is None:
-        _GEOMETRY = make_geometry(horizon=int(horizon), device=device)
-    return _GEOMETRY
+    key = (int(horizon), str(device))
+    if key not in _GEOMETRY_CACHE:
+        _GEOMETRY_CACHE[key] = make_geometry(horizon=int(horizon), device=device)
+    return _GEOMETRY_CACHE[key]
+
+
+def _source_viability_slices(
+    obs: dict[str, Any],
+    player_id: int,
+    source_slot: int,
+    *,
+    target_viability_mask: Any = None,
+    amount_viability_mask: Any = None,
+    horizon: int = DEFAULT_GEOMETRY_HORIZON,
+    geometry: Any = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    if target_viability_mask is None or amount_viability_mask is None:
+        target_viability_mask, amount_viability_mask = compute_viability_masks(
+            obs,
+            int(player_id),
+            horizon=int(horizon),
+            device="cpu",
+            geometry=geometry,
+        )
+    target_arr = np.asarray(target_viability_mask, dtype=bool)
+    amount_arr = np.asarray(amount_viability_mask, dtype=bool)
+    if target_arr.ndim == 2:
+        target_arr = target_arr[int(source_slot)]
+    if amount_arr.ndim == 3:
+        amount_arr = amount_arr[int(source_slot)]
+    return target_arr, amount_arr
 
 
 def build_source_batch(
@@ -91,10 +119,29 @@ def build_source_batch(
     *,
     device: str = "cpu",
     model_config: Any = None,
+    target_viability_mask: Any = None,
+    amount_viability_mask: Any = None,
+    horizon: int = DEFAULT_GEOMETRY_HORIZON,
+    geometry: Any = None,
 ) -> dict[str, torch.Tensor]:
     del model_config
     feature_state = build_feature_state(obs, int(player_id), P_MAX)
-    pair_features = pair_features_from_dense(feature_state.planet_features, feature_state.target_state_features, int(source_slot))
+    source_target_mask, source_amount_mask = _source_viability_slices(
+        obs,
+        int(player_id),
+        int(source_slot),
+        target_viability_mask=target_viability_mask,
+        amount_viability_mask=amount_viability_mask,
+        horizon=int(horizon),
+        geometry=geometry,
+    )
+    pair_features = pair_features_from_dense(
+        feature_state.planet_features,
+        feature_state.target_state_features,
+        int(source_slot),
+        target_viability_mask=source_target_mask,
+        amount_viability_mask=source_amount_mask,
+    )
     return {
         "planet_features": torch.as_tensor(feature_state.planet_features[None, ...], dtype=torch.float32, device=device),
         "global_features": torch.as_tensor(feature_state.global_features[None, ...], dtype=torch.float32, device=device),
@@ -121,6 +168,11 @@ def masked_target_prediction(obs: dict[str, Any], source_slot: int, target_logit
     mask = target_mask_for_source(obs, source_slot) if target_mask is None else torch.as_tensor(target_mask, dtype=torch.bool)
     mask = mask.to(torch.as_tensor(target_logits).device)
     return int(masked_argmax(torch.as_tensor(target_logits).float().unsqueeze(0), mask.unsqueeze(0))[0].item())
+
+
+def _masked_amount_prediction(amount_logits: torch.Tensor, amount_mask: torch.Tensor) -> int:
+    mask = torch.as_tensor(amount_mask, dtype=torch.bool, device=torch.as_tensor(amount_logits).device)
+    return int(masked_argmax(torch.as_tensor(amount_logits).float().unsqueeze(0), mask.unsqueeze(0))[0].item())
 
 
 def validate_env_move(obs: dict[str, Any], player_id: int, move: list[Any]) -> MoveValidation:
@@ -220,14 +272,28 @@ def agent(obs, config):
             source = obs.get("planets", [])[source_slot]
             source_planet_id = int(source[0])
             with torch.no_grad():
-                batch = build_source_batch(obs, player_id, source_slot, device=device, model_config=model_config)
-                output = model(batch)
-            target_logits = output["target_logits"][0].detach().cpu()
-            amount_logits = output["amount_logits"][0].detach().cpu()
+                batch = build_source_batch(
+                    obs,
+                    player_id,
+                    source_slot,
+                    device=device,
+                    model_config=model_config,
+                    target_viability_mask=turn_target_mask_np[int(source_slot)],
+                    amount_viability_mask=turn_amount_mask_np[int(source_slot)],
+                    horizon=horizon,
+                    geometry=geometry,
+                )
+                target_output = model(batch)
+            target_logits = target_output["target_logits"][0].detach().cpu()
             target_mask = torch.as_tensor(turn_target_mask_np[int(source_slot)], dtype=torch.bool)
             target_pred = masked_target_prediction(obs, source_slot, target_logits, target_mask)
             amount_mask = torch.as_tensor(turn_amount_mask_np[int(source_slot), int(target_pred)], dtype=torch.bool)
-            amount_pred = int(masked_argmax(amount_logits.float().unsqueeze(0), amount_mask.unsqueeze(0))[0].item())
+            with torch.no_grad():
+                amount_batch = dict(batch)
+                amount_batch["target_label"] = torch.as_tensor([int(target_pred)], dtype=torch.long, device=device)
+                amount_output = model(amount_batch)
+            amount_logits = amount_output["amount_logits"][0].detach().cpu()
+            amount_pred = _masked_amount_prediction(amount_logits, amount_mask)
             if target_pred == NOOP_TARGET_SLOT:
                 debug["no_op_source_decisions"] += 1
             else:
