@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from orbit_training_prep.features import PAIR_FEATURE_NAMES
 from orbit_training_prep.schema import NOOP_TARGET_SLOT
 
 
@@ -28,6 +29,7 @@ def _write_minimal_dense(path: Path) -> None:
         planet_features=np.zeros((1, 64, 16), dtype=np.float32),
         global_features=np.zeros((1, 10), dtype=np.float32),
         target_state_features=np.zeros((1, 64, 9), dtype=np.float32),
+        pair_features=np.zeros((1, 64, 65, len(PAIR_FEATURE_NAMES)), dtype=np.float32),
         target_labels=np.full((1, 64), NOOP_TARGET_SLOT, dtype=np.int64),
         amount_labels=np.zeros((1, 64), dtype=np.int64),
         source_mask=np.zeros((1, 64), dtype=np.float32),

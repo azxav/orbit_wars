@@ -27,6 +27,7 @@ REQUIRED_DENSE_KEYS = {
     "planet_features",
     "global_features",
     "target_state_features",
+    "pair_features",
     "target_labels",
     "amount_labels",
     "source_mask",
@@ -34,6 +35,7 @@ REQUIRED_DENSE_KEYS = {
     "amount_viability_mask",
 }
 OLD_DATASET_MESSAGE = "Old feature-versioned dataset detected. Rebuild dataset with the new compact feature contract."
+NOT_BC_READY_MESSAGE = "Dataset is not BC-ready. Rebuild with the updated dataset_builder."
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -54,6 +56,7 @@ def _find_dense_source(dataset_dir: Path) -> tuple[Path | None, list[dict[str, A
         dataset_dir.parent / "dense_bc_arrays.npz",
         dataset_dir.parent.parent / "dense_bc_arrays.npz",
         dataset_dir.parent.parent / "combined" / "dense_bc_arrays.npz",
+        dataset_dir.parent.parent / "combined_new" / "dense_bc_arrays.npz",
     ]
     for dense in candidates:
         state_path = dense.parent / "state_rows.jsonl"
@@ -63,17 +66,26 @@ def _find_dense_source(dataset_dir: Path) -> tuple[Path | None, list[dict[str, A
 
 
 def _row_weight(row: dict[str, Any], is_noop: bool) -> float:
-    if "sample_weight" in row:
-        return float(row["sample_weight"])
-    weight = 0.8 if is_noop else 1.0
+    base = float(row.get("sample_weight", 1.0))
+
+    if is_noop:
+        base *= 0.2
+    else:
+        base *= 1.0
+
     if bool(row.get("winner_action", False)) or float(row.get("final_reward", 0.0) or 0.0) > 0.0:
-        weight *= 1.1
+        base *= 1.1
+
     step = int(row.get("step_index", row.get("step", row.get("obs_step", 0))) or 0)
     if not is_noop and step <= 100:
-        weight *= 1.1
+        base *= 1.1
     if step > 430:
-        weight *= 0.8
-    return float(weight)
+        base *= 0.8
+
+    if "train_weight" in row:
+        base *= float(row["train_weight"])
+
+    return float(base)
 
 
 def is_train_valid_source_row(row: dict[str, Any]) -> bool:
@@ -97,8 +109,9 @@ class OrbitBCDataset(Dataset):
 
     noop_target_slot = NOOP_TARGET_SLOT
 
-    def __init__(self, dataset_dir: str | Path):
+    def __init__(self, dataset_dir: str | Path, *, allow_filter_invalid_rows: bool = False):
         self.dataset_dir = Path(dataset_dir)
+        self.allow_filter_invalid_rows = bool(allow_filter_invalid_rows)
         self.rows = self._load_rows()
         dense_path, state_rows = _find_dense_source(self.dataset_dir)
         if dense_path is None:
@@ -125,12 +138,17 @@ class OrbitBCDataset(Dataset):
         out: list[dict[str, Any]] = []
         for row in rows:
             if not is_train_valid_source_row(row):
-                continue
+                if self.allow_filter_invalid_rows:
+                    continue
+                raise RuntimeError(NOT_BC_READY_MESSAGE)
             target = int(row.get("target_slot_label", NOOP_TARGET_SLOT))
             amount = int(row.get("amount_bin_label", 0))
             if target == NOOP_TARGET_SLOT and amount != 0:
-                row = dict(row)
-                row["amount_bin_label"] = 0
+                if self.allow_filter_invalid_rows:
+                    row = dict(row)
+                    row["amount_bin_label"] = 0
+                else:
+                    raise RuntimeError(NOT_BC_READY_MESSAGE)
             out.append(row)
         return out
 
@@ -157,13 +175,7 @@ class OrbitBCDataset(Dataset):
         target_state_features = np.asarray(self._dense["target_state_features"][dense_idx], dtype=np.float32)
         target_mask = np.asarray(self._dense["target_viability_mask"][dense_idx, source_slot], dtype=bool).copy()
         amount_mask_for_source = np.asarray(self._dense["amount_viability_mask"][dense_idx, source_slot], dtype=bool).copy()
-        pair_features = pair_features_from_dense(
-            planet_features,
-            target_state_features,
-            source_slot,
-            target_viability_mask=target_mask,
-            amount_viability_mask=amount_mask_for_source,
-        )
+        pair_features = np.asarray(self._dense["pair_features"][dense_idx, source_slot], dtype=np.float32)
         if not bool(target_mask[target_label]):
             raise RuntimeError(
                 f"BC row {row.get('source_turn_uid', idx)!r} target label {target_label} is outside the geometry/capture viability mask for source {source_slot}."

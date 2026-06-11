@@ -3,6 +3,8 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from orbit_training_prep.schema import NOOP_TARGET_SLOT
+
 
 NEG_INF = -1.0e9
 
@@ -28,7 +30,11 @@ def bc_loss_and_metrics(outputs: dict[str, torch.Tensor], batch: dict[str, torch
     target_labels = batch["target_label"]
     amount_labels = batch["amount_label"]
     target_loss = _weighted_ce(target_logits, target_labels, weights)
-    amount_loss = _weighted_ce(amount_logits, amount_labels, weights)
+    amount_rows = target_labels != NOOP_TARGET_SLOT
+    if amount_rows.any():
+        amount_loss = _weighted_ce(amount_logits[amount_rows], amount_labels[amount_rows], weights[amount_rows])
+    else:
+        amount_loss = amount_logits.sum() * 0.0
     loss = target_loss + amount_loss
     target_pred = target_logits.argmax(dim=1)
     amount_pred = amount_logits.argmax(dim=1)
@@ -49,4 +55,3 @@ def bc_loss_and_metrics(outputs: dict[str, torch.Tensor], batch: dict[str, torch
         "noop_rate_true": float(is_noop.float().mean().detach().cpu()),
     }
     return loss, metrics
-

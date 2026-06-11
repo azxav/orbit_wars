@@ -12,7 +12,7 @@ import torch
 from orbit_bc_training.checkpoints import load_checkpoint
 from orbit_bc_training.decode_policy import decode_bc_prediction
 from orbit_bc_training.losses import masked_argmax
-from orbit_training_prep.features import build_feature_state, pair_features_from_dense
+from orbit_training_prep.features import build_feature_state, pair_features_from_obs
 from orbit_training_prep.geometry_bridge import make_geometry
 from orbit_training_prep.schema import AMOUNT_BIN_NAMES, P_MAX, NOOP_TARGET_SLOT, capture_needed_ships, decode_amount_bin, owned_source_slots, safe_float
 from orbit_training_prep.viability import compute_viability_masks
@@ -135,12 +135,15 @@ def build_source_batch(
         horizon=int(horizon),
         geometry=geometry,
     )
-    pair_features = pair_features_from_dense(
-        feature_state.planet_features,
-        feature_state.target_state_features,
+    pair_features = pair_features_from_obs(
+        obs,
+        int(player_id),
         int(source_slot),
+        max_planets=P_MAX,
         target_viability_mask=source_target_mask,
         amount_viability_mask=source_amount_mask,
+        feature_state=feature_state,
+        geometry=geometry,
     )
     return {
         "planet_features": torch.as_tensor(feature_state.planet_features[None, ...], dtype=torch.float32, device=device),

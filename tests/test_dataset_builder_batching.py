@@ -80,8 +80,56 @@ def test_dataset_builder_records_device_and_batched_inference_mode(tmp_path: Pat
     assert metadata["stats"]["max_raw_launch_batch_size"] == 2
     assert [row["target_inference_method"] for row in launch_rows] == ["first_contact", "angular_nearest"]
     assert "pair_rank_rows" not in metadata["files"]
-    assert "pair_feature_names" not in metadata
+    assert "pair_feature_names" in metadata
     assert not (out_dir / "pair_rank_rows.jsonl").exists()
+
+
+def test_dataset_builder_source_rows_are_bc_ready_and_dense_dropped_positive_is_noop(tmp_path: Path) -> None:
+    obs = static_obs(
+        [
+            [1, 0, 10.0, 50.0, 1.0, 80.0, 1.0],
+            [2, -1, 30.0, 52.0, 3.0, 5.0, 1.0],
+            [3, -1, 80.0, 50.0, 2.0, 5.0, 1.0],
+        ]
+    )
+    replay_path = tmp_path / "replay.json"
+    out_dir = tmp_path / "dataset"
+    replay_with_actions(replay_path, obs, [[1, 0.0, 10], [1, math.pi, 10]])
+
+    metadata = DatasetBuilder(horizon=80, device="cpu").build_from_replay(replay_path, out_dir)
+    source_rows = read_jsonl(out_dir / "source_turn_rows.jsonl")
+    dense = dict(__import__("numpy").load(out_dir / "dense_bc_arrays.npz"))
+
+    assert source_rows == []
+    assert metadata["stats"]["raw_source_turns"] == 1
+    assert metadata["stats"]["raw_positive_source_turns"] == 1
+    assert metadata["stats"]["train_source_turns"] == 0
+    assert metadata["stats"]["train_positive_source_turns"] == 0
+    assert metadata["stats"]["dropped_source_turns"] == 1
+    assert metadata["stats"]["dropped_ambiguous_sources"] == 1
+    assert int(dense["target_labels"][0, 0]) == 64
+    assert int(dense["amount_labels"][0, 0]) == 0
+
+
+def test_dataset_builder_fresh_output_validates_without_repair(tmp_path: Path) -> None:
+    from orbit_training_prep.validate_dataset import validate_dataset
+
+    obs = static_obs(
+        [
+            [1, 0, 10.0, 50.0, 1.0, 80.0, 1.0],
+            [2, -1, 30.0, 52.0, 3.0, 5.0, 1.0],
+        ]
+    )
+    replay_path = tmp_path / "replay.json"
+    out_dir = tmp_path / "dataset"
+    replay_with_actions(replay_path, obs, [[1, 0.0, 10]])
+
+    DatasetBuilder(horizon=80, device="cpu").build_from_replay(replay_path, out_dir)
+    report = validate_dataset(out_dir)
+
+    assert report["counts"]["bc_invalid_source_rows"] == 0
+    assert report["counts"]["drop_for_v1_bc_rows"] == 0
+    assert report["counts"]["source_turn_rows"] == 1
 
 
 def test_dataset_builder_emits_geometry_viability_masks(tmp_path: Path) -> None:

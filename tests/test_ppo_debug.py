@@ -103,14 +103,16 @@ def test_ppo_act_observation_uses_geometry_target_mask(monkeypatch) -> None:
     amount_mask_table = torch.zeros((64, 65, 7), dtype=torch.bool).numpy()
     amount_mask_table[0, 2, 4] = True
 
+    from orbit_training_prep.features import PAIR_FEATURE_NAMES
+
     monkeypatch.setattr(
         policy_mod,
         "build_source_batch",
-        lambda obs, player_id, source_slot, device="cpu": {
+        lambda obs, player_id, source_slot, device="cpu", **kwargs: {
             "planet_features": torch.zeros((1, 64, 16)),
             "global_features": torch.zeros((1, 10)),
             "target_state_features": torch.zeros((1, 64, 9)),
-            "pair_features": torch.zeros((1, 65, 22)),
+            "pair_features": torch.zeros((1, 65, len(PAIR_FEATURE_NAMES))),
             "source_slot": torch.tensor([source_slot]),
         },
     )

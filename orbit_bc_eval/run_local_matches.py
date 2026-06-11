@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
 from pathlib import Path
 from typing import Any, Callable
@@ -165,7 +166,57 @@ def _make_bc_agent_for_checkpoint(
     return RecordingAgent(call_bc, player_id=player_id, is_bc=True)
 
 
+def _checkpoint_file(path: str | Path) -> Path:
+    candidate = Path(path)
+    return candidate / "checkpoint.pt" if candidate.is_dir() else candidate
+
+
+def _validate_checkpoint_path(path: str | Path, label: str) -> None:
+    checkpoint_file = _checkpoint_file(path)
+    if not checkpoint_file.exists():
+        raise RuntimeError(f"{label} checkpoint does not exist: {checkpoint_file}")
+    if not checkpoint_file.is_file():
+        raise RuntimeError(f"{label} checkpoint path is not a file: {checkpoint_file}")
+
+
+def _preflight_checkpoint(path: str | Path, label: str, device: str) -> None:
+    _validate_checkpoint_path(path, label)
+    try:
+        bc_agent_runtime._load_model_once(path, str(device))
+    except Exception as exc:
+        raise RuntimeError(f"{label} checkpoint could not be loaded: {_checkpoint_file(path)} ({type(exc).__name__}: {exc})") from exc
+
+
+def _write_html_replay_index(html_dir: Path, rendered_games: list[dict[str, Any]]) -> None:
+    metadata_fields = ["game_id", "seed", "bc_seat", "reward", "rank", "win", "launches", "final_owned_planets"]
+    lines = [
+        "<!doctype html>",
+        '<html lang="en">',
+        "<head>",
+        '  <meta charset="utf-8">',
+        "  <title>Orbit Wars BC HTML Replays</title>",
+        "</head>",
+        "<body>",
+        "  <h1>Orbit Wars BC HTML Replays</h1>",
+        "  <ul>",
+    ]
+    for game in rendered_games:
+        filename = html.escape(str(game["filename"]), quote=True)
+        game_id = html.escape(str(game.get("game_id", "")))
+        metadata = []
+        for field in metadata_fields:
+            if field in game:
+                metadata.append(f"{html.escape(field)}={html.escape(str(game[field]))}")
+        details = html.escape(", ".join(metadata))
+        lines.append(f'    <li><a href="{filename}">{game_id}</a> - {details}</li>')
+    lines.extend(["  </ul>", "</body>", "</html>", ""])
+    (html_dir / "index.html").write_text("\n".join(lines), encoding="utf-8")
+
+
 def run_games(args: argparse.Namespace) -> dict[str, Any]:
+    _preflight_checkpoint(args.bc_checkpoint, "BC", args.device)
+    if args.opponent == "bc_checkpoint":
+        _preflight_checkpoint(args.opponent_bc_checkpoint, "Opponent BC", args.device)
     make = _import_make()
     players = _normalize_players(args.players)
     out_dir = Path(args.out_dir)
@@ -173,6 +224,12 @@ def run_games(args: argparse.Namespace) -> dict[str, Any]:
     debug_dir = out_dir / "debug"
     if args.debug_game:
         debug_dir.mkdir(parents=True, exist_ok=True)
+    render_html = bool(getattr(args, "render_html", False))
+    html_dir = out_dir / str(getattr(args, "html_dir", "html"))
+    html_limit = max(0, int(getattr(args, "render_html_games", 1)))
+    rendered_html_games: list[dict[str, Any]] = []
+    if render_html:
+        html_dir.mkdir(parents=True, exist_ok=True)
     bc_agent_runtime.configure_bc_agent(
         checkpoint=args.bc_checkpoint,
         device=args.device,
@@ -230,6 +287,26 @@ def run_games(args: argparse.Namespace) -> dict[str, Any]:
         row = metrics.finalize(rewards=rewards, statuses=statuses, final_obs=final_obs)
         row["seed"] = seed
         rows.append(row)
+        if render_html and len(rendered_html_games) < html_limit:
+            html_filename = f"{row['game_id']}.html"
+            try:
+                html_text = env.render(mode="html")
+                (html_dir / html_filename).write_text(str(html_text), encoding="utf-8")
+                rendered_html_games.append(
+                    {
+                        "filename": html_filename,
+                        "game_id": row.get("game_id"),
+                        "seed": seed,
+                        "bc_seat": row.get("bc_seat", bc_seat),
+                        "reward": row.get("reward"),
+                        "rank": row.get("rank"),
+                        "win": row.get("win"),
+                        "launches": row.get("launches"),
+                        "final_owned_planets": row.get("final_owned_planets"),
+                    }
+                )
+            except Exception as exc:
+                notes.append(f"HTML replay render failed for {row['game_id']}: {type(exc).__name__}: {exc}")
         if args.debug_game:
             debug_payload = {
                 "game_id": row["game_id"],
@@ -243,7 +320,15 @@ def run_games(args: argparse.Namespace) -> dict[str, Any]:
                 debug_payload["replay_error"] = f"{type(exc).__name__}: {exc}"
             with open(debug_dir / f"{row['game_id']}.json", "w", encoding="utf-8") as f:
                 json.dump(debug_payload, f, indent=2, sort_keys=True)
-    return write_eval_report(rows, out_dir=out_dir, opponent=_opponent_label(args), players=players, bc_seats=seats, notes=notes)
+    if render_html:
+        _write_html_replay_index(html_dir, rendered_html_games)
+    summary = write_eval_report(rows, out_dir=out_dir, opponent=_opponent_label(args), players=players, bc_seats=seats, notes=notes)
+    if render_html:
+        summary["html_replay_dir"] = str(html_dir)
+        summary["html_replay_count"] = len(rendered_html_games)
+        with open(out_dir / "summary.json", "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, sort_keys=True)
+    return summary
 
 
 def _player_counts(value: str) -> list[int]:
@@ -285,6 +370,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--geometry_horizon", type=int, default=DEFAULT_GEOMETRY_HORIZON)
     ap.add_argument("--heuristic_path", default=str(DEFAULT_HEURISTIC_PATH), help="Heuristic opponent module (default: ./orbit_wars_base.py).")
     ap.add_argument("--debug_game", action="store_true")
+    ap.add_argument("--render_html", action="store_true", help="Save Kaggle HTML replay files for local matches.")
+    ap.add_argument("--render_html_games", type=int, default=1, help="Maximum number of games to export as HTML replays.")
+    ap.add_argument("--html_dir", default="html", help="Output subdirectory for HTML replays under --out_dir.")
     return ap
 
 

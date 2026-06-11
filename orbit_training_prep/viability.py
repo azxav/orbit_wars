@@ -263,7 +263,9 @@ def compute_viability_masks(
         return target_mask, amount_mask
 
     geometry = geometry or make_geometry(horizon=int(horizon), device=str(device))
-    obs_tensors = geometry.obs_to_tensors(obs, player_id=int(player_id))
+    obs_for_movement = dict(obs)
+    obs_for_movement["fleets"] = []
+    obs_tensors = geometry.obs_to_tensors(obs_for_movement, player_id=int(player_id))
     movement = geometry.build_or_update_movement(obs_tensors)
 
     sources: list[int] = []

@@ -32,9 +32,16 @@ def _make_dense_dataset(path: Path, *, rows: int = 16) -> None:
     planet_features[:, :, 7] = np.clip(planet_features[:, :, 7], 0.0, 1.0)
     global_features = rng.normal(size=(rows, len(GLOBAL_FEATURE_NAMES))).astype(np.float32)
     target_state_features = rng.normal(size=(rows, pmax, len(TARGET_STATE_FEATURE_NAMES))).astype(np.float32)
+    pair_features = rng.normal(size=(rows, pmax, pmax + 1, len(PAIR_FEATURE_NAMES))).astype(np.float32)
+    pair_features[:, :, NOOP_TARGET_SLOT, :-1] = 0.0
+    pair_features[:, :, NOOP_TARGET_SLOT, -1] = 1.0
     target_labels = np.full((rows, pmax), NOOP_TARGET_SLOT, dtype=np.int64)
     amount_labels = np.zeros((rows, pmax), dtype=np.int64)
     source_mask = np.zeros((rows, pmax), dtype=np.float32)
+    target_viability_mask = np.zeros((rows, pmax, pmax + 1), dtype=bool)
+    amount_viability_mask = np.zeros((rows, pmax, pmax + 1, 7), dtype=bool)
+    target_viability_mask[:, :, NOOP_TARGET_SLOT] = True
+    amount_viability_mask[:, :, NOOP_TARGET_SLOT, 0] = True
     source_rows = []
     state_rows = []
     for i in range(rows):
@@ -44,6 +51,8 @@ def _make_dense_dataset(path: Path, *, rows: int = 16) -> None:
         source_mask[i, source] = 1.0
         target_labels[i, source] = target
         amount_labels[i, source] = amount
+        target_viability_mask[i, source, target] = True
+        amount_viability_mask[i, source, target, amount] = True
         obs_uid = f"e{i // 4}:{i}:p0"
         state_rows.append({"obs_uid": obs_uid, "episode_id": f"e{i // 4}", "step_index": i, "player_id": 0})
         source_rows.append(
@@ -57,7 +66,11 @@ def _make_dense_dataset(path: Path, *, rows: int = 16) -> None:
                 "target_slot_label": target,
                 "amount_bin_label": amount,
                 "sample_weight": 0.2 if target == NOOP_TARGET_SLOT else 1.0,
+                "train_weight": 0.5,
                 "drop_for_v1_bc": False,
+                "geometry_viable": True,
+                "ambiguous_multi_launch": False,
+                "target_inference_method": "noop" if target == NOOP_TARGET_SLOT else "first_contact",
             }
         )
     np.savez_compressed(
@@ -65,9 +78,12 @@ def _make_dense_dataset(path: Path, *, rows: int = 16) -> None:
         planet_features=planet_features,
         global_features=global_features,
         target_state_features=target_state_features,
+        pair_features=pair_features,
         target_labels=target_labels,
         amount_labels=amount_labels,
         source_mask=source_mask,
+        target_viability_mask=target_viability_mask,
+        amount_viability_mask=amount_viability_mask,
         planet_feature_names=np.asarray(PLANET_FEATURE_NAMES),
         global_feature_names=np.asarray(GLOBAL_FEATURE_NAMES),
         target_state_feature_names=np.asarray(TARGET_STATE_FEATURE_NAMES),
@@ -105,6 +121,7 @@ def test_feature_contract_excludes_future_labels() -> None:
 
 
 def test_dataset_loads_required_fields_and_labels(tmp_path: Path) -> None:
+    from orbit_training_prep.features import PAIR_FEATURE_NAMES
     from orbit_bc_training.dataset import OrbitBCDataset
 
     _make_dense_dataset(tmp_path)
@@ -114,14 +131,16 @@ def test_dataset_loads_required_fields_and_labels(tmp_path: Path) -> None:
     assert sample["planet_features"].shape == (64, 16)
     assert sample["global_features"].shape == (10,)
     assert sample["target_state_features"].shape == (64, 9)
-    assert sample["pair_features"].shape == (65, 22)
+    assert sample["pair_features"].shape == (65, len(PAIR_FEATURE_NAMES))
     assert sample["target_mask"].shape == (65,)
     assert sample["target_mask"][NOOP_TARGET_SLOT]
     assert 0 <= int(sample["target_label"]) <= NOOP_TARGET_SLOT
     assert int(ds.noop_target_slot) == NOOP_TARGET_SLOT
 
 
-def test_dataset_filters_v1_invalid_source_rows(tmp_path: Path) -> None:
+def test_dataset_rejects_v1_invalid_source_rows_by_default(tmp_path: Path) -> None:
+    import pytest
+
     from orbit_bc_training.dataset import OrbitBCDataset
 
     _make_dense_dataset(tmp_path, rows=4)
@@ -176,10 +195,33 @@ def test_dataset_filters_v1_invalid_source_rows(tmp_path: Path) -> None:
     ]
     _write_jsonl(tmp_path / "source_turn_rows.jsonl", rows)
 
-    ds = OrbitBCDataset(tmp_path)
+    with pytest.raises(RuntimeError, match="Dataset is not BC-ready. Rebuild with the updated dataset_builder."):
+        OrbitBCDataset(tmp_path)
 
+    ds = OrbitBCDataset(tmp_path, allow_filter_invalid_rows=True)
     assert len(ds) == 1
     assert ds.rows[0]["source_turn_uid"] == "keep"
+
+
+def test_dataset_multiplies_sample_weight_and_train_weight(tmp_path: Path) -> None:
+    from orbit_bc_training.dataset import OrbitBCDataset
+
+    _make_dense_dataset(tmp_path, rows=1)
+    row = json.loads((tmp_path / "source_turn_rows.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    row["sample_weight"] = 0.25
+    row["train_weight"] = 0.5
+    row["target_slot_label"] = 1
+    row["amount_bin_label"] = 3
+    row["target_inference_method"] = "first_contact"
+    _write_jsonl(tmp_path / "source_turn_rows.jsonl", [row])
+    dense = dict(np.load(tmp_path / "dense_bc_arrays.npz"))
+    dense["target_viability_mask"][0, int(row["source_slot"]), 1] = True
+    dense["amount_viability_mask"][0, int(row["source_slot"]), 1, 3] = True
+    np.savez_compressed(tmp_path / "dense_bc_arrays.npz", **dense)
+
+    sample = OrbitBCDataset(tmp_path)[0]
+
+    assert float(sample["sample_weight"]) == np.float32(0.1375)
 
 
 def test_dataset_uses_dense_geometry_viability_masks(tmp_path: Path) -> None:
@@ -261,7 +303,7 @@ def test_dataset_rejects_label_outside_dense_viability_mask(tmp_path: Path) -> N
     )
 
     ds = OrbitBCDataset(tmp_path)
-    with pytest.raises(RuntimeError, match="target label .* is not geometry-viable"):
+    with pytest.raises(RuntimeError, match="target label .* outside the geometry/capture viability mask"):
         _ = ds[0]
 
 
@@ -301,13 +343,14 @@ def test_eval_rejects_old_dense_arrays(tmp_path: Path, monkeypatch) -> None:
 
     from orbit_bc_training import eval_bc_policy
     from orbit_bc_training.config import BCModelConfig
+    from orbit_training_prep.features import PAIR_FEATURE_NAMES
 
     class FakeModel:
         config = BCModelConfig(
             planet_feature_dim=16,
             global_feature_dim=10,
             target_state_feature_dim=9,
-            pair_feature_dim=22,
+            pair_feature_dim=len(PAIR_FEATURE_NAMES),
         )
 
         def __call__(self, batch):
@@ -381,6 +424,30 @@ def test_loss_backward_has_finite_gradients(tmp_path: Path) -> None:
     assert math.isfinite(float(loss.detach()))
     assert math.isfinite(metrics["target_loss"])
     assert all(p.grad is None or torch.isfinite(p.grad).all().item() for p in model.parameters())
+
+
+def test_amount_loss_ignores_noop_rows() -> None:
+    from orbit_bc_training.losses import bc_loss_and_metrics
+
+    target_logits = torch.zeros((2, NOOP_TARGET_SLOT + 1))
+    target_logits[0, NOOP_TARGET_SLOT] = 10.0
+    target_logits[1, 1] = 10.0
+    outputs = {
+        "target_logits": target_logits,
+        "amount_logits": torch.tensor([[100.0, -100.0], [-100.0, 100.0]]),
+    }
+    batch = {
+        "target_mask": torch.ones((2, NOOP_TARGET_SLOT + 1), dtype=torch.bool),
+        "amount_mask": torch.ones((2, 2), dtype=torch.bool),
+        "target_label": torch.tensor([NOOP_TARGET_SLOT, 1]),
+        "amount_label": torch.tensor([1, 1]),
+        "sample_weight": torch.tensor([10.0, 1.0]),
+        "is_noop": torch.tensor([True, False]),
+    }
+
+    _, metrics = bc_loss_and_metrics(outputs, batch)
+
+    assert metrics["amount_loss"] < 1.0e-6
 
 
 def test_model_forward_uses_pair_features(tmp_path: Path) -> None:

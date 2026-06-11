@@ -118,7 +118,7 @@ def main() -> None:
     ap.add_argument("--out_dir", required=True)
     ap.add_argument("--selection_eval_dir", default=None)
     ap.add_argument("--batch_size", type=int, default=512)
-    ap.add_argument("--epochs", type=int, default=20)
+    ap.add_argument("--epochs", type=int, default=2)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--weight_decay", type=float, default=1e-4)
     ap.add_argument("--grad_clip", type=float, default=1.0)

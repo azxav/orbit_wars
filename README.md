@@ -378,7 +378,7 @@ validation_report.md
 
 ```powershell
 python -m orbit_training_prep.split_episodes `
-  --dataset_root .\orbit_dataset_work\combined `
+  --dataset_root .\orbit_dataset_work\combined_new `
   --valid_frac 0.15 `
   --seed 42 `
   --out .\orbit_dataset_work\splits.json
@@ -388,7 +388,7 @@ python -m orbit_training_prep.split_episodes `
 
 ```powershell
 python -m orbit_training_prep.materialize_splits `
-  --dataset_root .\orbit_dataset_work\combined `
+  --dataset_root .\orbit_dataset_work\combined_new `
   --splits .\orbit_dataset_work\splits.json `
   --out .\orbit_dataset_work\split_dataset
 ```
@@ -457,6 +457,21 @@ python -m orbit_bc_eval.run_local_matches `
 ```
 
 Use this as the main BC quality check.
+
+To export browser-viewable gameplay replays for visual checkpoint inspection:
+
+```bash
+python -m orbit_bc_eval.run_local_matches \
+  --bc_checkpoint bc_checkpoints/compact_bc_v1/best/checkpoint.pt \
+  --opponent heuristic_path \
+  --players 2 \
+  --num_games 5 \
+  --seed_start 42 \
+  --out_dir bc_eval_runs/compact_bc_visual \
+  --device cpu \
+  --render_html \
+  --render_html_games 3
+```
 
 ### Step 10: Compare metric relevance between runs
 

@@ -5,6 +5,7 @@ replays
 orbit_dataset_work
 dataset
 bc_checkpoints
+bc_eval_runs
 ppo_checkpoints
 ppo_eval_debug
 *.json
@@ -13,3 +14,4 @@ ppo_eval_debug
 *.log
 *.zip
 *.pt
+*.txt

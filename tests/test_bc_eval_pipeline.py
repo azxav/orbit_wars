@@ -287,6 +287,188 @@ def test_local_match_defaults_run_full_bc_v1_against_root_checkpoint() -> None:
     assert args.out_dir == "bc_eval_runs/full_bc_v1_best_vs_checkpoint"
 
 
+def test_local_match_parser_accepts_html_replay_flags() -> None:
+    from orbit_bc_eval.run_local_matches import build_arg_parser
+
+    args = build_arg_parser().parse_args(["--render_html", "--render_html_games", "3", "--html_dir", "visuals"])
+
+    assert args.render_html is True
+    assert args.render_html_games == 3
+    assert args.html_dir == "visuals"
+
+
+def test_run_games_writes_html_replays_and_index_without_debug_game(tmp_path: Path, monkeypatch) -> None:
+    from orbit_bc_eval import run_local_matches
+
+    class FakeEnv:
+        def __init__(self):
+            self.seed_value = None
+            self.steps = []
+
+        def seed(self, value):
+            self.seed_value = value
+
+        def run(self, agents):
+            for agent in agents:
+                agent(_obs(step=0), {})
+            self.steps = [[{"reward": 1.0, "status": "DONE", "observation": _capture_obs(step=499)}, {"reward": -1.0, "status": "DONE", "observation": {}}]]
+
+        def render(self, mode):
+            assert mode == "html"
+            return f"<html><body>seed {self.seed_value}</body></html>"
+
+    monkeypatch.setattr(run_local_matches, "_import_make", lambda: lambda *args, **kwargs: FakeEnv())
+    monkeypatch.setattr(run_local_matches, "_preflight_checkpoint", lambda path, label, device: None)
+    monkeypatch.setattr(run_local_matches.bc_agent_runtime, "configure_bc_agent", lambda **kwargs: None)
+    monkeypatch.setattr(run_local_matches.bc_agent_runtime, "reset_runtime_state", lambda: None)
+    monkeypatch.setattr(run_local_matches, "_make_opponent_for_seat", lambda args: (lambda obs, config: []))
+    monkeypatch.setattr(
+        run_local_matches,
+        "_make_bc_agent_for_checkpoint",
+        lambda **kwargs: run_local_matches.RecordingAgent(lambda obs, config: [[101, 0.0, 5]], player_id=kwargs["player_id"], is_bc=False),
+    )
+    checkpoint = tmp_path / "fake.pt"
+    checkpoint.write_bytes(b"fake checkpoint")
+    args = run_local_matches.build_arg_parser().parse_args(
+        [
+            "--bc_checkpoint",
+            str(checkpoint),
+            "--opponent",
+            "passive",
+            "--num_games",
+            "2",
+            "--out_dir",
+            str(tmp_path),
+            "--render_html",
+            "--render_html_games",
+            "1",
+            "--html_dir",
+            "visuals",
+        ]
+    )
+
+    summary = run_local_matches.run_games(args)
+
+    html_dir = tmp_path / "visuals"
+    assert (html_dir / "game_00000.html").read_text(encoding="utf-8").startswith("<html>")
+    assert not (html_dir / "game_00001.html").exists()
+    index = (html_dir / "index.html").read_text(encoding="utf-8")
+    assert 'href="game_00000.html"' in index
+    assert "game_00000" in index
+    assert "bc_seat" in index
+    assert "final_owned_planets" in index
+    assert not (tmp_path / "debug").exists()
+    assert summary["html_replay_dir"] == str(html_dir)
+    assert summary["html_replay_count"] == 1
+
+
+def test_run_games_html_render_failure_adds_note_and_continues(tmp_path: Path, monkeypatch) -> None:
+    from orbit_bc_eval import run_local_matches
+
+    class FakeEnv:
+        def __init__(self):
+            self.steps = []
+
+        def seed(self, value):
+            pass
+
+        def run(self, agents):
+            for agent in agents:
+                agent(_obs(step=0), {})
+            self.steps = [[{"reward": 0.0, "status": "DONE", "observation": _obs(step=499)}, {"reward": 1.0, "status": "DONE", "observation": {}}]]
+
+        def render(self, mode):
+            raise RuntimeError(f"{mode} render unavailable")
+
+    monkeypatch.setattr(run_local_matches, "_import_make", lambda: lambda *args, **kwargs: FakeEnv())
+    monkeypatch.setattr(run_local_matches, "_preflight_checkpoint", lambda path, label, device: None)
+    monkeypatch.setattr(run_local_matches.bc_agent_runtime, "configure_bc_agent", lambda **kwargs: None)
+    monkeypatch.setattr(run_local_matches.bc_agent_runtime, "reset_runtime_state", lambda: None)
+    monkeypatch.setattr(run_local_matches, "_make_opponent_for_seat", lambda args: (lambda obs, config: []))
+    monkeypatch.setattr(
+        run_local_matches,
+        "_make_bc_agent_for_checkpoint",
+        lambda **kwargs: run_local_matches.RecordingAgent(lambda obs, config: [], player_id=kwargs["player_id"], is_bc=False),
+    )
+    checkpoint = tmp_path / "fake.pt"
+    checkpoint.write_bytes(b"fake checkpoint")
+    args = run_local_matches.build_arg_parser().parse_args(
+        [
+            "--bc_checkpoint",
+            str(checkpoint),
+            "--opponent",
+            "passive",
+            "--num_games",
+            "1",
+            "--out_dir",
+            str(tmp_path),
+            "--render_html",
+        ]
+    )
+
+    summary = run_local_matches.run_games(args)
+
+    assert summary["html_replay_count"] == 0
+    assert (tmp_path / "html" / "index.html").exists()
+    assert any("HTML replay render failed for game_00000" in note for note in summary["notes_warnings"])
+    assert (tmp_path / "summary.json").exists()
+
+
+def test_run_games_rejects_missing_bc_checkpoint_before_match(tmp_path: Path, monkeypatch) -> None:
+    import pytest
+
+    from orbit_bc_eval import run_local_matches
+
+    def unexpected_make():
+        raise AssertionError("environment should not be created for a missing checkpoint")
+
+    monkeypatch.setattr(run_local_matches, "_import_make", unexpected_make)
+    args = run_local_matches.build_arg_parser().parse_args(
+        [
+            "--bc_checkpoint",
+            str(tmp_path / "missing.pt"),
+            "--opponent",
+            "passive",
+            "--num_games",
+            "1",
+            "--out_dir",
+            str(tmp_path / "out"),
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="BC checkpoint does not exist"):
+        run_local_matches.run_games(args)
+
+
+def test_run_games_rejects_unloadable_bc_checkpoint_before_match(tmp_path: Path, monkeypatch) -> None:
+    import pytest
+
+    from orbit_bc_eval import run_local_matches
+
+    checkpoint = tmp_path / "bad.pt"
+    checkpoint.write_bytes(b"not a torch checkpoint")
+
+    def unexpected_make():
+        raise AssertionError("environment should not be created for an unloadable checkpoint")
+
+    monkeypatch.setattr(run_local_matches, "_import_make", unexpected_make)
+    args = run_local_matches.build_arg_parser().parse_args(
+        [
+            "--bc_checkpoint",
+            str(checkpoint),
+            "--opponent",
+            "passive",
+            "--num_games",
+            "1",
+            "--out_dir",
+            str(tmp_path / "out"),
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="BC checkpoint could not be loaded"):
+        run_local_matches.run_games(args)
+
+
 def test_bc_checkpoint_agent_wrapper_passes_its_checkpoint_config(monkeypatch) -> None:
     from orbit_bc_eval import run_local_matches
 

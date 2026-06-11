@@ -8,6 +8,7 @@ from typing import Any
 
 import numpy as np
 
+from .features import PAIR_FEATURE_NAMES
 from .schema import AMOUNT_BIN_NAMES, NOOP_TARGET_SLOT
 
 
@@ -73,16 +74,32 @@ def validate_dataset(out_dir: str | Path) -> dict[str, Any]:
     if npz_path.exists():
         dense_arrays = np.load(npz_path, allow_pickle=False)
         arr_info = {k: list(v.shape) for k, v in dense_arrays.items() if hasattr(v, "shape")}
+        if "pair_features" not in dense_arrays:
+            raise RuntimeError("dense_bc_arrays.npz is missing pair_features; rebuild dataset with ETA-aware pair features")
+        pair_shape = dense_arrays["pair_features"].shape
+        if len(pair_shape) != 4 or int(pair_shape[-1]) != len(PAIR_FEATURE_NAMES):
+            raise RuntimeError(
+                f"pair_features shape {list(pair_shape)} does not match expected final dim {len(PAIR_FEATURE_NAMES)}"
+            )
+        if "pair_feature_names" in dense_arrays:
+            stored_pair_names = [str(x) for x in dense_arrays["pair_feature_names"].tolist()]
+            if stored_pair_names != list(PAIR_FEATURE_NAMES):
+                raise RuntimeError("pair_feature_names do not match current ETA-aware feature contract")
 
-    invalid_bc_rows = [
-        row
-        for row in source_rows_for_checks
-        if bool(row.get("drop_for_v1_bc", False))
-        or not bool(row.get("geometry_viable", True))
-        or bool(row.get("ambiguous_multi_launch", False))
-        or str(row.get("target_inference_method", "") or "") == "angular_nearest"
-    ]
+    invalid_bc_rows = []
+    for row in source_rows_for_checks:
+        target_label = int(row.get("target_slot_label", NOOP_TARGET_SLOT))
+        if bool(row.get("drop_for_v1_bc", False)):
+            invalid_bc_rows.append(row)
+        elif target_label != NOOP_TARGET_SLOT and not bool(row.get("geometry_viable", True)):
+            invalid_bc_rows.append(row)
+        elif target_label != NOOP_TARGET_SLOT and bool(row.get("ambiguous_multi_launch", False)):
+            invalid_bc_rows.append(row)
+        elif target_label != NOOP_TARGET_SLOT and str(row.get("target_inference_method", "") or "") == "angular_nearest":
+            invalid_bc_rows.append(row)
     num_invalid_bc_rows = len(invalid_bc_rows)
+    if num_invalid_bc_rows:
+        raise RuntimeError(f"BC-invalid source rows found in train-ready source_turn_rows.jsonl: {num_invalid_bc_rows}")
 
     if dense_arrays is not None and "target_viability_mask" in dense_arrays and "amount_viability_mask" in dense_arrays:
         state_rows = read_jsonl(out_dir / "state_rows.jsonl") if (out_dir / "state_rows.jsonl").exists() else []
@@ -98,11 +115,19 @@ def validate_dataset(out_dir: str | Path) -> dict[str, Any]:
             source_slot = int(row.get("source_slot", -1))
             target_label = int(row.get("target_slot_label", NOOP_TARGET_SLOT))
             amount_label = int(row.get("amount_bin_label", 0))
-            if source_slot < 0 or source_slot >= target_viability_mask.shape[1]:
+            if (
+                source_slot < 0
+                or source_slot >= target_viability_mask.shape[1]
+                or target_label < 0
+                or target_label >= target_viability_mask.shape[2]
+            ):
                 bad_targets += 1
                 continue
             if not bool(target_viability_mask[dense_idx, source_slot, target_label]):
                 bad_targets += 1
+                continue
+            if amount_label < 0 or amount_label >= amount_viability_mask.shape[3]:
+                bad_amounts += 1
                 continue
             if not bool(amount_viability_mask[dense_idx, source_slot, target_label, amount_label]):
                 bad_amounts += 1
@@ -142,6 +167,7 @@ def validate_dataset(out_dir: str | Path) -> dict[str, Any]:
             "noop_target_slot": metadata.get("action_space", {}).get("noop_target_slot"),
             "amount_bins": metadata.get("action_space", {}).get("amount_bins"),
             "angle_policy": metadata.get("action_space", {}).get("angle_policy"),
+            "pair_feature_dim": len(metadata.get("pair_feature_names", [])) or (arr_info.get("pair_features", [None, None, None, 0])[-1] if arr_info else None),
             "primary_train_rows": "source_turn_rows.jsonl",
             "dense_bc_arrays": "dense_bc_arrays.npz",
         },
@@ -161,14 +187,14 @@ def validate_dataset(out_dir: str | Path) -> dict[str, Any]:
     lines += ["", "## Training contract checks"]
     for k, v in report["decision_checks"].items():
         lines.append(f"- `{k}`: {v}")
-    lines += ["", "## Notes", "- Rows with `drop_for_v1_bc=true` should be excluded from the first BC run, but kept for later multi-launch modeling.", "- `target_inference_method=first_contact` means the label came from exact geometry first-hit simulation. `target_inference_method=angular_nearest` is only the fallback for sun, bounds, or no-contact launches."]
+    lines += ["", "## Notes", "- `source_turn_rows.jsonl` is the final train-ready BC source-row file.", "- `target_inference_method=first_contact` means the label came from exact geometry first-hit simulation. `target_inference_method=angular_nearest` is only the fallback for sun, bounds, or no-contact launches and is not valid for positive BC source rows."]
     (out_dir / "validation_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return report
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out-dir", required=True)
+    ap.add_argument("--out-dir", "--dataset-dir", dest="out_dir", required=True)
     args = ap.parse_args()
     report = validate_dataset(args.out_dir)
     print(json.dumps(report["counts"], indent=2, sort_keys=True))

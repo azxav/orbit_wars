@@ -18,8 +18,11 @@ from .features import (
     GLOBAL_FEATURE_NAMES,
     PAIR_FEATURE_NAMES,
     TARGET_STATE_FEATURE_NAMES,
+    _targeted_fleets,
     build_feature_state,
+    pair_features_from_obs,
 )
+from .geometry_bridge import make_geometry
 from .replay_io import iter_actual_launches, iter_player_steps, load_replay
 from .schema import (
     AMOUNT_BIN_NAMES,
@@ -88,6 +91,63 @@ class JsonlWriter:
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
         self.close()
+
+
+def _source_row_train_contract(row: dict[str, Any], target_viability_mask: np.ndarray, amount_viability_mask: np.ndarray) -> tuple[bool, dict[str, bool]]:
+    target_label = int(row.get("target_slot_label", NOOP_TARGET_SLOT))
+    amount_label = int(row.get("amount_bin_label", 0))
+    is_noop = target_label == NOOP_TARGET_SLOT
+    if is_noop:
+        return True, {
+            "ambiguous": False,
+            "geometry_invalid": False,
+            "mask_invalid": False,
+            "angular_fallback": False,
+        }
+
+    source_slot = int(row.get("source_slot", -1))
+    ambiguous = bool(row.get("ambiguous_multi_launch", False))
+    geometry_invalid = not bool(row.get("geometry_viable", False))
+    angular_fallback = str(row.get("target_inference_method", "") or "") == "angular_nearest"
+    mask_invalid = True
+    if (
+        0 <= source_slot < int(target_viability_mask.shape[0])
+        and 0 <= target_label < int(target_viability_mask.shape[1])
+        and 0 <= amount_label < int(amount_viability_mask.shape[2])
+    ):
+        target_ok = bool(target_viability_mask[source_slot, target_label])
+        amount_ok = bool(amount_viability_mask[source_slot, target_label, amount_label])
+        mask_invalid = not (target_ok and amount_ok)
+    reasons = {
+        "ambiguous": ambiguous,
+        "geometry_invalid": geometry_invalid,
+        "mask_invalid": mask_invalid,
+        "angular_fallback": angular_fallback,
+    }
+    return not any(reasons.values()), reasons
+
+
+TRAIN_STATS_KEYS = (
+    "raw_source_turns",
+    "train_source_turns",
+    "raw_positive_source_turns",
+    "train_positive_source_turns",
+    "dropped_source_turns",
+    "dropped_ambiguous_sources",
+    "dropped_geometry_invalid_sources",
+    "dropped_mask_invalid_sources",
+    "dropped_angular_fallback_sources",
+    "noop_source_turns",
+)
+
+
+def _stats_with_required_train_keys(stats: Counter[str]) -> dict[str, int]:
+    out = {str(k): int(v) for k, v in stats.items()}
+    for key in TRAIN_STATS_KEYS:
+        out.setdefault(key, 0)
+    out.setdefault("source_turn_rows", out["train_source_turns"])
+    out.setdefault("positive_source_turns", out["train_positive_source_turns"])
+    return out
 
 
 def _build_single_replay_shard(
@@ -223,6 +283,7 @@ class DatasetBuilder:
         dense_planet_features = None
         dense_global_features = None
         dense_target_state_features = None
+        dense_pair_features = None
         dense_source_labels = None
         dense_amount_labels = None
         dense_source_mask = None
@@ -248,6 +309,12 @@ class DatasetBuilder:
                     mode="w+",
                     dtype=np.float32,
                     shape=(dense_state_count, P_MAX, len(TARGET_STATE_FEATURE_NAMES)),
+                )
+                dense_pair_features = np.lib.format.open_memmap(
+                    dense_tmp_dir / "pair_features.npy",
+                    mode="w+",
+                    dtype=np.float32,
+                    shape=(dense_state_count, P_MAX, P_MAX + 1, len(PAIR_FEATURE_NAMES)),
                 )
                 dense_source_labels = np.lib.format.open_memmap(
                     dense_tmp_dir / "target_labels.npy",
@@ -296,6 +363,7 @@ class DatasetBuilder:
                         dense_planet_features[dense_index:end] = shard["planet_features"]
                         dense_global_features[dense_index:end] = shard["global_features"]
                         dense_target_state_features[dense_index:end] = shard["target_state_features"]
+                        dense_pair_features[dense_index:end] = shard["pair_features"]
                         dense_source_labels[dense_index:end] = shard["target_labels"]
                         dense_amount_labels[dense_index:end] = shard["amount_labels"]
                         dense_source_mask[dense_index:end] = shard["source_mask"]
@@ -311,6 +379,7 @@ class DatasetBuilder:
                 dense_planet_features.flush()
                 dense_global_features.flush()
                 dense_target_state_features.flush()
+                dense_pair_features.flush()
                 dense_source_labels.flush()
                 dense_amount_labels.flush()
                 dense_source_mask.flush()
@@ -321,6 +390,7 @@ class DatasetBuilder:
                     planet_features=np.load(dense_tmp_dir / "planet_features.npy", mmap_mode="r"),
                     global_features=np.load(dense_tmp_dir / "global_features.npy", mmap_mode="r"),
                     target_state_features=np.load(dense_tmp_dir / "target_state_features.npy", mmap_mode="r"),
+                    pair_features=np.load(dense_tmp_dir / "pair_features.npy", mmap_mode="r"),
                     target_labels=np.load(dense_tmp_dir / "target_labels.npy", mmap_mode="r"),
                     amount_labels=np.load(dense_tmp_dir / "amount_labels.npy", mmap_mode="r"),
                     source_mask=np.load(dense_tmp_dir / "source_mask.npy", mmap_mode="r"),
@@ -428,7 +498,8 @@ class DatasetBuilder:
                 "planet_feature_names": PLANET_FEATURE_NAMES,
                 "global_feature_names": GLOBAL_FEATURE_NAMES,
                 "target_state_feature_names": TARGET_STATE_FEATURE_NAMES,
-                "stats": dict(stats),
+                "pair_feature_names": PAIR_FEATURE_NAMES,
+                "stats": _stats_with_required_train_keys(stats),
                 "input_replay_files": {
                     "requested": len(replay_paths),
                     "used": len(valid_replay_paths),
@@ -480,6 +551,7 @@ class DatasetBuilder:
         dense_planet_features = None
         dense_global_features = None
         dense_target_state_features = None
+        dense_pair_features = None
         dense_source_labels = None
         dense_amount_labels = None
         dense_source_mask = None
@@ -503,6 +575,12 @@ class DatasetBuilder:
                 mode="w+",
                 dtype=np.float32,
                 shape=(dense_state_count, P_MAX, len(TARGET_STATE_FEATURE_NAMES)),
+            )
+            dense_pair_features = np.lib.format.open_memmap(
+                dense_tmp_dir / "pair_features.npy",
+                mode="w+",
+                dtype=np.float32,
+                shape=(dense_state_count, P_MAX, P_MAX + 1, len(PAIR_FEATURE_NAMES)),
             )
             dense_source_labels = np.lib.format.open_memmap(
                 dense_tmp_dir / "target_labels.npy",
@@ -571,6 +649,16 @@ class DatasetBuilder:
                             horizon=self.horizon,
                             device=self.device,
                         )
+                        pair_geometry = make_geometry(horizon=200, device="cpu")
+                        try:
+                            obs_no_fleets = dict(obs)
+                            obs_no_fleets["fleets"] = []
+                            pair_movement = pair_geometry.build_or_update_movement(
+                                pair_geometry.obs_to_tensors(obs_no_fleets, player_id=player_id)
+                            )
+                        except Exception:
+                            pair_movement = None
+                        pair_incoming = _targeted_fleets(obs, player_id, P_MAX)
                         source_labels = [NOOP_TARGET_SLOT] * P_MAX
                         amount_labels = [0] * P_MAX
                         source_mask = [1.0 if s in owned_slots else 0.0 for s in range(P_MAX)]
@@ -670,17 +758,44 @@ class DatasetBuilder:
                                 "multi_launch_count": int(multi_launch_count),
                                 "ambiguous_multi_launch": bool(ambiguous),
                                 "train_weight": 1.0 if final_reward > 0 else 0.35,
-                                "drop_for_v1_bc": bool(ambiguous or not geometry_viable),
+                                "drop_for_v1_bc": False,
                             }
-                            source_turn_rows.write(row)
-                            source_labels[source_slot] = int(target_slot)
-                            amount_labels[source_slot] = int(amount_bin)
-                            stats["source_turn_rows"] += 1
-                            stats["noop_source_turns"] += int(primary is None)
-                            stats["positive_source_turns"] += int(primary is not None)
+                            train_valid, drop_reasons = _source_row_train_contract(row, target_viability_mask, amount_viability_mask)
+                            is_positive = primary is not None
+                            stats["raw_source_turns"] += 1
+                            stats["raw_positive_source_turns"] += int(is_positive)
+                            stats["noop_source_turns"] += int(not is_positive)
                             stats["ambiguous_multi_launch_sources"] += int(ambiguous)
+                            stats["dropped_source_turns"] += int(not train_valid)
+                            stats["dropped_ambiguous_sources"] += int(drop_reasons["ambiguous"])
+                            stats["dropped_geometry_invalid_sources"] += int(drop_reasons["geometry_invalid"])
+                            stats["dropped_mask_invalid_sources"] += int(drop_reasons["mask_invalid"])
+                            stats["dropped_angular_fallback_sources"] += int(drop_reasons["angular_fallback"])
+                            if train_valid:
+                                source_turn_rows.write(row)
+                                stats["train_source_turns"] += 1
+                                stats["train_positive_source_turns"] += int(is_positive)
+                                stats["source_turn_rows"] += 1
+                                stats["positive_source_turns"] += int(is_positive)
+                                if is_positive:
+                                    source_labels[source_slot] = int(target_slot)
+                                    amount_labels[source_slot] = int(amount_bin)
 
                         if dense_planet_features is not None:
+                            for dense_source_slot in range(P_MAX):
+                                if source_mask[dense_source_slot] > 0.0:
+                                    dense_pair_features[dense_index, dense_source_slot] = pair_features_from_obs(
+                                        obs,
+                                        player_id,
+                                        dense_source_slot,
+                                        max_planets=P_MAX,
+                                        target_viability_mask=target_viability_mask[dense_source_slot],
+                                        amount_viability_mask=amount_viability_mask[dense_source_slot],
+                                        feature_state=feature_state,
+                                        geometry=pair_geometry,
+                                        movement=pair_movement,
+                                        incoming_by_target=pair_incoming,
+                                    )
                             dense_planet_features[dense_index] = feature_state.planet_features
                             dense_global_features[dense_index] = feature_state.global_features
                             dense_target_state_features[dense_index] = feature_state.target_state_features
@@ -697,6 +812,7 @@ class DatasetBuilder:
                 dense_planet_features.flush()
                 dense_global_features.flush()
                 dense_target_state_features.flush()
+                dense_pair_features.flush()
                 dense_source_labels.flush()
                 dense_amount_labels.flush()
                 dense_source_mask.flush()
@@ -707,6 +823,7 @@ class DatasetBuilder:
                     planet_features=np.load(dense_tmp_dir / "planet_features.npy", mmap_mode="r"),
                     global_features=np.load(dense_tmp_dir / "global_features.npy", mmap_mode="r"),
                     target_state_features=np.load(dense_tmp_dir / "target_state_features.npy", mmap_mode="r"),
+                    pair_features=np.load(dense_tmp_dir / "pair_features.npy", mmap_mode="r"),
                     target_labels=np.load(dense_tmp_dir / "target_labels.npy", mmap_mode="r"),
                     amount_labels=np.load(dense_tmp_dir / "amount_labels.npy", mmap_mode="r"),
                     source_mask=np.load(dense_tmp_dir / "source_mask.npy", mmap_mode="r"),
@@ -741,7 +858,8 @@ class DatasetBuilder:
             "planet_feature_names": PLANET_FEATURE_NAMES,
             "global_feature_names": GLOBAL_FEATURE_NAMES,
             "target_state_feature_names": TARGET_STATE_FEATURE_NAMES,
-            "stats": dict(stats),
+            "pair_feature_names": PAIR_FEATURE_NAMES,
+            "stats": _stats_with_required_train_keys(stats),
             "input_replay_files": {
                 "requested": len(replay_paths),
                 "used": len(valid_replay_paths),
