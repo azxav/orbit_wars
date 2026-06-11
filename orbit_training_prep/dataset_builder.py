@@ -3,9 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import multiprocessing as mp
 import shutil
 import sys
 from collections import Counter, defaultdict
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +32,16 @@ from .schema import (
     ActionSpaceSpec,
     owned_source_slots,
 )
-from .source_turn_store import DATASET_FORMAT, SourceTurnDatasetReader, SourceTurnDatasetWriter
+from .source_turn_store import DATASET_FORMAT, SAMPLE_SPECS, STATE_SPECS, SourceTurnDatasetReader, SourceTurnDatasetWriter
+from .lite_backend import (
+    LITE_MASK_MODE,
+    LITE_PAIR_ETA_MODE,
+    LITE_TARGET_INFERENCE_MODE,
+    LiteTargetInferer,
+    build_lite_context,
+    compute_lite_viability_masks,
+    pair_features_lite,
+)
 from .target_inference import TargetInferer
 from .viability import compute_viability_masks
 
@@ -142,6 +153,72 @@ def _stats_with_required_train_keys(stats: Counter[str]) -> dict[str, int]:
     return out
 
 
+
+def _build_single_replay_shard(
+    replay_path: str,
+    out_dir: str,
+    *,
+    horizon: int,
+    device: str,
+    batch_size: int | None,
+    include_loser_actions: bool,
+    write_debug_jsonl: bool,
+    backend: str,
+) -> dict[str, Any]:
+    builder = DatasetBuilder(
+        horizon=horizon,
+        device=device,
+        batch_size=batch_size,
+        include_loser_actions=include_loser_actions,
+        max_replay_files=1,
+        workers=1,
+        write_debug_jsonl=write_debug_jsonl,
+        backend=backend,
+    )
+    return builder.build_from_replay(replay_path, out_dir)
+
+
+def _copy_group_from_shards(
+    *,
+    group_name: str,
+    specs: dict[str, tuple[Any, tuple[int, ...]]],
+    shard_dirs: list[Path],
+    out_dir: Path,
+    total_count: int,
+    state_offsets: list[int] | None = None,
+) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for key, (dtype, tail_shape) in specs.items():
+        out_path = out_dir / f"{key}.npy"
+        merged = np.lib.format.open_memmap(out_path, mode="w+", dtype=dtype, shape=(int(total_count), *tail_shape))
+        offset = 0
+        for shard_i, shard_dir in enumerate(shard_dirs):
+            shard_path = shard_dir / group_name / f"{key}.npy"
+            if not shard_path.exists():
+                continue
+            arr = np.load(shard_path, mmap_mode="r", allow_pickle=False)
+            rows = int(arr.shape[0])
+            if rows <= 0:
+                continue
+            end = offset + rows
+            if group_name == "samples" and key == "state_index" and state_offsets is not None:
+                merged[offset:end] = np.asarray(arr, dtype=np.uint32) + np.uint32(state_offsets[shard_i])
+            else:
+                merged[offset:end] = arr
+            offset = end
+        if offset != int(total_count):
+            raise RuntimeError(f"Merged {group_name}/{key} row mismatch: expected {total_count}, wrote {offset}")
+        merged.flush()
+
+
+def _concat_debug_jsonl(out_path: Path, input_paths: list[Path]) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as out_f:
+        for input_path in input_paths:
+            if input_path.exists():
+                with open(input_path, "r", encoding="utf-8") as in_f:
+                    shutil.copyfileobj(in_f, out_f)
+
 def _sample_weight(row: dict[str, Any]) -> float:
     target = int(row.get("target_slot_label", NOOP_TARGET_SLOT))
     is_noop = target == NOOP_TARGET_SLOT
@@ -169,6 +246,7 @@ class DatasetBuilder:
         max_replay_files: int | None = None,
         workers: int = 1,
         write_debug_jsonl: bool = False,
+        backend: str = "exact",
     ):
         self.horizon = int(horizon)
         if batch_size is not None and int(batch_size) < 1:
@@ -180,8 +258,18 @@ class DatasetBuilder:
         self.max_replay_files = None if max_replay_files is None else int(max_replay_files)
         self.workers = int(workers)
         self.write_debug_jsonl = bool(write_debug_jsonl)
-        self.inferer = TargetInferer(horizon=horizon, device=device, batch_size=batch_size)
-        self.device = self.inferer.device
+        backend_value = str(backend).lower().strip()
+        if backend_value not in {"exact", "lite"}:
+            raise ValueError("backend must be one of: exact, lite")
+        self.backend = backend_value
+        if self.backend == "exact":
+            self.inferer = TargetInferer(horizon=horizon, device=device, batch_size=batch_size)
+            self.lite_inferer = None
+            self.device = self.inferer.device
+        else:
+            self.inferer = None
+            self.lite_inferer = LiteTargetInferer(horizon=horizon)
+            self.device = "cpu" if str(device).lower() == "auto" else str(device)
 
     def _load_replay_or_none(self, replay_path: Path, *, invalid_json_paths: set[str], unreadable_paths: set[str]) -> dict[str, Any] | None:
         try:
@@ -199,6 +287,144 @@ class DatasetBuilder:
                 print(json.dumps({"warning": "Skipping unreadable replay file", "replay_path": path_str, "error": str(exc)}, sort_keys=True), file=sys.stderr)
             return None
 
+    def _build_from_replay_parallel(self, replay_input: Path, replay_paths: list[Path], out_dir: Path) -> dict[str, Any]:
+        shard_root = out_dir / ".dataset_builder_worker_shards"
+        if shard_root.exists():
+            shutil.rmtree(shard_root)
+        shard_root.mkdir(parents=True, exist_ok=True)
+        worker_count = min(int(self.workers), len(replay_paths))
+        shard_dirs = [shard_root / f"shard_{i:06d}" for i in range(len(replay_paths))]
+        shard_metas: list[dict[str, Any]] = [{} for _ in replay_paths]
+        try:
+            with ProcessPoolExecutor(max_workers=worker_count, mp_context=mp.get_context("spawn")) as pool:
+                futures = [
+                    pool.submit(
+                        _build_single_replay_shard,
+                        str(replay_path_obj),
+                        str(shard_dirs[i]),
+                        horizon=self.horizon,
+                        device=self.device,
+                        batch_size=self.batch_size,
+                        include_loser_actions=self.include_loser_actions,
+                        write_debug_jsonl=self.write_debug_jsonl,
+                        backend=self.backend,
+                    )
+                    for i, replay_path_obj in enumerate(replay_paths)
+                ]
+                for i, future in enumerate(futures):
+                    try:
+                        shard_metas[i] = future.result()
+                    except Exception as exc:  # pragma: no cover - exercised in integration builds
+                        raise RuntimeError(f"Worker failed while processing replay: {replay_paths[i]}") from exc
+
+            state_counts = [int(meta.get("state_count", 0) or 0) for meta in shard_metas]
+            sample_counts = [int(meta.get("sample_count", 0) or 0) for meta in shard_metas]
+            state_offsets: list[int] = []
+            running_states = 0
+            for count in state_counts:
+                state_offsets.append(running_states)
+                running_states += int(count)
+            total_states = int(sum(state_counts))
+            total_samples = int(sum(sample_counts))
+            used_shard_dirs = [d for d, meta in zip(shard_dirs, shard_metas, strict=True) if int(meta.get("state_count", 0) or 0) > 0]
+            used_state_offsets = [state_offsets[i] for i, meta in enumerate(shard_metas) if int(meta.get("state_count", 0) or 0) > 0]
+            _copy_group_from_shards(
+                group_name="states",
+                specs=STATE_SPECS,
+                shard_dirs=used_shard_dirs,
+                out_dir=out_dir / "states",
+                total_count=total_states,
+            )
+            _copy_group_from_shards(
+                group_name="samples",
+                specs=SAMPLE_SPECS,
+                shard_dirs=used_shard_dirs,
+                out_dir=out_dir / "samples",
+                total_count=total_samples,
+                state_offsets=used_state_offsets,
+            )
+            if self.write_debug_jsonl:
+                _concat_debug_jsonl(out_dir / "debug" / "launch_rows.jsonl", [d / "debug" / "launch_rows.jsonl" for d in used_shard_dirs])
+                _concat_debug_jsonl(out_dir / "debug" / "source_turn_rows.jsonl", [d / "debug" / "source_turn_rows.jsonl" for d in used_shard_dirs])
+                _concat_debug_jsonl(out_dir / "debug" / "state_rows.jsonl", [d / "debug" / "state_rows.jsonl" for d in used_shard_dirs])
+
+            stats = Counter()
+            inference_methods = Counter()
+            amount_bin_counts = Counter()
+            invalid_json_paths: set[str] = set()
+            unreadable_paths: set[str] = set()
+            valid_replay_paths: list[str] = []
+            for meta in shard_metas:
+                if not meta:
+                    continue
+                for replay_path_str in meta.get("replay_paths", []):
+                    if replay_path_str:
+                        valid_replay_paths.append(str(replay_path_str))
+                for key, value in meta.get("stats", {}).items():
+                    if key == "max_raw_launch_batch_size":
+                        stats[key] = max(int(stats.get(key, 0) or 0), int(value or 0))
+                    else:
+                        stats[key] += int(value or 0)
+                for method, value in meta.get("target_inference_methods", {}).items():
+                    inference_methods[str(method)] += int(value or 0)
+                for name, value in meta.get("amount_bin_counts", {}).items():
+                    amount_bin_counts[str(name)] += int(value or 0)
+                input_meta = meta.get("input_replay_files", {})
+                invalid_json_paths.update(str(p) for p in input_meta.get("skipped_invalid_json_paths", []) if p)
+                unreadable_paths.update(str(p) for p in input_meta.get("skipped_unreadable_paths", []) if p)
+
+            metadata = {
+                "dataset_format": DATASET_FORMAT,
+                "state_count": total_states,
+                "sample_count": total_samples,
+                "replay_path": str(replay_input),
+                "replay_paths": valid_replay_paths,
+                "replay_paths_requested": [str(p) for p in replay_paths],
+                "action_space": ActionSpaceSpec().as_dict(),
+                "geometry_horizon": self.horizon,
+                "device": self.device,
+                "geometry_device": self.device,
+                "inference_batch_size": self.batch_size,
+                "backend": self.backend,
+                "target_inference_mode": LITE_TARGET_INFERENCE_MODE if self.backend == "lite" else "batched_exact_first_hit_with_angular_fallback",
+                "mask_mode": LITE_MASK_MODE if self.backend == "lite" else "exact-geometry",
+                "pair_eta_mode": LITE_PAIR_ETA_MODE if self.backend == "lite" else "exact-geometry",
+                "replay_action_alignment": "action at replay index t is paired with observation at replay index t-1",
+                "include_loser_actions": self.include_loser_actions,
+                "max_replay_files": self.max_replay_files,
+                "write_debug_jsonl": self.write_debug_jsonl,
+                "parallel": {
+                    "enabled": True,
+                    "worker_count": worker_count,
+                    "shards": len(shard_dirs),
+                },
+                "planet_feature_names": PLANET_FEATURE_NAMES,
+                "global_feature_names": GLOBAL_FEATURE_NAMES,
+                "target_state_feature_names": TARGET_STATE_FEATURE_NAMES,
+                "pair_feature_names": PAIR_FEATURE_NAMES,
+                "pair_feature_dtype": "float16",
+                "files": {
+                    "states": {k: f"states/{k}.npy" for k in STATE_SPECS},
+                    "samples": {k: f"samples/{k}.npy" for k in SAMPLE_SPECS},
+                },
+                "stats": _stats_with_required_train_keys(stats),
+                "input_replay_files": {
+                    "requested": len(replay_paths),
+                    "used": len(valid_replay_paths),
+                    "skipped_invalid_json": len(invalid_json_paths),
+                    "skipped_unreadable": len(unreadable_paths),
+                    "skipped_invalid_json_paths": sorted(invalid_json_paths),
+                    "skipped_unreadable_paths": sorted(unreadable_paths),
+                },
+                "target_inference_methods": dict(inference_methods),
+                "amount_bin_counts": dict(amount_bin_counts),
+            }
+            with open(out_dir / "metadata.json", "w", encoding="utf-8") as f:
+                json.dump(metadata, f, indent=2, sort_keys=True)
+            return metadata
+        finally:
+            shutil.rmtree(shard_root, ignore_errors=True)
+
     def build_from_replay(self, replay_path: str | Path, out_dir: str | Path) -> dict[str, Any]:
         replay_input = Path(replay_path)
         replay_paths = resolve_replay_paths(replay_input, self.max_replay_files)
@@ -206,6 +432,21 @@ class DatasetBuilder:
         if out_dir.exists():
             shutil.rmtree(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
+        if self.workers > 1 and len(replay_paths) > 1:
+            if self.backend == "exact" and str(self.device).lower().startswith("cuda"):
+                print(
+                    json.dumps(
+                        {
+                            "warning": "workers>1 is disabled for CUDA exact target inference to avoid spawning multiple GPU contexts; falling back to serial build",
+                            "workers": int(self.workers),
+                            "device": str(self.device),
+                        },
+                        sort_keys=True,
+                    ),
+                    file=sys.stderr,
+                )
+            else:
+                return self._build_from_replay_parallel(replay_input, replay_paths, out_dir)
         writer = SourceTurnDatasetWriter(out_dir)
         invalid_json_paths: set[str] = set()
         unreadable_paths: set[str] = set()
@@ -242,20 +483,28 @@ class DatasetBuilder:
                     used_replay = True
                     obs_uid = f"{sample['episode_id']}:{sample['step_index']}:p{player_id}"
                     feature_state = build_feature_state(obs, player_id, P_MAX)
-                    target_viability_mask, amount_viability_mask = compute_viability_masks(
-                        obs,
-                        player_id,
-                        horizon=self.horizon,
-                        device=self.device,
-                    )
-                    pair_geometry = make_geometry(horizon=200, device="cpu")
-                    try:
-                        obs_no_fleets = dict(obs)
-                        obs_no_fleets["fleets"] = []
-                        pair_movement = pair_geometry.build_or_update_movement(pair_geometry.obs_to_tensors(obs_no_fleets, player_id=player_id))
-                    except Exception:
-                        pair_movement = None
-                    pair_incoming = _targeted_fleets(obs, player_id, P_MAX)
+                    lite_ctx = None
+                    pair_geometry = None
+                    pair_movement = None
+                    pair_incoming = None
+                    if self.backend == "lite":
+                        lite_ctx = build_lite_context(obs, player_id, horizon=self.horizon, device="cpu")
+                        target_viability_mask, amount_viability_mask = compute_lite_viability_masks(lite_ctx)
+                    else:
+                        target_viability_mask, amount_viability_mask = compute_viability_masks(
+                            obs,
+                            player_id,
+                            horizon=self.horizon,
+                            device=self.device,
+                        )
+                        pair_geometry = make_geometry(horizon=200, device="cpu")
+                        try:
+                            obs_no_fleets = dict(obs)
+                            obs_no_fleets["fleets"] = []
+                            pair_movement = pair_geometry.build_or_update_movement(pair_geometry.obs_to_tensors(obs_no_fleets, player_id=player_id))
+                        except Exception:
+                            pair_movement = None
+                        pair_incoming = _targeted_fleets(obs, player_id, P_MAX)
                     state_index = writer.append_state(
                         planet_features=feature_state.planet_features,
                         global_features=feature_state.global_features,
@@ -279,7 +528,14 @@ class DatasetBuilder:
                         stats["max_raw_launch_batch_size"] = max(int(stats["max_raw_launch_batch_size"]), len(action))
 
                     inferred_by_source: dict[int, list[dict[str, Any]]] = defaultdict(list)
-                    inferred_moves = self.inferer.infer_moves(obs, player_id, action) if action else []
+                    if action and self.backend == "lite":
+                        assert lite_ctx is not None and self.lite_inferer is not None
+                        inferred_moves = self.lite_inferer.infer_moves(lite_ctx, action)
+                    elif action:
+                        assert self.inferer is not None
+                        inferred_moves = self.inferer.infer_moves(obs, player_id, action)
+                    else:
+                        inferred_moves = []
                     for launch_index, inf in enumerate(inferred_moves):
                         row = {
                             "obs_uid": obs_uid,
@@ -372,18 +628,28 @@ class DatasetBuilder:
                         stats["dropped_angular_fallback_sources"] += int(drop_reasons["angular_fallback"])
                         if not train_valid:
                             continue
-                        pair_features = pair_features_from_obs(
-                            obs,
-                            player_id,
-                            int(source_slot),
-                            max_planets=P_MAX,
-                            target_viability_mask=target_viability_mask[int(source_slot)],
-                            amount_viability_mask=amount_viability_mask[int(source_slot)],
-                            feature_state=feature_state,
-                            geometry=pair_geometry,
-                            movement=pair_movement,
-                            incoming_by_target=pair_incoming,
-                        )
+                        if self.backend == "lite":
+                            assert lite_ctx is not None
+                            pair_features = pair_features_lite(
+                                lite_ctx,
+                                feature_state,
+                                int(source_slot),
+                                target_viability_mask=target_viability_mask[int(source_slot)],
+                                amount_viability_mask=amount_viability_mask[int(source_slot)],
+                            )
+                        else:
+                            pair_features = pair_features_from_obs(
+                                obs,
+                                player_id,
+                                int(source_slot),
+                                max_planets=P_MAX,
+                                target_viability_mask=target_viability_mask[int(source_slot)],
+                                amount_viability_mask=amount_viability_mask[int(source_slot)],
+                                feature_state=feature_state,
+                                geometry=pair_geometry,
+                                movement=pair_movement,
+                                incoming_by_target=pair_incoming,
+                            )
                         target_label = int(target_slot)
                         amount_label = 0 if target_label == NOOP_TARGET_SLOT else int(amount_bin)
                         writer.append_sample(
@@ -415,11 +681,15 @@ class DatasetBuilder:
             "device": self.device,
             "geometry_device": self.device,
             "inference_batch_size": self.batch_size,
-            "target_inference_mode": "batched_exact_first_hit_with_angular_fallback",
+            "backend": self.backend,
+            "target_inference_mode": LITE_TARGET_INFERENCE_MODE if self.backend == "lite" else "batched_exact_first_hit_with_angular_fallback",
+            "mask_mode": LITE_MASK_MODE if self.backend == "lite" else "exact-geometry",
+            "pair_eta_mode": LITE_PAIR_ETA_MODE if self.backend == "lite" else "exact-geometry",
             "replay_action_alignment": "action at replay index t is paired with observation at replay index t-1",
             "include_loser_actions": self.include_loser_actions,
             "max_replay_files": self.max_replay_files,
             "write_debug_jsonl": self.write_debug_jsonl,
+            "parallel": {"enabled": False, "worker_count": 1, "shards": 1},
             "planet_feature_names": PLANET_FEATURE_NAMES,
             "global_feature_names": GLOBAL_FEATURE_NAMES,
             "target_state_feature_names": TARGET_STATE_FEATURE_NAMES,
@@ -448,8 +718,9 @@ def main() -> None:
     ap.add_argument("--batch-size", type=int, default=256, help="Maximum number of valid launches to exact-simulate per GPU/CPU batch.")
     ap.add_argument("--winner-only", action="store_true")
     ap.add_argument("--max-files", type=int, default=None, help="Maximum number of replay files to include from a replay directory.")
-    ap.add_argument("--workers", type=int, default=6, help="Accepted for compatibility; source-turn builder writes compact memmap output serially.")
+    ap.add_argument("--workers", type=int, default=6, help="Number of replay files to process in parallel. CUDA exact builds fall back to serial to avoid multiple GPU contexts.")
     ap.add_argument("--write-debug-jsonl", action="store_true", help="Write debug JSONL files under debug/.")
+    ap.add_argument("--backend", choices=("lite", "exact"), default="lite", help="Dataset build backend. lite uses orbit_lite movement-cache heuristics; exact keeps the old simulator path.")
     args = ap.parse_args()
     builder = DatasetBuilder(
         horizon=args.horizon,
@@ -459,6 +730,7 @@ def main() -> None:
         max_replay_files=args.max_files,
         workers=args.workers,
         write_debug_jsonl=args.write_debug_jsonl,
+        backend=args.backend,
     )
     meta = builder.build_from_replay(args.replay, args.out_dir)
     print(json.dumps({"out_dir": args.out_dir, "stats": meta["stats"], "target_inference_methods": meta["target_inference_methods"]}, indent=2, sort_keys=True))

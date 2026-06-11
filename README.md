@@ -30,6 +30,43 @@ Do not train from old dense datasets. Rebuild datasets after this change.
 
 ---
 
+## Dataset builder backends
+
+The dataset builder has two backends:
+
+```text
+--backend lite   # default, fast movement-cache heuristic backend
+--backend exact  # old exact simulator-based backend
+```
+
+### Lite backend, recommended
+
+The Lite backend is the default path for large replay datasets. It removes the expensive exact source-target-amount simulation from dataset construction and uses an `orbit_lite` movement-cache heuristic backend instead.
+
+It considers dynamic movement geometry through:
+
+```text
+future planet positions
+cross-time source-target distances
+movement-cache ETA approximation
+projected owner / garrison near estimated arrival
+```
+
+It does **not** perform full exact collision / first-hit simulation:
+
+```text
+no ExactTargetSimulator
+no exact first-hit search
+no exact source-target-amount aim grid
+no exact sun/bounds/comet/body collision resolution
+```
+
+Use Lite for fast training dataset generation. Use Exact only for small audit datasets or when you explicitly need the old simulator-derived labels.
+
+Parallel replay-level building is now supported with `--workers N`. Each worker builds a compact source-turn shard, then the main process merges `states/*.npy` and `samples/*.npy` while correcting `samples/state_index.npy` offsets. CUDA exact builds still fall back to serial to avoid multiple GPU contexts.
+
+---
+
 ## Project structure
 
 ```text
@@ -38,6 +75,7 @@ orbit_wars/
 │   ├── dataset_builder.py
 │   ├── source_turn_store.py
 │   ├── training_io.py
+│   ├── lite_backend.py
 │   ├── features.py
 │   ├── split_episodes.py
 │   ├── materialize_splits.py
@@ -63,6 +101,7 @@ orbit_wars/
 │
 ├── orbit_geometry_skeleton/
 ├── orbit_jax_env/
+├── orbit_lite/                    # movement-cache heuristic backend
 ├── tests/
 └── README.md
 ```
@@ -74,7 +113,7 @@ orbit_wars/
 A built dataset directory contains:
 
 ```text
-orbit_dataset_work/combined/
+orbit_dataset_work/combined_lite/
 ├── metadata.json
 ├── states/
 │   ├── planet_features.npy
@@ -192,18 +231,58 @@ Install Kaggle/local environment dependencies separately if running full environ
 
 ## Recommended workflow
 
-### 1. Build combined dataset
+### 1. Build combined dataset with Lite backend, recommended
+
+PowerShell:
+
+```powershell
+$env:OMP_NUM_THREADS="1"
+$env:MKL_NUM_THREADS="1"
+$env:TORCH_NUM_THREADS="1"
+
+python -m orbit_training_prep.dataset_builder `
+  --replay .\replays `
+  --out-dir .\orbit_dataset_work\combined_lite `
+  --horizon 160 `
+  --device cpu `
+  --batch-size 256 `
+  --backend lite `
+  --workers 16
+```
+
+Ubuntu / Bash:
+
+```bash
+OMP_NUM_THREADS=1 \
+MKL_NUM_THREADS=1 \
+TORCH_NUM_THREADS=1 \
+python -m orbit_training_prep.dataset_builder \
+  --replay ./replays \
+  --out-dir ./orbit_dataset_work/combined_lite \
+  --horizon 160 \
+  --device cpu \
+  --batch-size 256 \
+  --backend lite \
+  --workers 16
+```
+
+This is the default high-throughput path. It uses movement-cache heuristics from `orbit_lite`, avoids exact first-hit simulation during dataset construction, and parallelizes across replay files when `--workers > 1`.
+
+For a 128 GB RAM CPU build machine, start with `--workers 16`; increase toward 20-24 only if CPU utilization and disk throughput remain healthy. Keep `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, and `TORCH_NUM_THREADS` at `1` so workers do not oversubscribe CPU threads.
+
+Optional: build a small exact audit dataset:
 
 PowerShell:
 
 ```powershell
 python -m orbit_training_prep.dataset_builder `
   --replay .\replays `
-  --out-dir .\orbit_dataset_work\combined `
+  --out-dir .\orbit_dataset_work\combined_lite_exact_small `
   --horizon 160 `
   --device cpu `
   --batch-size 256 `
-  --workers 8
+  --backend exact `
+  --max-files 5
 ```
 
 Ubuntu / Bash:
@@ -211,11 +290,12 @@ Ubuntu / Bash:
 ```bash
 python -m orbit_training_prep.dataset_builder \
   --replay ./replays \
-  --out-dir ./orbit_dataset_work/combined \
+  --out-dir ./orbit_dataset_work/combined_lite_exact_small \
   --horizon 160 \
   --device cpu \
   --batch-size 256 \
-  --workers 8
+  --backend exact \
+  --max-files 5
 ```
 
 With debug JSONL rows:
@@ -225,11 +305,11 @@ PowerShell:
 ```powershell
 python -m orbit_training_prep.dataset_builder `
   --replay .\replays `
-  --out-dir .\orbit_dataset_work\combined_debug `
+  --out-dir .\orbit_dataset_work\combined_lite_debug `
   --horizon 160 `
   --device cpu `
   --batch-size 256 `
-  --workers 8 `
+  --backend lite `
   --write-debug-jsonl
 ```
 
@@ -238,25 +318,26 @@ Ubuntu / Bash:
 ```bash
 python -m orbit_training_prep.dataset_builder \
   --replay ./replays \
-  --out-dir ./orbit_dataset_work/combined_debug \
+  --out-dir ./orbit_dataset_work/combined_lite_debug \
   --horizon 160 \
   --device cpu \
   --batch-size 256 \
-  --workers 8 \
+  --backend lite \
   --write-debug-jsonl
 ```
 
-CUDA target inference, one worker:
+Exact backend with CUDA target inference, one worker:
 
 PowerShell:
 
 ```powershell
 python -m orbit_training_prep.dataset_builder `
   --replay .\replays `
-  --out-dir .\orbit_dataset_work\combined_cuda `
+  --out-dir .\orbit_dataset_work\combined_lite_cuda `
   --horizon 160 `
   --device cuda `
   --batch-size 256 `
+  --backend exact `
   --workers 1
 ```
 
@@ -265,10 +346,11 @@ Ubuntu / Bash:
 ```bash
 python -m orbit_training_prep.dataset_builder \
   --replay ./replays \
-  --out-dir ./orbit_dataset_work/combined_cuda \
+  --out-dir ./orbit_dataset_work/combined_lite_cuda \
   --horizon 160 \
   --device cuda \
   --batch-size 256 \
+  --backend exact \
   --workers 1
 ```
 
@@ -280,14 +362,14 @@ PowerShell:
 
 ```powershell
 python -m orbit_training_prep.validate_dataset `
-  --out-dir .\orbit_dataset_work\combined
+  --out-dir .\orbit_dataset_work\combined_lite
 ```
 
 Ubuntu / Bash:
 
 ```bash
 python -m orbit_training_prep.validate_dataset \
-  --out-dir ./orbit_dataset_work/combined
+  --out-dir ./orbit_dataset_work/combined_lite
 ```
 
 This writes:
@@ -305,7 +387,7 @@ PowerShell:
 
 ```powershell
 python -m orbit_training_prep.split_episodes `
-  --dataset_root .\orbit_dataset_work\combined `
+  --dataset_root .\orbit_dataset_work\combined_lite `
   --valid_frac 0.15 `
   --seed 42 `
   --out .\orbit_dataset_work\splits.json
@@ -315,7 +397,7 @@ Ubuntu / Bash:
 
 ```bash
 python -m orbit_training_prep.split_episodes \
-  --dataset_root ./orbit_dataset_work/combined \
+  --dataset_root ./orbit_dataset_work/combined_lite \
   --valid_frac 0.15 \
   --seed 42 \
   --out ./orbit_dataset_work/splits.json
@@ -329,7 +411,7 @@ PowerShell:
 
 ```powershell
 python -m orbit_training_prep.materialize_splits `
-  --dataset_root .\orbit_dataset_work\combined `
+  --dataset_root .\orbit_dataset_work\combined_lite `
   --splits .\orbit_dataset_work\splits.json `
   --out .\orbit_dataset_work\split_dataset
 ```
@@ -338,7 +420,7 @@ Ubuntu / Bash:
 
 ```bash
 python -m orbit_training_prep.materialize_splits \
-  --dataset_root ./orbit_dataset_work/combined \
+  --dataset_root ./orbit_dataset_work/combined_lite \
   --splits ./orbit_dataset_work/splits.json \
   --out ./orbit_dataset_work/split_dataset
 ```
@@ -362,7 +444,7 @@ PowerShell:
 python -m orbit_bc_training.train_bc_policy `
   --train_dir .\orbit_dataset_work\split_dataset\train `
   --valid_dir .\orbit_dataset_work\split_dataset\valid `
-  --out_dir .\bc_checkpoints\compact_bc_v1 `
+  --out_dir .\bc_checkpoints\lite_bc_v1 `
   --batch_size 512 `
   --epochs 20 `
   --lr 3e-4 `
@@ -384,7 +466,7 @@ Ubuntu / Bash:
 python -m orbit_bc_training.train_bc_policy \
   --train_dir ./orbit_dataset_work/split_dataset/train \
   --valid_dir ./orbit_dataset_work/split_dataset/valid \
-  --out_dir ./bc_checkpoints/compact_bc_v1 \
+  --out_dir ./bc_checkpoints/lite_bc_v1 \
   --batch_size 512 \
   --epochs 20 \
   --lr 3e-4 \
@@ -403,9 +485,9 @@ python -m orbit_bc_training.train_bc_policy \
 Outputs:
 
 ```text
-bc_checkpoints/compact_bc_v1/latest/checkpoint.pt
-bc_checkpoints/compact_bc_v1/best/checkpoint.pt
-bc_checkpoints/compact_bc_v1/metrics.jsonl
+bc_checkpoints/lite_bc_v1/latest/checkpoint.pt
+bc_checkpoints/lite_bc_v1/best/checkpoint.pt
+bc_checkpoints/lite_bc_v1/metrics.jsonl
 ```
 
 ---
@@ -416,9 +498,9 @@ PowerShell:
 
 ```powershell
 python -m orbit_bc_training.eval_bc_policy `
-  --checkpoint .\bc_checkpoints\compact_bc_v1\best\checkpoint.pt `
+  --checkpoint .\bc_checkpoints\lite_bc_v1\best\checkpoint.pt `
   --valid_dir .\orbit_dataset_work\split_dataset\valid `
-  --out .\bc_checkpoints\compact_bc_v1\offline_eval.json `
+  --out .\bc_checkpoints\lite_bc_v1\offline_eval.json `
   --device auto
 ```
 
@@ -426,9 +508,9 @@ Ubuntu / Bash:
 
 ```bash
 python -m orbit_bc_training.eval_bc_policy \
-  --checkpoint ./bc_checkpoints/compact_bc_v1/best/checkpoint.pt \
+  --checkpoint ./bc_checkpoints/lite_bc_v1/best/checkpoint.pt \
   --valid_dir ./orbit_dataset_work/split_dataset/valid \
-  --out ./bc_checkpoints/compact_bc_v1/offline_eval.json \
+  --out ./bc_checkpoints/lite_bc_v1/offline_eval.json \
   --device auto
 ```
 
@@ -442,13 +524,13 @@ PowerShell:
 
 ```powershell
 python -m orbit_bc_eval.run_local_matches `
-  --bc_checkpoint .\bc_checkpoints\compact_bc_v1\best\checkpoint.pt `
+  --bc_checkpoint .\bc_checkpoints\lite_bc_v1\best\checkpoint.pt `
   --opponent heuristic_path `
   --heuristic_path .\orbit_wars_base.py `
   --players both `
   --num_games 20 `
   --seed_start 1000 `
-  --out_dir .\bc_eval_runs\compact_bc_v1_vs_heuristic `
+  --out_dir .\bc_eval_runs\lite_bc_v1_vs_heuristic `
   --device cpu `
   --debug_game
 ```
@@ -457,13 +539,13 @@ Ubuntu / Bash:
 
 ```bash
 python -m orbit_bc_eval.run_local_matches \
-  --bc_checkpoint ./bc_checkpoints/compact_bc_v1/best/checkpoint.pt \
+  --bc_checkpoint ./bc_checkpoints/lite_bc_v1/best/checkpoint.pt \
   --opponent heuristic_path \
   --heuristic_path ./orbit_wars_base.py \
   --players both \
   --num_games 20 \
   --seed_start 1000 \
-  --out_dir ./bc_eval_runs/compact_bc_v1_vs_heuristic \
+  --out_dir ./bc_eval_runs/lite_bc_v1_vs_heuristic \
   --device cpu \
   --debug_game
 ```
@@ -474,13 +556,13 @@ PowerShell:
 
 ```powershell
 python -m orbit_bc_eval.run_local_matches `
-  --bc_checkpoint .\bc_checkpoints\compact_bc_v1\best\checkpoint.pt `
+  --bc_checkpoint .\bc_checkpoints\lite_bc_v1\best\checkpoint.pt `
   --opponent heuristic_path `
   --heuristic_path .\orbit_wars_base.py `
   --players 2 `
   --num_games 5 `
   --seed_start 42 `
-  --out_dir .\bc_eval_runs\compact_bc_visual `
+  --out_dir .\bc_eval_runs\lite_bc_visual `
   --device cpu `
   --render_html `
   --render_html_games 3
@@ -490,13 +572,13 @@ Ubuntu / Bash:
 
 ```bash
 python -m orbit_bc_eval.run_local_matches \
-  --bc_checkpoint ./bc_checkpoints/compact_bc_v1/best/checkpoint.pt \
+  --bc_checkpoint ./bc_checkpoints/lite_bc_v1/best/checkpoint.pt \
   --opponent heuristic_path \
   --heuristic_path ./orbit_wars_base.py \
   --players 2 \
   --num_games 5 \
   --seed_start 42 \
-  --out_dir ./bc_eval_runs/compact_bc_visual \
+  --out_dir ./bc_eval_runs/lite_bc_visual \
   --device cpu \
   --render_html \
   --render_html_games 3
@@ -510,8 +592,8 @@ PowerShell:
 
 ```powershell
 python -m orbit_ppo_training.smoke_test `
-  --bc_checkpoint .\bc_checkpoints\compact_bc_v1\best\checkpoint.pt `
-  --out_dir .\ppo_runs\smoke_compact_bc_v1 `
+  --bc_checkpoint .\bc_checkpoints\lite_bc_v1\best\checkpoint.pt `
+  --out_dir .\ppo_runs\smoke_lite_bc_v1 `
   --device cpu
 ```
 
@@ -519,8 +601,8 @@ Ubuntu / Bash:
 
 ```bash
 python -m orbit_ppo_training.smoke_test \
-  --bc_checkpoint ./bc_checkpoints/compact_bc_v1/best/checkpoint.pt \
-  --out_dir ./ppo_runs/smoke_compact_bc_v1 \
+  --bc_checkpoint ./bc_checkpoints/lite_bc_v1/best/checkpoint.pt \
+  --out_dir ./ppo_runs/smoke_lite_bc_v1 \
   --device cpu
 ```
 
@@ -532,8 +614,8 @@ PowerShell:
 
 ```powershell
 python -m orbit_ppo_training.train_ppo `
-  --bc_checkpoint .\bc_checkpoints\compact_bc_v1\best\checkpoint.pt `
-  --out_dir .\ppo_runs\compact_bc_v1_ppo `
+  --bc_checkpoint .\bc_checkpoints\lite_bc_v1\best\checkpoint.pt `
+  --out_dir .\ppo_runs\lite_bc_v1_ppo `
   --players 4 `
   --opponent heuristic_path `
   --num_envs 8 `
@@ -559,8 +641,8 @@ Ubuntu / Bash:
 
 ```bash
 python -m orbit_ppo_training.train_ppo \
-  --bc_checkpoint ./bc_checkpoints/compact_bc_v1/best/checkpoint.pt \
-  --out_dir ./ppo_runs/compact_bc_v1_ppo \
+  --bc_checkpoint ./bc_checkpoints/lite_bc_v1/best/checkpoint.pt \
+  --out_dir ./ppo_runs/lite_bc_v1_ppo \
   --players 4 \
   --opponent heuristic_path \
   --num_envs 8 \
@@ -590,11 +672,11 @@ PowerShell:
 
 ```powershell
 python -m orbit_ppo_training.eval_ppo `
-  --checkpoint .\ppo_runs\compact_bc_v1_ppo\best `
+  --checkpoint .\ppo_runs\lite_bc_v1_ppo\best `
   --opponent heuristic_path `
   --players 4 `
   --num_games 50 `
-  --out_dir .\ppo_eval_runs\compact_bc_v1_ppo_vs_heuristic `
+  --out_dir .\ppo_eval_runs\lite_bc_v1_ppo_vs_heuristic `
   --seed 2000 `
   --device cpu `
   --save_replays 3 `
@@ -605,11 +687,11 @@ Ubuntu / Bash:
 
 ```bash
 python -m orbit_ppo_training.eval_ppo \
-  --checkpoint ./ppo_runs/compact_bc_v1_ppo/best \
+  --checkpoint ./ppo_runs/lite_bc_v1_ppo/best \
   --opponent heuristic_path \
   --players 4 \
   --num_games 50 \
-  --out_dir ./ppo_eval_runs/compact_bc_v1_ppo_vs_heuristic \
+  --out_dir ./ppo_eval_runs/lite_bc_v1_ppo_vs_heuristic \
   --seed 2000 \
   --device cpu \
   --save_replays 3 \
@@ -626,7 +708,7 @@ PowerShell:
 
 ```powershell
 python -m orbit_training_prep.audit_exact_targets `
-  --dataset_dir .\orbit_dataset_work\combined `
+  --dataset_dir .\orbit_dataset_work\combined_lite `
   --replay_dir .\replays `
   --sample_size 2000 `
   --out .\orbit_dataset_work\exact_target_audit.json `
@@ -638,7 +720,7 @@ Ubuntu / Bash:
 
 ```bash
 python -m orbit_training_prep.audit_exact_targets \
-  --dataset_dir ./orbit_dataset_work/combined \
+  --dataset_dir ./orbit_dataset_work/combined_lite \
   --replay_dir ./replays \
   --sample_size 2000 \
   --out ./orbit_dataset_work/exact_target_audit.json \
@@ -653,7 +735,7 @@ PowerShell:
 ```powershell
 python -m orbit_bc_eval.compare_metric_relevance `
   .\bc_eval_runs\baseline\2p\games.jsonl `
-  .\bc_eval_runs\compact_bc_v1_vs_heuristic\2p\games.jsonl
+  .\bc_eval_runs\lite_bc_v1_vs_heuristic\2p\games.jsonl
 ```
 
 Ubuntu / Bash:
@@ -661,7 +743,7 @@ Ubuntu / Bash:
 ```bash
 python -m orbit_bc_eval.compare_metric_relevance \
   ./bc_eval_runs/baseline/2p/games.jsonl \
-  ./bc_eval_runs/compact_bc_v1_vs_heuristic/2p/games.jsonl
+  ./bc_eval_runs/lite_bc_v1_vs_heuristic/2p/games.jsonl
 ```
 
 ---
@@ -772,3 +854,23 @@ actual_returned_move_count
 3. Rebuild datasets after changing feature names or dimensions.
 4. Do not add fallback support for `dense_bc_arrays.npz`.
 5. Use local gameplay evaluation before trusting checkpoint quality.
+
+---
+
+## Lite backend verification commands
+
+PowerShell:
+
+```powershell
+pytest -q tests/test_lite_dataset_backend.py
+pytest -q tests/test_source_turn_store.py tests/test_training_io.py tests/test_bc_training.py
+```
+
+Ubuntu / Bash:
+
+```bash
+pytest -q tests/test_lite_dataset_backend.py
+pytest -q tests/test_source_turn_store.py tests/test_training_io.py tests/test_bc_training.py
+```
+
+Known full-suite note: comet parity tests require the Kaggle environment package. If `kaggle_environments` is not installed, run the focused tests above instead of the full suite.

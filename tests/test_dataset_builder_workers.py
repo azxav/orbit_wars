@@ -54,3 +54,21 @@ def test_dataset_builder_parallel_workers_matches_serial_output(tmp_path: Path) 
             assert parallel_path.exists()
             assert np.array_equal(np.load(parallel_path, allow_pickle=False), np.load(serial_path, allow_pickle=False))
     assert not (parallel_out / "dense_bc_arrays.npz").exists()
+
+
+def test_dataset_builder_parallel_workers_records_real_shard_merge(tmp_path: Path) -> None:
+    replay_dir = tmp_path / "replays"
+    replay_dir.mkdir()
+    _write_minimal_replay(replay_dir / "a.json", "episode-a")
+    _write_minimal_replay(replay_dir / "b.json", "episode-b")
+
+    out_dir = tmp_path / "parallel_real"
+    metadata = DatasetBuilder(horizon=8, device="cpu", workers=2, backend="lite").build_from_replay(replay_dir, out_dir)
+
+    assert metadata["parallel"]["enabled"] is True
+    assert metadata["parallel"]["worker_count"] == 2
+    assert metadata["parallel"]["shards"] == 2
+    assert metadata["stats"]["states"] == 2
+    assert metadata["stats"]["source_turn_rows"] == 2
+    assert np.array_equal(np.load(out_dir / "samples" / "state_index.npy", allow_pickle=False), np.asarray([0, 1], dtype=np.uint32))
+    assert not (out_dir / ".dataset_builder_worker_shards").exists()
