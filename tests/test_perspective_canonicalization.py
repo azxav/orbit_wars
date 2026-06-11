@@ -91,6 +91,30 @@ def test_canonicalize_p1_observation_rotates_owner_coords_slots_and_action_to_p0
     assert transformed[0][2] == 10
 
 
+def test_canonicalize_observation_keeps_initial_planets_aligned_by_planet_id() -> None:
+    from orbit_training_prep.canonical import canonicalize_observation
+
+    obs = {
+        "player": 0,
+        "players": 2,
+        "step": 20,
+        "planets": [
+            [1, 0, 90.0, 50.0, 1.0, 10.0, 1.0],
+            [2, -1, 10.0, 50.0, 1.0, 5.0, 1.0],
+        ],
+        "initial_planets": [
+            [1, 0, 10.0, 50.0, 1.0, 10.0, 1.0],
+            [2, -1, 90.0, 50.0, 1.0, 5.0, 1.0],
+        ],
+        "fleets": [],
+    }
+
+    canon = canonicalize_observation(obs, 0).obs
+
+    assert [int(p[0]) for p in canon["planets"]] == [2, 1]
+    assert [int(p[0]) for p in canon["initial_planets"]] == [2, 1]
+
+
 def test_dataset_builder_canonicalizes_p1_replay_rows_and_records_metadata(tmp_path: Path) -> None:
     from orbit_training_prep.dataset_builder import DatasetBuilder
     from orbit_training_prep.source_turn_store import SourceTurnDatasetReader
@@ -192,12 +216,15 @@ def test_bc_agent_runtime_canonicalizes_p1_and_rotates_decoded_move_back(monkeyp
     monkeypatch.setattr(bc_agent_runtime, "compute_viability_masks", fake_masks)
     monkeypatch.setattr(bc_agent_runtime, "decode_bc_prediction", fake_decode)
 
-    moves = bc_agent_runtime.agent(_p1_runtime_obs(), {"bc_checkpoint": "fake.pt", "device": "cpu", "geometry_horizon": 1})
+    moves = bc_agent_runtime.agent(_p1_runtime_obs(), {"bc_checkpoint": "fake.pt", "device": "cpu", "geometry_horizon": 1, "debug": True})
 
     assert len(moves) == 1
     assert moves[0][0] == 202
     assert abs(wrap_angle(float(moves[0][1]) - math.pi)) < 1e-6
     assert moves[0][2] == 10
+    debug = bc_agent_runtime.get_last_debug()
+    assert debug["predictions"][0]["canonical_target_planet_id"] == 101
+    assert debug["predictions"][0]["env_target_planet_id"] == 101
 
 
 def test_ppo_policy_canonicalizes_p1_and_records_canonical_decision(monkeypatch) -> None:

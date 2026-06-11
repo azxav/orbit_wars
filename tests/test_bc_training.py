@@ -305,7 +305,7 @@ def test_decode_noop_and_launch_uses_geometry_angle() -> None:
 
     class FakeGeometry:
         def to_env_moves(self, **kwargs):
-            return [[101, 1.2345, 7]]
+            return [[101, 0.0, 7]]
 
     obs = {"planets": [[101, 0, 0, 0, 1, 20, 1], [202, 1, 10, 0, 1, 5, 1]]}
     noop_logits = torch.full((65,), -10.0)
@@ -317,7 +317,7 @@ def test_decode_noop_and_launch_uses_geometry_angle() -> None:
     launch_logits[1] = 5.0
     amount_logits = torch.full((7,), -10.0)
     amount_logits[4] = 5.0
-    assert decode_bc_prediction(obs, 0, 101, launch_logits, amount_logits, FakeGeometry()) == [101, 1.2345, 7]
+    assert decode_bc_prediction(obs, 0, 101, launch_logits, amount_logits, FakeGeometry()) == [101, 0.0, 7]
 
 
 def test_decode_prediction_respects_precomputed_target_and_amount_masks() -> None:
@@ -327,7 +327,7 @@ def test_decode_prediction_respects_precomputed_target_and_amount_masks() -> Non
         def to_env_moves(self, **kwargs):
             return [[101, 0.0, int(kwargs["ships"][0].item())]]
 
-    obs = {"planets": [[101, 0, 0, 0, 1, 20, 1], [202, 1, 10, 0, 1, 5, 1], [303, 1, 20, 0, 1, 5, 1]]}
+    obs = {"planets": [[101, 0, 0, 0, 1, 20, 1], [202, 1, 0, 10, 1, 5, 1], [303, 1, 20, 0, 1, 5, 1]]}
     target_logits = torch.full((65,), -10.0)
     target_logits[1] = 100.0
     target_logits[2] = 10.0
@@ -351,6 +351,90 @@ def test_decode_prediction_respects_precomputed_target_and_amount_masks() -> Non
     )
 
     assert move == [101, 0.0, 10]
+
+
+def test_decode_prediction_rejects_geometry_move_that_hits_other_planet_first() -> None:
+    from orbit_bc_training.decode_policy import decode_bc_prediction
+
+    class FakeGeometry:
+        def to_env_moves(self, **kwargs):
+            return [[101, 0.0, 1]]
+
+    obs = {
+        "player": 0,
+        "step": 0,
+        "episode_steps": 120,
+        "angular_velocity": 0.0,
+        "next_fleet_id": 0,
+        "remainingOverageTime": 60.0,
+        "comets": [],
+        "comet_planet_ids": [],
+        "planets": [
+            [101, 0, 10.0, 90.0, 1.0, 1.0, 1.0],
+            [202, -1, 90.0, 90.0, 1.0, 0.0, 1.0],
+            [303, -1, 50.0, 90.0, 2.0, 0.0, 1.0],
+        ],
+        "initial_planets": [
+            [101, 0, 10.0, 90.0, 1.0, 1.0, 1.0],
+            [202, -1, 90.0, 90.0, 1.0, 0.0, 1.0],
+            [303, -1, 50.0, 90.0, 2.0, 0.0, 1.0],
+        ],
+        "fleets": [],
+    }
+    target_logits = torch.full((65,), -10.0)
+    target_logits[1] = 10.0
+    amount_logits = torch.full((7,), -10.0)
+    amount_logits[1] = 10.0
+
+    move = decode_bc_prediction(obs, 0, 101, target_logits, amount_logits, FakeGeometry())
+
+    assert move is None
+
+
+def test_decode_prediction_rejects_long_launch_across_unobserved_comet_spawn() -> None:
+    from orbit_bc_training.decode_policy import decode_bc_prediction
+    from orbit_training_prep.geometry_bridge import make_geometry
+
+    obs = {
+        "player": 0,
+        "step": 49,
+        "episode_steps": 120,
+        "angular_velocity": 0.0,
+        "next_fleet_id": 0,
+        "remainingOverageTime": 60.0,
+        "comets": [],
+        "comet_planet_ids": [],
+        "planets": [
+            [101, 0, 10.0, 90.0, 1.0, 1.0, 1.0],
+            [202, -1, 90.0, 90.0, 1.0, 0.0, 1.0],
+        ],
+        "initial_planets": [
+            [101, 0, 10.0, 90.0, 1.0, 1.0, 1.0],
+            [202, -1, 90.0, 90.0, 1.0, 0.0, 1.0],
+        ],
+        "fleets": [],
+    }
+    target_logits = torch.full((65,), -10.0)
+    target_logits[1] = 10.0
+    amount_logits = torch.full((7,), -10.0)
+    amount_logits[1] = 10.0
+    target_mask = torch.zeros(65, dtype=torch.bool)
+    target_mask[1] = True
+    amount_mask = torch.zeros(7, dtype=torch.bool)
+    amount_mask[1] = True
+
+    move = decode_bc_prediction(
+        obs,
+        0,
+        101,
+        target_logits,
+        amount_logits,
+        make_geometry(horizon=160, device="cpu"),
+        target_mask=target_mask,
+        amount_mask=amount_mask,
+    )
+
+    assert move is None
 
 
 def test_resolve_device_auto_prefers_cuda_when_available(monkeypatch) -> None:

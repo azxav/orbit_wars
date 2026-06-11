@@ -101,11 +101,16 @@ def train(config: BCTrainConfig) -> dict[str, float]:
             metrics_file.write(json.dumps(latest_metrics, sort_keys=True) + "\n")
             metrics_file.flush()
             save_checkpoint(out_dir / "latest", model, optimizer, epoch, latest_metrics, model_cfg)
-            score = float(selection_metrics["gameplay_score"]) if selection_metrics.get("true_best") else float("-inf")
-            if selection_metrics.get("true_best") and score >= best_score:
+            # Selection score: gameplay eval when available, otherwise fall back
+            # to validation target accuracy on real launches. The old fallback
+            # overwrote "best" every epoch, so it always kept the last (most
+            # overfit) checkpoint. Now we early-stop on generalization.
+            if selection_metrics.get("true_best"):
+                score = float(selection_metrics["gameplay_score"])
+            else:
+                score = float(valid_metrics.get("target_non_noop_accuracy", 0.0))
+            if score >= best_score:
                 best_score = score
-                save_checkpoint(out_dir / "best", model, optimizer, epoch, latest_metrics, model_cfg)
-            elif not selection_metrics.get("true_best"):
                 save_checkpoint(out_dir / "best", model, optimizer, epoch, latest_metrics, model_cfg)
             print(json.dumps(latest_metrics, sort_keys=True))
     return latest_metrics
@@ -120,7 +125,10 @@ def main() -> None:
     ap.add_argument("--batch_size", type=int, default=512)
     ap.add_argument("--epochs", type=int, default=2)
     ap.add_argument("--lr", type=float, default=3e-4)
-    ap.add_argument("--weight_decay", type=float, default=1e-4)
+    # Regularization defaults raised: 102-episode dataset overfits the target
+    # head hard (train non_noop_acc 0.55 vs valid 0.28). Stronger wd + dropout
+    # closes the generalization gap.
+    ap.add_argument("--weight_decay", type=float, default=1e-3)
     ap.add_argument("--grad_clip", type=float, default=1.0)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--device", default="auto", help="Training device: auto, cpu, cuda, or cuda:N. auto prefers CUDA when available.")
@@ -129,7 +137,7 @@ def main() -> None:
     ap.add_argument("--num_layers", type=int, default=2)
     ap.add_argument("--num_heads", type=int, default=4)
     ap.add_argument("--mlp_size", type=int, default=256)
-    ap.add_argument("--dropout", type=float, default=0.0)
+    ap.add_argument("--dropout", type=float, default=0.2)
     args = ap.parse_args()
     train(BCTrainConfig(**vars(args)))
 
