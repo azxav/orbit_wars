@@ -22,7 +22,7 @@ class EntityBCPolicy(nn.Module):
             activation="gelu",
             norm_first=True,
         )
-        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=int(config.num_layers))
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=int(config.num_layers), enable_nested_tensor=False)
         self.target_state_encoder = nn.Linear(int(config.target_state_feature_dim), h) if int(config.target_state_feature_dim) > 0 else None
         pair_dim = int(config.pair_feature_dim)
         self.pair_feature_dim = pair_dim

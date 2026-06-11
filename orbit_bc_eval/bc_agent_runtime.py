@@ -12,7 +12,7 @@ import torch
 from orbit_bc_training.checkpoints import load_checkpoint
 from orbit_bc_training.decode_policy import decode_bc_prediction
 from orbit_bc_training.losses import masked_argmax
-from orbit_training_prep.features import build_feature_state, pair_features_from_obs
+from orbit_training_prep.features import _targeted_fleets, build_feature_state, pair_features_from_obs
 from orbit_training_prep.geometry_bridge import make_geometry
 from orbit_training_prep.schema import AMOUNT_BIN_NAMES, P_MAX, NOOP_TARGET_SLOT, capture_needed_ships, decode_amount_bin, owned_source_slots, safe_float
 from orbit_training_prep.viability import compute_viability_masks
@@ -123,9 +123,12 @@ def build_source_batch(
     amount_viability_mask: Any = None,
     horizon: int = DEFAULT_GEOMETRY_HORIZON,
     geometry: Any = None,
+    feature_state: Any = None,
+    movement: Any = None,
+    incoming_by_target: Any = None,
 ) -> dict[str, torch.Tensor]:
     del model_config
-    feature_state = build_feature_state(obs, int(player_id), P_MAX)
+    feature_state = feature_state or build_feature_state(obs, int(player_id), P_MAX)
     source_target_mask, source_amount_mask = _source_viability_slices(
         obs,
         int(player_id),
@@ -144,6 +147,8 @@ def build_source_batch(
         amount_viability_mask=source_amount_mask,
         feature_state=feature_state,
         geometry=geometry,
+        movement=movement,
+        incoming_by_target=incoming_by_target,
     )
     return {
         "planet_features": torch.as_tensor(feature_state.planet_features[None, ...], dtype=torch.float32, device=device),
@@ -268,6 +273,14 @@ def agent(obs, config):
     }
     try:
         turn_target_mask_np, turn_amount_mask_np = compute_viability_masks(obs, player_id, horizon=horizon, device="cpu", geometry=geometry)
+        turn_feature_state = build_feature_state(obs, player_id, P_MAX)
+        turn_incoming = _targeted_fleets(obs, player_id, P_MAX)
+        try:
+            obs_no_fleets = dict(obs)
+            obs_no_fleets["fleets"] = []
+            turn_movement = geometry.build_or_update_movement(geometry.obs_to_tensors(obs_no_fleets, player_id=player_id))
+        except Exception:
+            turn_movement = None
         for source_slot in owned_source_slots(obs, player_id):
             if time.monotonic() >= deadline:
                 debug["timeout"] = True
@@ -285,6 +298,9 @@ def agent(obs, config):
                     amount_viability_mask=turn_amount_mask_np[int(source_slot)],
                     horizon=horizon,
                     geometry=geometry,
+                    feature_state=turn_feature_state,
+                    movement=turn_movement,
+                    incoming_by_target=turn_incoming,
                 )
                 target_output = model(batch)
             target_logits = target_output["target_logits"][0].detach().cpu()

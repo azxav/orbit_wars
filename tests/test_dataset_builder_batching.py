@@ -5,6 +5,7 @@ import math
 from pathlib import Path
 
 from orbit_training_prep.dataset_builder import DatasetBuilder, read_jsonl
+from orbit_training_prep.source_turn_store import SourceTurnDatasetReader
 from orbit_training_prep.exact_target_sim import ExactTargetSimulator, resolve_geometry_device
 
 
@@ -71,8 +72,8 @@ def test_dataset_builder_records_device_and_batched_inference_mode(tmp_path: Pat
     out_dir = tmp_path / "dataset"
     replay_with_actions(replay_path, obs, [[1, 0.0, 10], [1, math.pi, 10]])
 
-    metadata = DatasetBuilder(horizon=80, device="cpu").build_from_replay(replay_path, out_dir)
-    launch_rows = read_jsonl(out_dir / "launch_rows.jsonl")
+    metadata = DatasetBuilder(horizon=80, device="cpu", write_debug_jsonl=True).build_from_replay(replay_path, out_dir)
+    launch_rows = read_jsonl(out_dir / "debug" / "launch_rows.jsonl")
 
     assert metadata["geometry_device"] == "cpu"
     assert metadata["target_inference_mode"] == "batched_exact_first_hit_with_angular_fallback"
@@ -96,9 +97,9 @@ def test_dataset_builder_source_rows_are_bc_ready_and_dense_dropped_positive_is_
     out_dir = tmp_path / "dataset"
     replay_with_actions(replay_path, obs, [[1, 0.0, 10], [1, math.pi, 10]])
 
-    metadata = DatasetBuilder(horizon=80, device="cpu").build_from_replay(replay_path, out_dir)
-    source_rows = read_jsonl(out_dir / "source_turn_rows.jsonl")
-    dense = dict(__import__("numpy").load(out_dir / "dense_bc_arrays.npz"))
+    metadata = DatasetBuilder(horizon=80, device="cpu", write_debug_jsonl=True).build_from_replay(replay_path, out_dir)
+    source_rows = read_jsonl(out_dir / "debug" / "source_turn_rows.jsonl")
+    reader = SourceTurnDatasetReader(out_dir)
 
     assert source_rows == []
     assert metadata["stats"]["raw_source_turns"] == 1
@@ -107,8 +108,8 @@ def test_dataset_builder_source_rows_are_bc_ready_and_dense_dropped_positive_is_
     assert metadata["stats"]["train_positive_source_turns"] == 0
     assert metadata["stats"]["dropped_source_turns"] == 1
     assert metadata["stats"]["dropped_ambiguous_sources"] == 1
-    assert int(dense["target_labels"][0, 0]) == 64
-    assert int(dense["amount_labels"][0, 0]) == 0
+    assert int(reader.samples["target_label"].shape[0]) == 0
+    assert int(reader.samples["amount_label"].shape[0]) == 0
 
 
 def test_dataset_builder_fresh_output_validates_without_repair(tmp_path: Path) -> None:
@@ -145,14 +146,14 @@ def test_dataset_builder_emits_geometry_viability_masks(tmp_path: Path) -> None:
     replay_with_actions(replay_path, obs, [[1, 0.0, 10]])
 
     DatasetBuilder(horizon=80, device="cpu").build_from_replay(replay_path, out_dir)
-    dense = dict(__import__("numpy").load(out_dir / "dense_bc_arrays.npz"))
+    reader = SourceTurnDatasetReader(out_dir)
 
-    assert dense["target_viability_mask"].shape == (1, 64, 65)
-    assert dense["amount_viability_mask"].shape == (1, 64, 65, 7)
-    assert bool(dense["target_viability_mask"][0, 0, 1])
-    assert not bool(dense["target_viability_mask"][0, 0, 2])
-    assert bool(dense["target_viability_mask"][0, 0, 64])
-    assert dense["amount_viability_mask"][0, 0, 64].tolist() == [True, False, False, False, False, False, False]
+    assert reader.samples["target_mask"].shape == (1, 65)
+    assert reader.samples["amount_mask"].shape == (1, 7)
+    assert bool(reader.samples["target_mask"][0, 1])
+    assert not bool(reader.samples["target_mask"][0, 2])
+    assert bool(reader.samples["target_mask"][0, 64])
+    assert reader.samples["amount_mask"][0].tolist() == [False, False, True, True, True, True, True]
 
 
 def test_viability_mask_is_amount_conditioned() -> None:

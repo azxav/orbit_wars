@@ -48,17 +48,9 @@ def test_dataset_builder_parallel_workers_matches_serial_output(tmp_path: Path) 
 
     assert parallel_meta["replay_paths"] == serial_meta["replay_paths"]
     assert parallel_meta["stats"] == serial_meta["stats"]
-    assert (parallel_out / "launch_rows.jsonl").read_text(encoding="utf-8") == (serial_out / "launch_rows.jsonl").read_text(encoding="utf-8")
-    assert (parallel_out / "source_turn_rows.jsonl").read_text(encoding="utf-8") == (serial_out / "source_turn_rows.jsonl").read_text(encoding="utf-8")
-    assert (parallel_out / "state_rows.jsonl").read_text(encoding="utf-8") == (serial_out / "state_rows.jsonl").read_text(encoding="utf-8")
-
-    with np.load(serial_out / "dense_bc_arrays.npz") as serial_npz, np.load(parallel_out / "dense_bc_arrays.npz") as parallel_npz:
-        for key in (
-            "planet_features",
-            "global_features",
-            "target_state_features",
-            "target_labels",
-            "amount_labels",
-            "source_mask",
-        ):
-            assert np.array_equal(parallel_npz[key], serial_npz[key])
+    for group in ("states", "samples"):
+        for serial_path in sorted((serial_out / group).glob("*.npy")):
+            parallel_path = parallel_out / group / serial_path.name
+            assert parallel_path.exists()
+            assert np.array_equal(np.load(parallel_path, allow_pickle=False), np.load(serial_path, allow_pickle=False))
+    assert not (parallel_out / "dense_bc_arrays.npz").exists()

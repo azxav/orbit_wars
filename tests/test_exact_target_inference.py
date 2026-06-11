@@ -110,9 +110,9 @@ class ExactTargetInferenceTest(unittest.TestCase):
             out_dir = root / "dataset"
             replay_with_action(replay_path, obs, [[1, 0.0, 10]])
 
-            metadata = DatasetBuilder(horizon=80).build_from_replay(replay_path, out_dir)
-            launch_row = read_jsonl(out_dir / "launch_rows.jsonl")[0]
-            source_row = read_jsonl(out_dir / "source_turn_rows.jsonl")[0]
+            metadata = DatasetBuilder(horizon=80, write_debug_jsonl=True).build_from_replay(replay_path, out_dir)
+            launch_row = read_jsonl(out_dir / "debug" / "launch_rows.jsonl")[0]
+            source_row = read_jsonl(out_dir / "debug" / "source_turn_rows.jsonl")[0]
 
         self.assertEqual(metadata["target_inference_mode"], "batched_exact_first_hit_with_angular_fallback")
         self.assertEqual(launch_row["inferred_target_id"], 2)

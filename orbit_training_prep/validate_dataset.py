@@ -10,15 +10,7 @@ import numpy as np
 
 from .features import PAIR_FEATURE_NAMES
 from .schema import AMOUNT_BIN_NAMES, NOOP_TARGET_SLOT
-
-
-def read_jsonl(path: Path) -> list[dict[str, Any]]:
-    rows = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            if line.strip():
-                rows.append(json.loads(line))
-    return rows
+from .source_turn_store import DATASET_FORMAT, SAMPLE_SPECS, STATE_SPECS, SourceTurnDatasetReader
 
 
 def iter_jsonl(path: Path):
@@ -28,157 +20,91 @@ def iter_jsonl(path: Path):
                 yield json.loads(line)
 
 
+def _shape_map(arrays: dict[str, np.ndarray]) -> dict[str, list[int]]:
+    return {k: list(v.shape) for k, v in arrays.items() if hasattr(v, "shape")}
+
+
 def validate_dataset(out_dir: str | Path) -> dict[str, Any]:
     out_dir = Path(out_dir)
-    metadata = json.load(open(out_dir / "metadata.json", "r", encoding="utf-8")) if (out_dir / "metadata.json").exists() else {}
+    if (out_dir / "dense_bc_arrays.npz").exists():
+        raise RuntimeError("Old dense_bc_arrays.npz dataset detected. Rebuild dataset with source_turn_memmap_v1.")
+    reader = SourceTurnDatasetReader(out_dir)
+    metadata = reader.metadata
+    if metadata.get("dataset_format") != DATASET_FORMAT:
+        raise RuntimeError("Dataset is not source_turn_memmap_v1")
 
-    launch_count = 0
-    methods: Counter[str] = Counter()
-    launch_valid = 0
-    contact = 0
-    angular = 0
-    launch_path = out_dir / "launch_rows.jsonl"
-    if launch_path.exists():
-        for row in iter_jsonl(launch_path):
-            launch_count += 1
-            methods[str(row.get("target_inference_method"))] += 1
-            launch_valid += int(bool(row.get("valid_source")))
-            contact += int(row.get("target_inference_method") == "first_contact")
-            angular += int(row.get("target_inference_method") == "angular_nearest")
+    state_shapes = _shape_map(reader.states)
+    sample_shapes = _shape_map(reader.samples)
+    sample_count = int(reader.samples["state_index"].shape[0])
+    state_count = int(reader.states["planet_features"].shape[0])
 
-    source_count = 0
-    amount_bins: Counter[str] = Counter()
-    geometry_viable = 0
-    ambiguous = 0
-    drop_v1 = 0
-    positives = 0
-    noops = 0
-    source_rows_for_checks: list[dict[str, Any]] = []
-    source_path = out_dir / "source_turn_rows.jsonl"
-    if source_path.exists():
-        for row in iter_jsonl(source_path):
-            source_rows_for_checks.append(row)
-            source_count += 1
-            amount_name = row.get("amount_bin_name", AMOUNT_BIN_NAMES[int(row.get("amount_bin_label", 0))] if "amount_bin_label" in row else row.get("amount_bin", 0))
-            amount_bins[str(amount_name)] += 1
-            geometry_viable += int(bool(row.get("geometry_viable")))
-            ambiguous += int(bool(row.get("ambiguous_multi_launch")))
-            drop_v1 += int(bool(row.get("drop_for_v1_bc")))
-            is_positive = int(row.get("target_slot_label", NOOP_TARGET_SLOT)) != NOOP_TARGET_SLOT
-            positives += int(is_positive)
-            noops += int(not is_positive)
+    for key, (_, tail_shape) in STATE_SPECS.items():
+        expected = (state_count, *tail_shape)
+        if tuple(reader.states[key].shape) != expected:
+            raise RuntimeError(f"state array {key} shape {list(reader.states[key].shape)} != expected {list(expected)}")
+    for key, (_, tail_shape) in SAMPLE_SPECS.items():
+        expected = (sample_count, *tail_shape)
+        if tuple(reader.samples[key].shape) != expected:
+            raise RuntimeError(f"sample array {key} shape {list(reader.samples[key].shape)} != expected {list(expected)}")
 
-    arr_info = {}
-    dense_arrays = None
-    npz_path = out_dir / "dense_bc_arrays.npz"
-    if npz_path.exists():
-        dense_arrays = np.load(npz_path, allow_pickle=False)
-        arr_info = {k: list(v.shape) for k, v in dense_arrays.items() if hasattr(v, "shape")}
-        if "pair_features" not in dense_arrays:
-            raise RuntimeError("dense_bc_arrays.npz is missing pair_features; rebuild dataset with ETA-aware pair features")
-        pair_shape = dense_arrays["pair_features"].shape
-        if len(pair_shape) != 4 or int(pair_shape[-1]) != len(PAIR_FEATURE_NAMES):
-            raise RuntimeError(
-                f"pair_features shape {list(pair_shape)} does not match expected final dim {len(PAIR_FEATURE_NAMES)}"
-            )
-        if "pair_feature_names" in dense_arrays:
-            stored_pair_names = [str(x) for x in dense_arrays["pair_feature_names"].tolist()]
-            if stored_pair_names != list(PAIR_FEATURE_NAMES):
-                raise RuntimeError("pair_feature_names do not match current ETA-aware feature contract")
+    state_index = np.asarray(reader.samples["state_index"])
+    source_slot = np.asarray(reader.samples["source_slot"])
+    target_label = np.asarray(reader.samples["target_label"])
+    amount_label = np.asarray(reader.samples["amount_label"])
+    target_mask = np.asarray(reader.samples["target_mask"])
+    amount_mask = np.asarray(reader.samples["amount_mask"])
 
-    invalid_bc_rows = []
-    for row in source_rows_for_checks:
-        target_label = int(row.get("target_slot_label", NOOP_TARGET_SLOT))
-        if bool(row.get("drop_for_v1_bc", False)):
-            invalid_bc_rows.append(row)
-        elif target_label != NOOP_TARGET_SLOT and not bool(row.get("geometry_viable", True)):
-            invalid_bc_rows.append(row)
-        elif target_label != NOOP_TARGET_SLOT and bool(row.get("ambiguous_multi_launch", False)):
-            invalid_bc_rows.append(row)
-        elif target_label != NOOP_TARGET_SLOT and str(row.get("target_inference_method", "") or "") == "angular_nearest":
-            invalid_bc_rows.append(row)
-    num_invalid_bc_rows = len(invalid_bc_rows)
-    if num_invalid_bc_rows:
-        raise RuntimeError(f"BC-invalid source rows found in train-ready source_turn_rows.jsonl: {num_invalid_bc_rows}")
+    if np.any(state_index >= state_count):
+        raise RuntimeError("source-turn samples contain state_index outside state array")
+    if np.any(source_slot >= 64):
+        raise RuntimeError("source-turn samples contain source_slot outside action space")
+    if np.any(target_label > NOOP_TARGET_SLOT):
+        raise RuntimeError("source-turn samples contain target_label outside action space")
+    if np.any(amount_label >= len(AMOUNT_BIN_NAMES)):
+        raise RuntimeError("source-turn samples contain amount_label outside action space")
 
-    if dense_arrays is not None and "target_viability_mask" in dense_arrays and "amount_viability_mask" in dense_arrays:
-        state_rows = read_jsonl(out_dir / "state_rows.jsonl") if (out_dir / "state_rows.jsonl").exists() else []
-        obs_uid_to_dense = {str(row.get("obs_uid")): i for i, row in enumerate(state_rows)}
-        target_viability_mask = dense_arrays["target_viability_mask"]
-        amount_viability_mask = dense_arrays["amount_viability_mask"]
-        bad_targets = 0
-        bad_amounts = 0
-        for row in source_rows_for_checks:
-            dense_idx = obs_uid_to_dense.get(str(row.get("obs_uid")))
-            if dense_idx is None:
-                continue
-            source_slot = int(row.get("source_slot", -1))
-            target_label = int(row.get("target_slot_label", NOOP_TARGET_SLOT))
-            amount_label = int(row.get("amount_bin_label", 0))
-            if (
-                source_slot < 0
-                or source_slot >= target_viability_mask.shape[1]
-                or target_label < 0
-                or target_label >= target_viability_mask.shape[2]
-            ):
-                bad_targets += 1
-                continue
-            if not bool(target_viability_mask[dense_idx, source_slot, target_label]):
-                bad_targets += 1
-                continue
-            if amount_label < 0 or amount_label >= amount_viability_mask.shape[3]:
-                bad_amounts += 1
-                continue
-            if not bool(amount_viability_mask[dense_idx, source_slot, target_label, amount_label]):
-                bad_amounts += 1
-        if bad_targets:
-            raise RuntimeError(f"BC source rows contain {bad_targets} target labels outside target_viability_mask")
-        if bad_amounts:
-            raise RuntimeError(f"BC source rows contain {bad_amounts} amount labels outside amount_viability_mask")
+    bad_targets = int(sum(not bool(target_mask[i, int(target_label[i])]) for i in range(sample_count)))
+    bad_amounts = int(sum(not bool(amount_mask[i, int(amount_label[i])]) for i in range(sample_count)))
+    if bad_targets:
+        raise RuntimeError(f"BC source-turn samples contain {bad_targets} target labels outside target_mask")
+    if bad_amounts:
+        raise RuntimeError(f"BC source-turn samples contain {bad_amounts} amount labels outside amount_mask")
 
-    denom_launch = max(launch_count, 1)
-    denom_source = max(source_count, 1)
+    positives = int(np.sum(target_label != NOOP_TARGET_SLOT))
+    noops = int(sample_count - positives)
+    amount_bins = Counter(str(AMOUNT_BIN_NAMES[int(a)]) for a in amount_label.tolist())
     report = {
         "counts": {
-            "launch_rows": launch_count,
-            "source_turn_rows": source_count,
-            "valid_launches": launch_valid,
+            "source_turn_rows": sample_count,
             "positive_source_turns": positives,
             "noop_source_turns": noops,
-            "ambiguous_multi_launch_sources": ambiguous,
-            "drop_for_v1_bc_rows": drop_v1,
-            "bc_invalid_source_rows": num_invalid_bc_rows,
+            "drop_for_v1_bc_rows": 0,
+            "bc_invalid_source_rows": 0,
         },
         "rates": {
-            "valid_launch_rate": launch_valid / denom_launch,
-            "first_contact_launch_rate": contact / denom_launch,
-            "angular_fallback_launch_rate": angular / denom_launch,
-            "geometry_viable_source_rate": geometry_viable / denom_source,
-            "noop_source_rate": noops / denom_source,
-            "drop_for_v1_bc_rate": drop_v1 / denom_source,
-            "bc_invalid_source_rate": num_invalid_bc_rows / denom_source,
+            "noop_source_rate": float(noops / max(sample_count, 1)),
+            "bc_invalid_source_rate": 0.0,
         },
-        "target_inference_methods": dict(methods),
+        "target_inference_methods": {},
         "amount_bin_distribution_source_turns": dict(amount_bins),
-        "dense_array_shapes": arr_info,
+        "dense_array_shapes": {},
+        "state_array_shapes": state_shapes,
+        "source_turn_array_shapes": sample_shapes,
         "metadata_stats": metadata.get("stats", {}),
         "decision_checks": {
+            "dataset_format": metadata.get("dataset_format"),
             "target_head_dim": metadata.get("action_space", {}).get("target_slots"),
             "noop_target_slot": metadata.get("action_space", {}).get("noop_target_slot"),
             "amount_bins": metadata.get("action_space", {}).get("amount_bins"),
             "angle_policy": metadata.get("action_space", {}).get("angle_policy"),
-            "pair_feature_dim": len(metadata.get("pair_feature_names", [])) or (arr_info.get("pair_features", [None, None, None, 0])[-1] if arr_info else None),
-            "primary_train_rows": "source_turn_rows.jsonl",
-            "dense_bc_arrays": "dense_bc_arrays.npz",
+            "pair_feature_dim": len(metadata.get("pair_feature_names", [])) or int(reader.samples["pair_features"].shape[-1]),
+            "primary_train_rows": "samples/*.npy",
+            "dense_bc_arrays": None,
         },
     }
     with open(out_dir / "validation_report.json", "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, sort_keys=True)
-    lines = [
-        "# Orbit Wars Dataset Validation Report",
-        "",
-        "## Counts",
-    ]
+    lines = ["# Orbit Wars Dataset Validation Report", "", "## Counts"]
     for k, v in report["counts"].items():
         lines.append(f"- `{k}`: {v}")
     lines += ["", "## Rates"]
@@ -187,7 +113,7 @@ def validate_dataset(out_dir: str | Path) -> dict[str, Any]:
     lines += ["", "## Training contract checks"]
     for k, v in report["decision_checks"].items():
         lines.append(f"- `{k}`: {v}")
-    lines += ["", "## Notes", "- `source_turn_rows.jsonl` is the final train-ready BC source-row file.", "- `target_inference_method=first_contact` means the label came from exact geometry first-hit simulation. `target_inference_method=angular_nearest` is only the fallback for sun, bounds, or no-contact launches and is not valid for positive BC source rows."]
+    lines += ["", "## Notes", "- `samples/*.npy` is the final train-ready BC source-turn dataset."]
     (out_dir / "validation_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return report
 

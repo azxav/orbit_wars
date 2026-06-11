@@ -48,4 +48,5 @@ def test_dataset_builder_streams_rows_instead_of_buffering_until_finish(tmp_path
 
     assert metadata["stats"]["states"] == 1
     assert metadata["stats"]["source_turn_rows"] == 1
-    assert (tmp_path / "dataset" / "source_turn_rows.jsonl").read_text(encoding="utf-8").strip()
+    assert not (tmp_path / "dataset" / "source_turn_rows.jsonl").exists()
+    assert (tmp_path / "dataset" / "samples" / "pair_features.npy").exists()

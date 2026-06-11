@@ -53,7 +53,9 @@ class DatasetBuilderMultipleReplaysTest(unittest.TestCase):
             )
             self.assertEqual(metadata["stats"]["states"], 2)
             self.assertEqual(metadata["stats"]["source_turn_rows"], 2)
-            self.assertTrue((out_dir / "source_turn_rows.jsonl").exists())
+            self.assertTrue((out_dir / "samples" / "pair_features.npy").exists())
+            self.assertFalse((out_dir / "dense_bc_arrays.npz").exists())
+            self.assertEqual(metadata["dataset_format"], "source_turn_memmap_v1")
 
     def test_limits_replay_directory_to_requested_file_count(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

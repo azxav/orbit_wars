@@ -10,7 +10,7 @@ CENTER=50.0; BOARD=100.0; ROTATION_RADIUS_LIMIT=50.0; SHIP_LOG_DENOM=math.log1p(
 PLANET_FEATURE_NAMES=["alive","rel_owner_neutral","rel_owner_own","rel_owner_enemy","x_centered","y_centered","radius_norm","ships_log_norm","production_norm","is_comet","is_orbiting","distance_center_norm","owner_ship_share","owner_prod_share","projected_garrison_20","under_threat_20"]
 GLOBAL_FEATURE_NAMES=["step_norm","remaining_steps_norm","is_2p","is_4p","my_ship_share","my_prod_share","my_planet_share","leader_ship_gap_norm","leader_prod_gap_norm","weakest_enemy_ship_gap_norm"]
 TARGET_STATE_FEATURE_NAMES=["nearest_own_eta_to_target","nearest_enemy_eta_to_target","enemy_before_own_flag","hostile_arrivals_before_10","projected_owner_20","projected_garrison_20","target_contested_flag","target_easy_neutral_flag","target_high_prod_flag"]
-PAIR_FEATURE_NAMES=["capture_needed","capture_ratio","surplus_after_capture","roi_prod_per_ship","is_neutral","is_enemy","is_own","cheap_neutral","high_prod_target","distance","angle_sin","angle_cos","geom_viable_any_amount","geom_viable_amount_frac","geom_no_viable_amount_flag","safe_sendable_ships","post_send_frac_capture","overkill_ratio_capture","our_eta_norm","enemy_ships_before_our_arrival","friendly_ships_before_our_arrival","enemy_ships_at_or_before_our_arrival","friendly_ships_at_or_before_our_arrival","projected_garrison_at_our_arrival","projected_owner_at_our_arrival","enemy_arrives_before_us_flag","friendly_support_before_us_flag","target_capture_margin_at_arrival","local_ship_advantage_at_arrival","is_noop_candidate"]
+PAIR_FEATURE_NAMES=["capture_ratio","surplus_after_capture","roi_prod_per_ship","distance","angle_sin","angle_cos","geom_viable_amount_frac","safe_sendable_ships","post_send_frac_capture","our_eta_norm","enemy_ships_before_our_arrival","friendly_ships_before_our_arrival","projected_garrison_at_our_arrival","projected_owner_at_our_arrival","target_capture_margin_at_arrival"]
 @dataclass(frozen=True)
 class FeatureState:
     planet_features:np.ndarray; global_features:np.ndarray; target_state_features:np.ndarray
@@ -126,7 +126,10 @@ def _candidate_etas_for_source(obs:dict[str,Any],player_id:int,source_slot:int,s
     except Exception:
         pass
     for t in range(len(ships_by_target)):
-        if t==int(source_slot): etas[t]=0.0
+        if t==int(source_slot):
+            etas[t]=0.0
+        elif t>=len(planets) or len(planets[t])<7:
+            etas[t]=math.inf
         elif not math.isfinite(etas[t]):
             etas[t]=_candidate_eta(obs,int(player_id),int(source_slot),int(t),float(ships_by_target[t]),movement=movement,geometry=geometry,horizon=int(horizon))
     return etas
@@ -191,23 +194,53 @@ def target_state_features(obs:dict[str,Any],player_id:int,max_planets:int=P_MAX)
     return np.nan_to_num(out,nan=0.0,posinf=0.0,neginf=0.0)
 def build_feature_state(obs:dict[str,Any],player_id:int,max_planets:int=P_MAX)->FeatureState: return FeatureState(planet_features=all_planet_features(obs,player_id,max_planets),global_features=global_features(obs,player_id,max_planets),target_state_features=target_state_features(obs,player_id,max_planets))
 def pair_features_from_dense(planet_features:np.ndarray,target_state_features:np.ndarray,source_slot:int,*,max_planets:int=P_MAX,target_viability_mask:np.ndarray|None=None,amount_viability_mask:np.ndarray|None=None)->np.ndarray:
-    out=np.zeros((max_planets+1,len(PAIR_FEATURE_NAMES)),dtype=np.float32); ni={n:i for i,n in enumerate(PLANET_FEATURE_NAMES)}; ti={n:i for i,n in enumerate(TARGET_STATE_FEATURE_NAMES)}
-    noop_idx=NOOP_TARGET_SLOT if NOOP_TARGET_SLOT<out.shape[0] else max_planets
-    if not (0<=int(source_slot)<max_planets): out[noop_idx,-1]=1.0; return out
-    src=planet_features[int(source_slot)]; sx=float(src[ni["x_centered"]]); sy=float(src[ni["y_centered"]]); ss=max(0.0,ships_from_log_norm(float(src[ni["ships_log_norm"]]))); sp=max(0.0,float(src[ni["production_norm"]])*5.0); threat=float(src[ni["under_threat_20"]]); abc=max(1,int(np.asarray(amount_viability_mask).shape[-1])-1) if amount_viability_mask is not None else 0
+    out=np.zeros((max_planets+1,len(PAIR_FEATURE_NAMES)),dtype=np.float32)
+    ni={n:i for i,n in enumerate(PLANET_FEATURE_NAMES)}; ti={n:i for i,n in enumerate(TARGET_STATE_FEATURE_NAMES)}
+    if not (0<=int(source_slot)<max_planets): return out
+    src=planet_features[int(source_slot)]
+    sx=float(src[ni["x_centered"]]); sy=float(src[ni["y_centered"]])
+    ss=max(0.0,ships_from_log_norm(float(src[ni["ships_log_norm"]]))); sp=max(0.0,float(src[ni["production_norm"]])*5.0); threat=float(src[ni["under_threat_20"]])
+    abc=max(1,int(np.asarray(amount_viability_mask).shape[-1])-1) if amount_viability_mask is not None else 0
     for tslot in range(max_planets):
         tgt=planet_features[tslot]
         if float(tgt[ni["alive"]])<=0.0: continue
-        dx=float(tgt[ni["x_centered"]])-sx; dy=float(tgt[ni["y_centered"]])-sy; dist=math.hypot(dx,dy); ang=math.atan2(dy,dx) if dist>0 else 0.0; ts=max(0.0,ships_from_log_norm(float(tgt[ni["ships_log_norm"]]))); tp=max(0.0,float(tgt[ni["production_norm"]])*5.0); own=float(tgt[ni["rel_owner_own"]]); enemy=float(tgt[ni["rel_owner_enemy"]]); neutral=float(tgt[ni["rel_owner_neutral"]]); need=1.0 if own>0.5 else ts+1.0; safe=max(0.0,ss-(2.0+sp+10.0*threat)); rowts=target_state_features[tslot]; ne=float(rowts[ti["nearest_enemy_eta_to_target"]]); arrival=min(float(MAX_ETA_FEATURE_HORIZON),dist*10.0); proj=float(rowts[ti["projected_garrison_20"]]); owner=float(rowts[ti["projected_owner_20"]]); gv=1.0 if target_viability_mask is not None and bool(np.asarray(target_viability_mask)[tslot]) else 0.0; gaf=float(np.asarray(amount_viability_mask)[tslot,1:].sum())/float(abc) if amount_viability_mask is not None and abc>0 else 0.0
-        out[tslot]=np.asarray([need/100.0,need/max(1.0,ss),(ss-need)/100.0,tp/max(1.0,need),neutral,enemy,own,1.0 if neutral>0.5 and need<=5.0 else 0.0,1.0 if tp>=3.0 else 0.0,dist,math.sin(ang),math.cos(ang),gv,gaf,1.0 if gaf<=0.0 else 0.0,safe/100.0,(ss-need)/max(1.0,ss),ss/max(1.0,need),arrival/float(MAX_ETA_FEATURE_HORIZON),0.0,0.0,0.0,0.0,proj,owner,1.0 if ne*50.0<arrival else 0.0,0.0,(ss-need)/100.0,(ss/100.0)-proj,0.0],dtype=np.float32)
-    out[noop_idx,-1]=1.0; return np.nan_to_num(out,nan=0.0,posinf=0.0,neginf=0.0)
+        dx=float(tgt[ni["x_centered"]])-sx; dy=float(tgt[ni["y_centered"]])-sy
+        dist=math.hypot(dx,dy); ang=math.atan2(dy,dx) if dist>0 else 0.0
+        ts=max(0.0,ships_from_log_norm(float(tgt[ni["ships_log_norm"]]))); tp=max(0.0,float(tgt[ni["production_norm"]])*5.0); own=float(tgt[ni["rel_owner_own"]])
+        need=1.0 if own>0.5 else ts+1.0
+        safe=max(0.0,ss-(2.0+sp+10.0*threat))
+        rowts=target_state_features[tslot]
+        arrival=min(float(MAX_ETA_FEATURE_HORIZON),dist*10.0)
+        proj_garrison_norm=float(rowts[ti["projected_garrison_20"]])
+        projected_owner=float(rowts[ti["projected_owner_20"]])
+        hostile_need=0.0 if int(projected_owner)==1 else max(0.0,proj_garrison_norm*100.0)+1.0
+        capture_margin=(ss-hostile_need)/100.0
+        gaf=float(np.asarray(amount_viability_mask)[tslot,1:].sum())/float(abc) if amount_viability_mask is not None and abc>0 else 0.0
+        values={
+            "capture_ratio":need/max(1.0,ss),
+            "surplus_after_capture":(ss-need)/100.0,
+            "roi_prod_per_ship":tp/max(1.0,need),
+            "distance":dist,
+            "angle_sin":math.sin(ang),
+            "angle_cos":math.cos(ang),
+            "geom_viable_amount_frac":gaf,
+            "safe_sendable_ships":safe/100.0,
+            "post_send_frac_capture":(ss-need)/max(1.0,ss),
+            "our_eta_norm":min(1.0,arrival/float(MAX_ETA_FEATURE_HORIZON)),
+            "enemy_ships_before_our_arrival":0.0,
+            "friendly_ships_before_our_arrival":0.0,
+            "projected_garrison_at_our_arrival":proj_garrison_norm,
+            "projected_owner_at_our_arrival":projected_owner,
+            "target_capture_margin_at_arrival":capture_margin,
+        }
+        out[tslot]=np.asarray([values[name] for name in PAIR_FEATURE_NAMES],dtype=np.float32)
+    return np.nan_to_num(out,nan=0.0,posinf=0.0,neginf=0.0)
 def pair_features_from_obs(obs:dict[str,Any],player_id:int,source_slot:int,*,max_planets:int=P_MAX,target_viability_mask:np.ndarray|None=None,amount_viability_mask:np.ndarray|None=None,feature_state:FeatureState|None=None,geometry:Any=None,movement:Any=None,incoming_by_target:dict[int,list[tuple[float,int,float]]]|None=None)->np.ndarray:
     fs=feature_state or build_feature_state(obs,int(player_id),max_planets)
     out=np.zeros((max_planets+1,len(PAIR_FEATURE_NAMES)),dtype=np.float32); ni={n:i for i,n in enumerate(PLANET_FEATURE_NAMES)}
-    noop_idx=NOOP_TARGET_SLOT if NOOP_TARGET_SLOT<out.shape[0] else max_planets
     planets=obs.get("planets",[])[:max_planets]
     if not (0<=int(source_slot)<max_planets) or int(source_slot)>=len(planets) or len(planets[int(source_slot)])<7:
-        out[noop_idx,-1]=1.0; return out
+        return out
     if movement is None:
         try:
             geometry=geometry or make_geometry(horizon=MAX_ETA_FEATURE_HORIZON,device="cpu")
@@ -226,14 +259,29 @@ def pair_features_from_obs(obs:dict[str,Any],player_id:int,source_slot:int,*,max
         if tslot>=len(planets) or len(planets[tslot])<7: continue
         tgt=fs.planet_features[tslot]
         if float(tgt[ni["alive"]])<=0.0: continue
-        dx=float(tgt[ni["x_centered"]])-sx; dy=float(tgt[ni["y_centered"]])-sy; dist=math.hypot(dx,dy); ang=math.atan2(dy,dx) if dist>0 else 0.0; ts=max(0.0,ships_from_log_norm(float(tgt[ni["ships_log_norm"]]))); tp=max(0.0,float(tgt[ni["production_norm"]])*5.0); own=float(tgt[ni["rel_owner_own"]]); enemy=float(tgt[ni["rel_owner_enemy"]]); neutral=float(tgt[ni["rel_owner_neutral"]]); need=1.0 if own>0.5 else ts+1.0; safe=max(0.0,ss-(2.0+sp+10.0*threat)); gv=1.0 if target_viability_mask is not None and bool(np.asarray(target_viability_mask)[tslot]) else 0.0; gaf=float(np.asarray(amount_viability_mask)[tslot,1:].sum())/float(abc) if amount_viability_mask is not None and abc>0 else 0.0
+        dx=float(tgt[ni["x_centered"]])-sx; dy=float(tgt[ni["y_centered"]])-sy; dist=math.hypot(dx,dy); ang=math.atan2(dy,dx) if dist>0 else 0.0; ts=max(0.0,ships_from_log_norm(float(tgt[ni["ships_log_norm"]]))); tp=max(0.0,float(tgt[ni["production_norm"]])*5.0); own=float(tgt[ni["rel_owner_own"]]); need=1.0 if own>0.5 else ts+1.0; safe=max(0.0,ss-(2.0+sp+10.0*threat)); gaf=float(np.asarray(amount_viability_mask)[tslot,1:].sum())/float(abc) if amount_viability_mask is not None and abc>0 else 0.0
         our_eta=float(candidate_etas[tslot])
         if not math.isfinite(our_eta): our_eta=float(MAX_ETA_FEATURE_HORIZON)
         proj_owner,proj_ships,enemy_before,friendly_before,enemy_at,friendly_at=_project_target_to_eta(planets[tslot],incoming.get(tslot,[]),int(player_id),our_eta)
         rel_proj=relative_owner(proj_owner,int(player_id))
         hostile_need=0.0 if rel_proj==1 else proj_ships+1.0
         capture_margin=(ss-hostile_need)/100.0
-        local_adv=(ss+friendly_before-enemy_before-proj_ships)/100.0
-        out[tslot]=np.asarray([need/100.0,need/max(1.0,ss),(ss-need)/100.0,tp/max(1.0,need),neutral,enemy,own,1.0 if neutral>0.5 and need<=5.0 else 0.0,1.0 if tp>=3.0 else 0.0,dist,math.sin(ang),math.cos(ang),gv,gaf,1.0 if gaf<=0.0 else 0.0,safe/100.0,(ss-need)/max(1.0,ss),ss/max(1.0,need),min(1.0,our_eta/float(MAX_ETA_FEATURE_HORIZON)),enemy_before/100.0,friendly_before/100.0,enemy_at/100.0,friendly_at/100.0,proj_ships/100.0,float(rel_proj),1.0 if enemy_before>0.0 else 0.0,1.0 if friendly_before>0.0 else 0.0,capture_margin,local_adv,0.0],dtype=np.float32)
-    out[noop_idx,-1]=1.0
+        values={
+            "capture_ratio":need/max(1.0,ss),
+            "surplus_after_capture":(ss-need)/100.0,
+            "roi_prod_per_ship":tp/max(1.0,need),
+            "distance":dist,
+            "angle_sin":math.sin(ang),
+            "angle_cos":math.cos(ang),
+            "geom_viable_amount_frac":gaf,
+            "safe_sendable_ships":safe/100.0,
+            "post_send_frac_capture":(ss-need)/max(1.0,ss),
+            "our_eta_norm":min(1.0,our_eta/float(MAX_ETA_FEATURE_HORIZON)),
+            "enemy_ships_before_our_arrival":enemy_before/100.0,
+            "friendly_ships_before_our_arrival":friendly_before/100.0,
+            "projected_garrison_at_our_arrival":proj_ships/100.0,
+            "projected_owner_at_our_arrival":float(rel_proj),
+            "target_capture_margin_at_arrival":capture_margin,
+        }
+        out[tslot]=np.asarray([values[name] for name in PAIR_FEATURE_NAMES],dtype=np.float32)
     return np.nan_to_num(out,nan=0.0,posinf=0.0,neginf=0.0)

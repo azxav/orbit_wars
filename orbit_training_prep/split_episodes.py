@@ -6,7 +6,6 @@ import random
 from pathlib import Path
 from typing import Any
 
-
 EPISODE_ROW_FILES = (
     "source_turn_rows.jsonl",
     "state_rows.jsonl",
@@ -21,12 +20,36 @@ def iter_jsonl(path: Path):
                 yield json.loads(line)
 
 
+def _discover_memmap_episode_ids(root: Path) -> set[str]:
+    metadata_path = root / "metadata.json"
+    if not metadata_path.exists():
+        return set()
+    try:
+        from .source_turn_store import DATASET_FORMAT, SourceTurnDatasetReader
+
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if metadata.get("dataset_format") != DATASET_FORMAT:
+            return set()
+        reader = SourceTurnDatasetReader(root)
+        if "episode_id" not in reader.states:
+            return set()
+        return {str(x) for x in reader.states["episode_id"].tolist() if str(x)}
+    except Exception:
+        return set()
+
+
 def discover_episode_ids(dataset_root: str | Path) -> list[str]:
     root = Path(dataset_root)
     if not root.exists():
         raise FileNotFoundError(f"dataset_root does not exist: {root}")
 
     episode_ids: set[str] = set()
+    episode_ids.update(_discover_memmap_episode_ids(root))
+    for metadata_path in sorted(root.rglob("metadata.json")):
+        if "train" in metadata_path.parts or "valid" in metadata_path.parts:
+            continue
+        episode_ids.update(_discover_memmap_episode_ids(metadata_path.parent))
+
     for filename in EPISODE_ROW_FILES:
         for path in sorted(root.rglob(filename)):
             if "train" in path.parts or "valid" in path.parts:
