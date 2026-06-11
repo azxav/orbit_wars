@@ -6,7 +6,7 @@ import torch
 
 from orbit_training_prep.schema import NOOP_TARGET_SLOT, capture_needed_ships, decode_amount_bin
 
-from .losses import masked_argmax
+from .losses import apply_mask, masked_argmax
 
 
 def _slot_for_planet_id(obs: dict, planet_id: int) -> int | None:
@@ -35,6 +35,7 @@ def decode_bc_prediction(
     *,
     target_mask: torch.Tensor | None = None,
     amount_mask: torch.Tensor | None = None,
+    noop_threshold: float = 0.85,
 ) -> Optional[list]:
     source_slot = _slot_for_planet_id(obs, int(source_planet_id))
     if source_slot is None:
@@ -44,9 +45,19 @@ def decode_bc_prediction(
         return None
     mask = _target_mask(obs, source_slot) if target_mask is None else torch.as_tensor(target_mask, dtype=torch.bool)
     mask = mask.to(torch.as_tensor(target_logits).device)
-    target = int(masked_argmax(torch.as_tensor(target_logits).float().unsqueeze(0), mask.unsqueeze(0))[0].item())
-    if target == NOOP_TARGET_SLOT:
+    # Launch-bias decode. Pure argmax over the 65-way head collapses to NOOP at
+    # rollout (NOOP is the single fattest slot; under covariate shift target
+    # logits go mushy and NOOP wins). Only NOOP when its probability genuinely
+    # dominates (>= noop_threshold); otherwise commit to the best launch slot.
+    masked = apply_mask(torch.as_tensor(target_logits).float().unsqueeze(0), mask.unsqueeze(0))
+    probs = masked.softmax(dim=-1)[0]
+    launch_probs = probs.clone()
+    launch_probs[NOOP_TARGET_SLOT] = -1.0
+    best_launch = int(launch_probs.argmax().item())
+    noop_prob = float(probs[NOOP_TARGET_SLOT].item())
+    if launch_probs[best_launch] <= 0.0 or noop_prob >= float(noop_threshold):
         return None
+    target = best_launch
     amount_tensor = torch.as_tensor(amount_logits).float()
     if amount_mask is not None:
         amount_mask_t = torch.as_tensor(amount_mask, dtype=torch.bool, device=amount_tensor.device)
