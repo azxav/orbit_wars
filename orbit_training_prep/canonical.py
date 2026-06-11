@@ -97,6 +97,30 @@ def _transform_planets_sorted(planets: Any, *, player_id: int, num_players: int,
     return [p for _, p in transformed]
 
 
+def _transform_planets_in_id_order(planets: Any, ordered_planets: list[list[Any]], *, player_id: int, num_players: int, rotation: float) -> list[list[Any]]:
+    if not isinstance(planets, list):
+        planets = []
+    by_id: dict[int, list[Any]] = {}
+    for p in planets:
+        if not isinstance(p, (list, tuple)) or len(p) < 1:
+            continue
+        transformed = _transform_planet(p, player_id=player_id, num_players=num_players, rotation=rotation)
+        try:
+            by_id[int(transformed[0])] = transformed
+        except Exception:
+            continue
+    out: list[list[Any]] = []
+    for current in ordered_planets:
+        if len(current) < 1:
+            continue
+        try:
+            pid = int(current[0])
+        except Exception:
+            continue
+        out.append(list(by_id.get(pid, current)))
+    return out
+
+
 def _transform_path_point(point: Any, rotation: float) -> Any:
     if isinstance(point, (list, tuple)) and len(point) >= 2:
         out = list(point)
@@ -151,17 +175,25 @@ def _transform_fleet(fleet: Any, *, player_id: int, num_players: int, rotation: 
 
 def canonicalize_observation(obs: dict[str, Any], player_id: int | None = None) -> CanonicalObservation:
     raw = copy.deepcopy(dict(obs or {}))
+    original_planets = list(raw.get("planets", []) or [])
+    original_initial_planets = list(raw.get("initial_planets", original_planets) or [])
     original_player_id = int(raw.get("player", 0) if player_id is None else player_id)
     num_players = infer_num_players(raw, original_player_id)
     rotation = player_rotation_radians(original_player_id, num_players)
     planets, id_to_slot, slot_to_old = _transform_planets_with_mapping(
-        list(raw.get("planets", []) or []),
+        original_planets,
         player_id=original_player_id,
         num_players=num_players,
         rotation=rotation,
     )
     raw["planets"] = planets
-    raw["initial_planets"] = _transform_planets_sorted(raw.get("initial_planets", raw.get("planets", [])) or [], player_id=original_player_id, num_players=num_players, rotation=rotation)
+    raw["initial_planets"] = _transform_planets_in_id_order(
+        original_initial_planets,
+        planets,
+        player_id=original_player_id,
+        num_players=num_players,
+        rotation=rotation,
+    )
     raw["fleets"] = [_transform_fleet(f, player_id=original_player_id, num_players=num_players, rotation=rotation) for f in (raw.get("fleets", []) or [])]
     raw["comets"] = _transform_comets(raw.get("comets", []), rotation)
     raw["player"] = 0

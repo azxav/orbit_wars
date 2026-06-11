@@ -77,6 +77,103 @@ def test_runtime_masked_target_prediction_excludes_source_slot() -> None:
     assert masked_target_prediction(_obs(), 0, logits) == NOOP_TARGET_SLOT
 
 
+def test_runtime_candidate_chooser_scores_topk_launches_with_lite_heuristic(monkeypatch) -> None:
+    import torch
+
+    from orbit_bc_eval import bc_agent_runtime
+    from orbit_training_prep.schema import AMOUNT_BIN_CAPTURE, NOOP_TARGET_SLOT
+
+    obs = {
+        "player": 0,
+        "step": 10,
+        "planets": [
+            [101, 0, 0.0, 0.0, 1.0, 30.0, 1.0],
+            [202, 1, 60.0, 0.0, 1.0, 22.0, 1.0],
+            [303, -1, 10.0, 0.0, 1.0, 2.0, 5.0],
+        ],
+        "initial_planets": [
+            [101, 0, 0.0, 0.0, 1.0, 30.0, 1.0],
+            [202, 1, 60.0, 0.0, 1.0, 22.0, 1.0],
+            [303, -1, 10.0, 0.0, 1.0, 2.0, 5.0],
+        ],
+        "fleets": [],
+    }
+    target_logits = torch.full((NOOP_TARGET_SLOT + 1,), -10.0)
+    target_logits[1] = 8.0
+    target_logits[2] = 7.0
+    target_logits[NOOP_TARGET_SLOT] = 1.0
+    target_mask = torch.zeros(NOOP_TARGET_SLOT + 1, dtype=torch.bool)
+    target_mask[1] = True
+    target_mask[2] = True
+    target_mask[NOOP_TARGET_SLOT] = True
+    amount_mask_table = torch.zeros((NOOP_TARGET_SLOT + 1, 7), dtype=torch.bool)
+    amount_mask_table[1, AMOUNT_BIN_CAPTURE] = True
+    amount_mask_table[2, AMOUNT_BIN_CAPTURE] = True
+    decoded_targets: list[int] = []
+
+    def amount_logits_for_target(target: int) -> torch.Tensor:
+        out = torch.full((7,), -10.0)
+        out[AMOUNT_BIN_CAPTURE] = 10.0
+        return out
+
+    def fake_decode(obs, player_id, source_planet_id, target_logits, amount_logits, geometry, **kwargs):
+        del obs, player_id, amount_logits, geometry, kwargs
+        target = int(torch.argmax(target_logits).item())
+        decoded_targets.append(target)
+        return [source_planet_id, {1: 0.0, 2: 0.5}[target], 3 if target == 2 else 23]
+
+    monkeypatch.setattr(bc_agent_runtime, "decode_bc_prediction", fake_decode)
+
+    choice = bc_agent_runtime.choose_heuristic_bc_move(
+        obs,
+        player_id=0,
+        source_planet_id=101,
+        target_logits=target_logits,
+        amount_logits_for_target=amount_logits_for_target,
+        geometry=object(),
+        target_mask=target_mask,
+        amount_mask_table=amount_mask_table,
+        top_k=2,
+    )
+
+    assert decoded_targets == [1, 2]
+    assert choice.target == 2
+    assert choice.amount_bin == AMOUNT_BIN_CAPTURE
+    assert choice.move == [101, 0.5, 3]
+
+
+def test_runtime_candidate_chooser_keeps_strong_noop_without_amount_decode() -> None:
+    import torch
+
+    from orbit_bc_eval import bc_agent_runtime
+    from orbit_training_prep.schema import NOOP_TARGET_SLOT
+
+    calls: list[int] = []
+    target_logits = torch.full((NOOP_TARGET_SLOT + 1,), -10.0)
+    target_logits[1] = 1.0
+    target_logits[NOOP_TARGET_SLOT] = 10.0
+    target_mask = torch.zeros(NOOP_TARGET_SLOT + 1, dtype=torch.bool)
+    target_mask[1] = True
+    target_mask[NOOP_TARGET_SLOT] = True
+
+    choice = bc_agent_runtime.choose_heuristic_bc_move(
+        _obs(),
+        player_id=0,
+        source_planet_id=101,
+        target_logits=target_logits,
+        amount_logits_for_target=lambda target: calls.append(target) or torch.zeros(7),
+        geometry=object(),
+        target_mask=target_mask,
+        amount_mask_table=torch.zeros((NOOP_TARGET_SLOT + 1, 7), dtype=torch.bool),
+        noop_threshold=0.85,
+    )
+
+    assert choice.target == NOOP_TARGET_SLOT
+    assert choice.amount_bin == 0
+    assert choice.move is None
+    assert calls == []
+
+
 def test_runtime_compact_debug_counts_opening_predictions_and_skip_reasons(monkeypatch) -> None:
     import torch
 
