@@ -63,6 +63,28 @@ no exact sun/bounds/comet/body collision resolution
 
 Use Lite for fast training dataset generation. Use Exact only for small audit datasets or when you explicitly need the old simulator-derived labels.
 
+### Player-perspective canonicalization, default
+
+The dataset builder canonicalizes every player observation into a shared P0 frame by default. This is required to reduce map/seat bias for both BC and PPO.
+
+For a sample from player `p`, the builder now:
+
+```text
+rotates planet/fleet/comet coordinates by -2*pi*p/num_players around board center
+remaps owner ids so the acting player becomes owner 0
+reorders planet slots deterministically in canonical coordinates
+rotates replay launch angles into the same canonical frame
+trains labels/features from player_id=0 after the transform
+```
+
+This means P0/P1 in 2-player games and P0/P1/P2/P3 in 4-player games are presented to the model in the same coordinate convention. Live BC evaluation and PPO rollouts apply the same transform before policy inference, then rotate decoded moves back to the environment frame.
+
+Canonicalization is enabled by default. Only disable it for legacy comparisons:
+
+```bash
+--no-canonicalize-perspective
+```
+
 Parallel replay-level building is now supported with `--workers N`. Each worker builds a compact source-turn shard, then the main process merges `states/*.npy` and `samples/*.npy` while correcting `samples/state_index.npy` offsets. CUDA exact builds still fall back to serial to avoid multiple GPU contexts.
 
 ---
@@ -76,6 +98,7 @@ orbit_wars/
 │   ├── source_turn_store.py
 │   ├── training_io.py
 │   ├── lite_backend.py
+│   ├── canonical.py
 │   ├── features.py
 │   ├── split_episodes.py
 │   ├── materialize_splits.py
@@ -269,6 +292,41 @@ python -m orbit_training_prep.dataset_builder \
 This is the default high-throughput path. It uses movement-cache heuristics from `orbit_lite`, avoids exact first-hit simulation during dataset construction, and parallelizes across replay files when `--workers > 1`.
 
 For a 128 GB RAM CPU build machine, start with `--workers 16`; increase toward 20-24 only if CPU utilization and disk throughput remain healthy. Keep `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, and `TORCH_NUM_THREADS` at `1` so workers do not oversubscribe CPU threads.
+
+Legacy comparison build without canonicalization:
+
+PowerShell:
+
+```powershell
+python -m orbit_training_prep.dataset_builder `
+  --replay .\replays `
+  --out-dir .\orbit_dataset_work\combined_lite_legacy_perspective `
+  --horizon 160 `
+  --device cpu `
+  --batch-size 256 `
+  --backend lite `
+  --workers 16 `
+  --no-canonicalize-perspective
+```
+
+Ubuntu / Bash:
+
+```bash
+OMP_NUM_THREADS=1 \
+MKL_NUM_THREADS=1 \
+TORCH_NUM_THREADS=1 \
+python -m orbit_training_prep.dataset_builder \
+  --replay ./replays \
+  --out-dir ./orbit_dataset_work/combined_lite_legacy_perspective \
+  --horizon 160 \
+  --device cpu \
+  --batch-size 256 \
+  --backend lite \
+  --workers 16 \
+  --no-canonicalize-perspective
+```
+
+Use this only to compare old seat/map-biased behavior against the default canonicalized dataset.
 
 Optional: build a small exact audit dataset:
 
@@ -763,6 +821,8 @@ python -m pytest -q `
   tests/test_dataset_builder_multiple_replays.py `
   tests/test_dataset_builder_workers.py `
   tests/test_dataset_builder_batching.py `
+  tests/test_lite_dataset_backend.py `
+  tests/test_perspective_canonicalization.py `
   tests/test_split_materialize.py `
   tests/test_validate_dataset.py `
   tests/test_pair_eta_features.py `
@@ -781,6 +841,8 @@ python -m pytest -q \
   tests/test_dataset_builder_multiple_replays.py \
   tests/test_dataset_builder_workers.py \
   tests/test_dataset_builder_batching.py \
+  tests/test_lite_dataset_backend.py \
+  tests/test_perspective_canonicalization.py \
   tests/test_split_materialize.py \
   tests/test_validate_dataset.py \
   tests/test_pair_eta_features.py \
@@ -788,11 +850,29 @@ python -m pytest -q \
   tests/test_ppo_debug.py
 ```
 
-Expected focused result from this implementation:
+Expected focused result from the canonicalized Lite-parallel implementation:
 
 ```text
-67 passed
+86 passed in focused verification chunks
 ```
+
+The focused verification includes compact source-turn storage, Lite backend, real worker shard merging, BC dataset/training/eval, PPO rollout batching, and player-perspective canonicalization.
+
+### Canonicalization-specific verification
+
+PowerShell:
+
+```powershell
+python -m pytest -q tests/test_perspective_canonicalization.py
+```
+
+Ubuntu / Bash:
+
+```bash
+python -m pytest -q tests/test_perspective_canonicalization.py
+```
+
+This verifies that replay BC rows, live BC runtime, and PPO rollout observations all use the same player-perspective P0-frame transform and that decoded live moves are rotated back to the environment frame.
 
 ### Full test suite
 
@@ -853,7 +933,8 @@ actual_returned_move_count
 2. Keep one feature contract in `orbit_training_prep/features.py`.
 3. Rebuild datasets after changing feature names or dimensions.
 4. Do not add fallback support for `dense_bc_arrays.npz`.
-5. Use local gameplay evaluation before trusting checkpoint quality.
+5. Keep player-perspective canonicalization shared across dataset building, live BC runtime, and PPO rollout collection.
+6. Use local gameplay evaluation before trusting checkpoint quality.
 
 ---
 

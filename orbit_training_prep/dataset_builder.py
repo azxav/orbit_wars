@@ -23,6 +23,7 @@ from .features import (
     pair_features_from_obs,
 )
 from .geometry_bridge import make_geometry
+from .canonical import canonicalize_launches, canonicalize_observation
 from .replay_io import iter_actual_launches, iter_player_steps, load_replay
 from .schema import (
     AMOUNT_BIN_NAMES,
@@ -164,6 +165,7 @@ def _build_single_replay_shard(
     include_loser_actions: bool,
     write_debug_jsonl: bool,
     backend: str,
+    canonicalize_perspective: bool,
 ) -> dict[str, Any]:
     builder = DatasetBuilder(
         horizon=horizon,
@@ -174,6 +176,7 @@ def _build_single_replay_shard(
         workers=1,
         write_debug_jsonl=write_debug_jsonl,
         backend=backend,
+        canonicalize_perspective=canonicalize_perspective,
     )
     return builder.build_from_replay(replay_path, out_dir)
 
@@ -247,6 +250,7 @@ class DatasetBuilder:
         workers: int = 1,
         write_debug_jsonl: bool = False,
         backend: str = "exact",
+        canonicalize_perspective: bool = True,
     ):
         self.horizon = int(horizon)
         if batch_size is not None and int(batch_size) < 1:
@@ -258,6 +262,7 @@ class DatasetBuilder:
         self.max_replay_files = None if max_replay_files is None else int(max_replay_files)
         self.workers = int(workers)
         self.write_debug_jsonl = bool(write_debug_jsonl)
+        self.canonicalize_perspective = bool(canonicalize_perspective)
         backend_value = str(backend).lower().strip()
         if backend_value not in {"exact", "lite"}:
             raise ValueError("backend must be one of: exact, lite")
@@ -308,6 +313,7 @@ class DatasetBuilder:
                         include_loser_actions=self.include_loser_actions,
                         write_debug_jsonl=self.write_debug_jsonl,
                         backend=self.backend,
+                        canonicalize_perspective=self.canonicalize_perspective,
                     )
                     for i, replay_path_obj in enumerate(replay_paths)
                 ]
@@ -393,6 +399,7 @@ class DatasetBuilder:
                 "include_loser_actions": self.include_loser_actions,
                 "max_replay_files": self.max_replay_files,
                 "write_debug_jsonl": self.write_debug_jsonl,
+                "perspective_canonicalization": {"enabled": self.canonicalize_perspective, "frame": "p0", "rotation": "-2*pi*player_id/num_players"},
                 "parallel": {
                     "enabled": True,
                     "worker_count": worker_count,
@@ -471,17 +478,27 @@ class DatasetBuilder:
                     continue
                 used_replay = False
                 for sample in iter_player_steps(replay):
-                    obs = sample["obs"]
-                    player_id = int(sample["player_id"])
+                    raw_obs = sample["obs"]
+                    original_player_id = int(sample["player_id"])
+                    player_id = original_player_id
                     final_reward = float(sample["final_reward"])
                     if not self.include_loser_actions and final_reward <= 0:
                         continue
-                    action = list(iter_actual_launches(sample["action"]))
+                    raw_action = list(iter_actual_launches(sample["action"]))
+                    if self.canonicalize_perspective:
+                        transform = canonicalize_observation(raw_obs, original_player_id)
+                        obs = transform.obs
+                        action = canonicalize_launches(raw_action, transform)
+                        player_id = 0
+                    else:
+                        obs = raw_obs
+                        action = raw_action
                     owned_slots = owned_source_slots(obs, player_id)
                     if not owned_slots and not action:
                         continue
+                    stats["canonicalized_player_steps"] += int(self.canonicalize_perspective and original_player_id != 0)
                     used_replay = True
-                    obs_uid = f"{sample['episode_id']}:{sample['step_index']}:p{player_id}"
+                    obs_uid = f"{sample['episode_id']}:{sample['step_index']}:p{original_player_id}:canon{player_id}"
                     feature_state = build_feature_state(obs, player_id, P_MAX)
                     lite_ctx = None
                     pair_geometry = None
@@ -544,6 +561,7 @@ class DatasetBuilder:
                             "step_index": sample["step_index"],
                             "obs_step": sample["obs_step"],
                             "player_id": player_id,
+                            "original_player_id": original_player_id,
                             "final_reward": final_reward,
                             "winner_action": final_reward > 0,
                             "status": sample["status"],
@@ -594,6 +612,7 @@ class DatasetBuilder:
                             "step_index": sample["step_index"],
                             "obs_step": sample["obs_step"],
                             "player_id": player_id,
+                            "original_player_id": original_player_id,
                             "final_reward": final_reward,
                             "winner_action": final_reward > 0,
                             "source_slot": int(source_slot),
@@ -689,6 +708,7 @@ class DatasetBuilder:
             "include_loser_actions": self.include_loser_actions,
             "max_replay_files": self.max_replay_files,
             "write_debug_jsonl": self.write_debug_jsonl,
+            "perspective_canonicalization": {"enabled": self.canonicalize_perspective, "frame": "p0", "rotation": "-2*pi*player_id/num_players"},
             "parallel": {"enabled": False, "worker_count": 1, "shards": 1},
             "planet_feature_names": PLANET_FEATURE_NAMES,
             "global_feature_names": GLOBAL_FEATURE_NAMES,
@@ -721,6 +741,7 @@ def main() -> None:
     ap.add_argument("--workers", type=int, default=6, help="Number of replay files to process in parallel. CUDA exact builds fall back to serial to avoid multiple GPU contexts.")
     ap.add_argument("--write-debug-jsonl", action="store_true", help="Write debug JSONL files under debug/.")
     ap.add_argument("--backend", choices=("lite", "exact"), default="lite", help="Dataset build backend. lite uses orbit_lite movement-cache heuristics; exact keeps the old simulator path.")
+    ap.add_argument("--no-canonicalize-perspective", action="store_true", help="Disable player-perspective canonicalization. Not recommended for BC/PPO because it can reintroduce map/seat bias.")
     args = ap.parse_args()
     builder = DatasetBuilder(
         horizon=args.horizon,
@@ -731,6 +752,7 @@ def main() -> None:
         workers=args.workers,
         write_debug_jsonl=args.write_debug_jsonl,
         backend=args.backend,
+        canonicalize_perspective=not args.no_canonicalize_perspective,
     )
     meta = builder.build_from_replay(args.replay, args.out_dir)
     print(json.dumps({"out_dir": args.out_dir, "stats": meta["stats"], "target_inference_methods": meta["target_inference_methods"]}, indent=2, sort_keys=True))

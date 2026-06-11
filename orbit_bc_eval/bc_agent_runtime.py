@@ -12,6 +12,7 @@ import torch
 from orbit_bc_training.checkpoints import load_checkpoint
 from orbit_bc_training.decode_policy import decode_bc_prediction
 from orbit_bc_training.losses import masked_argmax
+from orbit_training_prep.canonical import canonicalize_observation, uncanonicalize_move
 from orbit_training_prep.features import _targeted_fleets, build_feature_state, pair_features_from_obs
 from orbit_training_prep.geometry_bridge import make_geometry
 from orbit_training_prep.schema import AMOUNT_BIN_NAMES, P_MAX, NOOP_TARGET_SLOT, capture_needed_ships, decode_amount_bin, owned_source_slots, safe_float
@@ -246,8 +247,12 @@ def _decode_none_reason(obs: dict[str, Any], player_id: int, source_slot: int, t
 
 def agent(obs, config):
     global LAST_DEBUG
-    obs = dict(obs or {})
-    player_id = int(obs.get("player", _config_get(config, "player", 0)) or 0)
+    raw_obs = dict(obs or {})
+    raw_player_id = int(raw_obs.get("player", _config_get(config, "player", 0)) or 0)
+    canonical_enabled = bool(_config_get(config, "canonicalize_perspective", _RUNTIME_CONFIG.get("canonicalize_perspective", True)))
+    canonical_transform = canonicalize_observation(raw_obs, raw_player_id) if canonical_enabled else None
+    obs = canonical_transform.obs if canonical_transform is not None else raw_obs
+    player_id = 0 if canonical_transform is not None else raw_player_id
     device = str(_config_get(config, "device", _RUNTIME_CONFIG.get("device", DEFAULT_DEVICE)))
     checkpoint = _checkpoint_from(config)
     horizon = int(_config_get(config, "geometry_horizon", _RUNTIME_CONFIG.get("geometry_horizon", DEFAULT_GEOMETRY_HORIZON)))
@@ -260,6 +265,8 @@ def agent(obs, config):
     debug: dict[str, Any] = {
         "step": int(obs.get("step", 0) or 0),
         "player_id": player_id,
+        "original_player_id": raw_player_id,
+        "perspective_canonicalized": canonical_transform is not None,
         "predictions": [],
         "skipped": [],
         "skip_reasons": {},
@@ -348,14 +355,16 @@ def agent(obs, config):
                 debug["skipped"].append({"source_slot": int(source_slot), "reason": reason})
                 debug["predictions"].append(pred_row)
                 continue
-            validation = validate_env_move(obs, player_id, move)
+            env_move = uncanonicalize_move(move, canonical_transform) if canonical_transform is not None else move
+            validation = validate_env_move(raw_obs, raw_player_id, env_move)
             if not validation.ok:
                 debug["skipped_invalid_decoded_actions"] += 1
                 _increment_count(debug["skip_reasons"], validation.reason)
-                debug["skipped"].append({"source_slot": int(source_slot), "reason": validation.reason, "move": move})
+                debug["skipped"].append({"source_slot": int(source_slot), "reason": validation.reason, "move": env_move})
                 debug["predictions"].append(pred_row)
                 continue
-            moves.append([int(move[0]), float(move[1]), int(move[2])])
+            moves.append([int(env_move[0]), float(env_move[1]), int(env_move[2])])
+            pred_row["decoded_move_env"] = [int(env_move[0]), float(env_move[1]), int(env_move[2])]
             debug["predictions"].append(pred_row)
     except Exception as exc:
         debug["error"] = f"{type(exc).__name__}: {exc}"

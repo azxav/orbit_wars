@@ -16,6 +16,7 @@ from orbit_bc_eval.bc_agent_runtime import (
     validate_env_move,
 )
 from orbit_bc_training.checkpoints import load_checkpoint
+from orbit_training_prep.canonical import canonicalize_observation, uncanonicalize_move
 from orbit_bc_training.losses import NEG_INF, apply_mask, masked_argmax
 from orbit_bc_training.decode_policy import decode_bc_prediction
 from orbit_training_prep.geometry_bridge import make_geometry
@@ -98,6 +99,11 @@ class PPOPolicy(nn.Module):
         geometry=None,
     ) -> PolicyTurn:
         self.eval()
+        raw_obs = obs
+        raw_player_id = int(player_id)
+        canonical_transform = canonicalize_observation(raw_obs, raw_player_id)
+        obs = canonical_transform.obs
+        player_id = 0
         geometry = geometry or make_geometry(device="cpu")
         moves: list[list[Any]] = []
         records: list[DecisionRecord] = []
@@ -170,9 +176,10 @@ class PPOPolicy(nn.Module):
             )
             decoded_moves: list[list[Any]] = []
             if move is not None:
-                validation = validate_env_move(obs, player_id, move)
+                env_move = uncanonicalize_move(move, canonical_transform)
+                validation = validate_env_move(raw_obs, raw_player_id, env_move)
                 if validation.ok:
-                    decoded_moves = [[int(move[0]), float(move[1]), int(move[2])]]
+                    decoded_moves = [[int(env_move[0]), float(env_move[1]), int(env_move[2])]]
                     moves.extend(decoded_moves)
                 else:
                     illegal += 1
