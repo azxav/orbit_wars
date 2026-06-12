@@ -9,9 +9,10 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 
-from orbit_jax_env.config import EnvConfig, MAX_PLAYERS, P_MAX
+from orbit_jax_env.config import EnvConfig, MAX_ACTIONS_PER_PLAYER, MAX_PLAYERS, P_MAX
 from orbit_jax_env.jax_policy import greedy_actions
 from orbit_jax_env.observation import build_observation
 from orbit_jax_env.reset import reset
@@ -23,6 +24,8 @@ from .actions import action_rows_from_source_choices
 from .bc_policy import bc_forward, init_value_head, load_bc_jax_params, value_apply
 from .checkpointing import save_jax_checkpoint
 from .features import NOOP_TARGET_SLOT, build_bc_features_for_seat
+from .pfsp import OPP_FROZEN_POLICY, OPP_JAX_PROXY, OPP_NONE, OPP_SIMPLE_HEURISTIC, add_snapshot_entry, build_initial_manifest, build_match_plan, load_manifest, save_manifest, update_manifest_from_slot_stats
+from .pfsp_bank import build_pfsp_bank, tree_stack, tree_take
 
 NEG = -1.0e9
 
@@ -55,6 +58,20 @@ class JaxPPOConfig:
     initial_state_bank: str | None = None
     state_bank_mode: str = "random"
     source_cap: int = 32
+    pfsp_enabled: bool = False
+    pfsp_max_policy_slots: int = 32
+    pfsp_anchor_fraction: float = 0.25
+    pfsp_snapshot_interval_updates: int = 10
+    pfsp_warmup_updates: int = 10
+    pfsp_min_games_per_entry: int = 16
+    pfsp_hard_low: float = 0.20
+    pfsp_hard_high: float = 0.55
+    pfsp_hard_bonus: float = 0.15
+    pfsp_exploration_bonus: float = 0.10
+    pfsp_matrix_games: int = 16
+    pfsp_eval_interval_updates: int = 10
+    pfsp_learner_seat_mode: str = "rotate"
+    pfsp_4p_layout: str = "one_pfsp_two_anchors"
 
 
 def _append_jsonl(path: Path, row: dict[str, Any]) -> None:
@@ -120,8 +137,8 @@ def _policy_eval(params, features, config: dict[str, Any], target_idx: jnp.ndarr
     return logprob, value, entropy
 
 
-def _learner_act(params, state, key, config: dict[str, Any], source_cap: int):
-    features = build_bc_features_for_seat(state, 0, source_cap=source_cap)
+def _policy_sample_act(params, state, seat, key, config: dict[str, Any], source_cap: int):
+    features = build_bc_features_for_seat(state, seat, source_cap=source_cap)
     target_out = bc_forward(params["bc"], _source_batch(features), config)
     target_logits = _safe_target_logits(target_out["target_logits"], features.target_mask)
     kt, ka = jax.random.split(key)
@@ -132,8 +149,21 @@ def _learner_act(params, state, key, config: dict[str, Any], source_cap: int):
     amount_logits = _safe_amount_logits(amount_out["amount_logits"], chosen_amount_mask)
     amount_idx = jax.random.categorical(ka, amount_logits, axis=-1).astype(jnp.int32)
     logprob, value, entropy = _policy_eval(params, features, config, target_idx, amount_idx)
-    rows = action_rows_from_source_choices(state, 0, features.source_slots, target_idx, amount_idx, features.source_mask)
+    rows = action_rows_from_source_choices(state, seat, features.source_slots, target_idx, amount_idx, features.source_mask)
     return rows, logprob, value, entropy, target_idx, amount_idx, features
+
+
+def _policy_greedy_act(bc_params, state, seat, config: dict[str, Any], source_cap: int):
+    features = build_bc_features_for_seat(state, seat, source_cap=source_cap)
+    target_out = bc_forward(bc_params, _source_batch(features), config)
+    target_logits = _safe_target_logits(target_out["target_logits"], features.target_mask)
+    target_idx = jnp.argmax(target_logits, axis=-1).astype(jnp.int32)
+    amount_out = bc_forward(bc_params, _source_batch(features, target_idx), config)
+    source_rows = jnp.arange(features.source_slots.shape[0])
+    chosen_amount_mask = features.amount_mask[source_rows, jnp.clip(target_idx, 0, P_MAX)]
+    amount_logits = _safe_amount_logits(amount_out["amount_logits"], chosen_amount_mask)
+    amount_idx = jnp.argmax(amount_logits, axis=-1).astype(jnp.int32)
+    return action_rows_from_source_choices(state, seat, features.source_slots, target_idx, amount_idx, features.source_mask)
 
 
 def _compute_gae(rewards, values, dones, last_values, gamma: float, lam: float):
@@ -154,10 +184,69 @@ def _compute_gae(rewards, values, dones, last_values, gamma: float, lam: float):
     return adv, adv + values
 
 
-def _value_for_state(params, state, config: dict[str, Any]):
-    features = build_bc_features_for_seat(state, 0, source_cap=1)
+def _value_for_state(params, state, seat, config: dict[str, Any], source_cap: int = 1):
+    features = build_bc_features_for_seat(state, seat, source_cap=source_cap)
     out = bc_forward(params["bc"], _source_batch(features), config)
     return value_apply(params["value"], out["global_ctx"][0])
+
+
+def _learner_terminal_fields(rewards, ranks, learner_seat):
+    return rewards[learner_seat], ranks[learner_seat]
+
+
+def _pfsp_slot_stats(traj, max_slots: int, players: int):
+    done = traj["done"] > 0.5
+    reward = traj["reward"]
+    rank = traj["rank"].astype(jnp.float32)
+    if int(players) == 2:
+        result = (rank == 0.0).astype(jnp.float32)
+    else:
+        result = (float(players - 1) - rank) / float(max(players - 1, 1))
+    frozen = traj["opponent_kind"] == OPP_FROZEN_POLICY
+    simple = traj["opponent_kind"] == OPP_SIMPLE_HEURISTIC
+    proxy = traj["opponent_kind"] == OPP_JAX_PROXY
+    slot = jnp.clip(traj["opponent_slot"], 0, int(max_slots) - 1)
+    terminal_frozen = done[:, :, None] & frozen
+    terminal_simple = done[:, :, None] & simple
+    terminal_proxy = done[:, :, None] & proxy
+    slot_axis = jnp.arange(int(max_slots), dtype=jnp.int32)
+    by_slot = terminal_frozen[:, :, :, None] & (slot[:, :, :, None] == slot_axis)
+    simple_count = jnp.sum(terminal_simple.astype(jnp.float32))
+    proxy_count = jnp.sum(terminal_proxy.astype(jnp.float32))
+    return {
+        "slot_games": jnp.sum(by_slot.astype(jnp.float32), axis=(0, 1, 2)),
+        "slot_score_sum": jnp.sum(by_slot.astype(jnp.float32) * result[:, :, None, None], axis=(0, 1, 2)),
+        "slot_reward_sum": jnp.sum(by_slot.astype(jnp.float32) * reward[:, :, None, None], axis=(0, 1, 2)),
+        "slot_rank_sum": jnp.sum(by_slot.astype(jnp.float32) * rank[:, :, None, None], axis=(0, 1, 2)),
+        "kind_games": jnp.asarray([0.0, simple_count, proxy_count, 0.0], dtype=jnp.float32),
+        "kind_score_sum": jnp.asarray(
+            [
+                0.0,
+                jnp.sum(terminal_simple.astype(jnp.float32) * result[:, :, None]),
+                jnp.sum(terminal_proxy.astype(jnp.float32) * result[:, :, None]),
+                0.0,
+            ],
+            dtype=jnp.float32,
+        ),
+        "kind_reward_sum": jnp.asarray(
+            [
+                0.0,
+                jnp.sum(terminal_simple.astype(jnp.float32) * reward[:, :, None]),
+                jnp.sum(terminal_proxy.astype(jnp.float32) * reward[:, :, None]),
+                0.0,
+            ],
+            dtype=jnp.float32,
+        ),
+        "kind_rank_sum": jnp.asarray(
+            [
+                0.0,
+                jnp.sum(terminal_simple.astype(jnp.float32) * rank[:, :, None]),
+                jnp.sum(terminal_proxy.astype(jnp.float32) * rank[:, :, None]),
+                0.0,
+            ],
+            dtype=jnp.float32,
+        ),
+    }
 
 
 def _where_state(mask: jnp.ndarray, replacement: EnvState, original: EnvState) -> EnvState:
@@ -194,22 +283,38 @@ def _make_update(config: JaxPPOConfig, bc_config: dict[str, Any], state_bank: En
             next_cycle_index = cycle_index + jnp.sum(done_int)
         return _where_state(done_mask, reset_states, next_states), next_cycle_index
 
-    def rollout(params, key, states, cycle_index):
+    def rollout(params, key, states, cycle_index, frozen_bc_params, learner_seat_plan, opponent_kind_plan, opponent_slot_plan):
         def scan_body(carry, step_key):
             carry_states, carry_cycle_index = carry
             action_key, reset_key = jax.random.split(step_key)
             action_keys = jax.random.split(action_key, int(config.envs))
             reset_keys = jax.random.split(reset_key, int(config.envs))
 
-            def one_env(state, k):
-                rows0, lp, val, ent, ti, ai, feats = _learner_act(params, state, k, bc_config, int(config.source_cap))
+            def one_env(state, k, learner_seat, opponent_kind, opponent_slot):
+                rows0, lp, val, ent, ti, ai, feats = _policy_sample_act(params, state, learner_seat, k, bc_config, int(config.source_cap))
                 obs = build_observation(state)
-                if config.opponent == "jax_proxy":
-                    proxy = greedy_actions(obs["planets"], state.num_players)
-                else:
-                    proxy = simple_heuristic_actions(state)
-                actions = proxy.at[0].set(rows0)
+                simple_rows = simple_heuristic_actions(state)
+                proxy_rows = greedy_actions(obs["planets"], state.num_players)
+
+                def rows_for_seat(seat):
+                    kind = opponent_kind[seat]
+                    slot = opponent_slot[seat]
+                    frozen_bc_params_slot = tree_take(frozen_bc_params, jnp.maximum(slot, 0))
+                    frozen_rows = _policy_greedy_act(frozen_bc_params_slot, state, seat, bc_config, int(config.source_cap))
+                    opponent_rows = jax.lax.switch(
+                        kind,
+                        [
+                            lambda: jnp.zeros((MAX_ACTIONS_PER_PLAYER, 3), dtype=jnp.float32),
+                            lambda: simple_rows[seat],
+                            lambda: proxy_rows[seat],
+                            lambda: frozen_rows,
+                        ],
+                    )
+                    return jnp.where(seat == learner_seat, rows0, opponent_rows)
+
+                actions = jax.vmap(rows_for_seat)(jnp.arange(MAX_PLAYERS, dtype=jnp.int32))
                 next_state, _next_obs, rewards, done, info = step(state, actions)
+                learner_reward, learner_rank = _learner_terminal_fields(rewards, info["ranks"], learner_seat)
                 store = {
                     "planet_features": feats.planet_features,
                     "global_features": feats.global_features,
@@ -226,7 +331,8 @@ def _make_update(config: JaxPPOConfig, bc_config: dict[str, Any], state_bank: En
                     "old_logprob": lp,
                     "value": val,
                     "entropy": ent,
-                    "reward": rewards[0],
+                    "learner_seat": learner_seat,
+                    "reward": learner_reward,
                     "done": done.astype(jnp.float32),
                     "submitted_action_count": info["submitted_action_count"].astype(jnp.float32),
                     "valid_action_count": info["valid_action_count"].astype(jnp.float32),
@@ -238,11 +344,13 @@ def _make_update(config: JaxPPOConfig, bc_config: dict[str, Any], state_bank: En
                     "invalid_unaffordable_source_total_count": info["invalid_unaffordable_source_total_count"].astype(jnp.float32),
                     "invalid_no_free_fleet_slot_count": info["invalid_no_free_fleet_slot_count"].astype(jnp.float32),
                     "episode_step": next_state.step.astype(jnp.float32),
-                    "rank": info["ranks"][0],
+                    "rank": learner_rank,
+                    "opponent_kind": opponent_kind,
+                    "opponent_slot": opponent_slot,
                 }
                 return next_state, store
 
-            stepped_states, stores = jax.vmap(one_env)(carry_states, action_keys)
+            stepped_states, stores = jax.vmap(one_env)(carry_states, action_keys, learner_seat_plan, opponent_kind_plan, opponent_slot_plan)
             done_mask = stores["done"].astype(jnp.bool_)
             next_carry_states, next_cycle_index = reset_many(reset_keys, done_mask, stepped_states, carry_cycle_index)
             return (next_carry_states, next_cycle_index), stores
@@ -319,9 +427,10 @@ def _make_update(config: JaxPPOConfig, bc_config: dict[str, Any], state_bank: En
         }
         return loss, metrics
 
-    def update(params, opt_state, key, states, cycle_index, update_index):
-        traj, next_states, next_cycle_index = rollout(params, key, states, cycle_index)
-        last_values = jax.vmap(lambda s: _value_for_state(params, s, bc_config))(next_states)
+    def update(params, opt_state, key, states, cycle_index, update_index, frozen_bc_params, learner_seat_plan, opponent_kind_plan, opponent_slot_plan):
+        traj, next_states, next_cycle_index = rollout(params, key, states, cycle_index, frozen_bc_params, learner_seat_plan, opponent_kind_plan, opponent_slot_plan)
+        learner_seats = learner_seat_plan
+        last_values = jax.vmap(lambda s, seat: _value_for_state(params, s, seat, bc_config))(next_states, learner_seats)
 
         def wrapped_loss(p):
             return loss_fn(p, traj, last_values)
@@ -336,10 +445,23 @@ def _make_update(config: JaxPPOConfig, bc_config: dict[str, Any], state_bank: En
         updates, opt_state2 = optimizer.update(grads, opt_state, params)
         params2 = optax.apply_updates(params, updates)
         metrics = {**metrics, "loss": loss}
-        return params2, opt_state2, next_states, next_cycle_index, metrics
+        league_stats = _pfsp_slot_stats(traj, int(config.pfsp_max_policy_slots), int(config.players))
+        return params2, opt_state2, next_states, next_cycle_index, metrics, league_stats
 
     optimizer = optax.chain(optax.clip_by_global_norm(float(config.max_grad_norm)), optax.adam(float(config.lr)))
     return jax.jit(update), optimizer
+
+
+def _default_match_plan_arrays(config: JaxPPOConfig):
+    learner_seat = jnp.zeros((int(config.envs),), dtype=jnp.int32)
+    opponent_kind = jnp.zeros((int(config.envs), MAX_PLAYERS), dtype=jnp.int32)
+    opponent_slot = -jnp.ones((int(config.envs), MAX_PLAYERS), dtype=jnp.int32)
+    kind = OPP_JAX_PROXY if config.opponent == "jax_proxy" else OPP_SIMPLE_HEURISTIC
+    active_seats = jnp.arange(MAX_PLAYERS, dtype=jnp.int32)[None, :] < int(config.players)
+    non_learner = jnp.arange(MAX_PLAYERS, dtype=jnp.int32)[None, :] != 0
+    opponent_kind = jnp.where(active_seats & non_learner, kind, opponent_kind)
+    opponent_kind = opponent_kind.at[:, 0].set(OPP_NONE)
+    return learner_seat, opponent_kind, opponent_slot
 
 
 def _initial_vector_states(config: JaxPPOConfig, key, env_config: EnvConfig, state_bank: EnvState | None):
@@ -358,8 +480,12 @@ def _initial_vector_states(config: JaxPPOConfig, key, env_config: EnvConfig, sta
 
 def train(config: JaxPPOConfig) -> dict[str, Any]:
     runtime = _check_runtime(config.require_cuda)
-    if config.opponent not in {"simple_heuristic_jax", "jax_proxy"}:
-        raise RuntimeError("orbit_ppo_jax.train supports --opponent simple_heuristic_jax or jax_proxy")
+    if config.opponent not in {"simple_heuristic_jax", "jax_proxy", "pfsp_jax"}:
+        raise RuntimeError("orbit_ppo_jax.train supports --opponent simple_heuristic_jax, jax_proxy, or pfsp_jax")
+    if config.opponent == "pfsp_jax" and not config.pfsp_enabled:
+        raise RuntimeError("--opponent pfsp_jax requires --pfsp_enabled")
+    if config.pfsp_learner_seat_mode not in {"fixed0", "rotate", "random"}:
+        raise RuntimeError("--pfsp_learner_seat_mode must be fixed0, rotate, or random")
     if config.state_bank_mode not in {"cycle", "random"}:
         raise RuntimeError("--state_bank_mode must be either cycle or random")
     if int(config.source_cap) < 1 or int(config.source_cap) > P_MAX:
@@ -410,6 +536,22 @@ def train(config: JaxPPOConfig) -> dict[str, Any]:
         json.dump(saved_config, f, indent=2, sort_keys=True)
 
     bc_params, bc_config = load_bc_jax_params(config.bc_checkpoint)
+    league_manifest = None
+    if config.pfsp_enabled:
+        league_dir = out_dir / "league"
+        manifest_path = league_dir / "manifest.json"
+        if manifest_path.exists():
+            league_manifest = load_manifest(manifest_path)
+        else:
+            league_manifest = build_initial_manifest(
+                players=int(config.players),
+                max_policy_slots=int(config.pfsp_max_policy_slots),
+                bc_checkpoint=config.bc_checkpoint,
+            )
+            save_manifest(manifest_path, league_manifest)
+        frozen_bank = build_pfsp_bank(league_manifest, bc_params, bc_config)
+    else:
+        frozen_bank = None
     key = jax.random.PRNGKey(int(config.seed))
     key, value_key = jax.random.split(key)
     params = {"bc": bc_params, "value": init_value_head(value_key, int(bc_config["hidden_size"]))}
@@ -423,24 +565,62 @@ def train(config: JaxPPOConfig) -> dict[str, Any]:
     key, reset_key = jax.random.split(key)
     states, state_bank_cycle_index = _initial_vector_states(config, reset_key, env_config, state_bank)
     best_score = -1.0e9
+    best_entry_id: str | None = None
     last_metrics: dict[str, Any] = {}
 
     for update_index in range(1, int(config.updates) + 1):
         key, step_key = jax.random.split(key)
         t0 = time.time()
-        params, opt_state, states, state_bank_cycle_index, metrics_jax = update_fn(
+        params, opt_state, states, state_bank_cycle_index, metrics_jax, league_stats_jax = update_fn(
             params,
             opt_state,
             step_key,
             states,
             state_bank_cycle_index,
             jnp.asarray(update_index, dtype=jnp.int32),
+            frozen_bank.bc_params if frozen_bank is not None else tree_stack([bc_params]),
+            *(
+                (
+                    lambda plan: (plan.learner_seat, plan.opponent_kind, plan.opponent_slot)
+                )(
+                    build_match_plan(
+                        league_manifest,
+                        rng=np.random.default_rng(int(config.seed) + update_index),
+                        envs=int(config.envs),
+                        players=int(config.players),
+                        learner_seat_mode=str(config.pfsp_learner_seat_mode),
+                        anchor_fraction=float(config.pfsp_anchor_fraction),
+                        layout=str(config.pfsp_4p_layout),
+                        min_games_per_entry=int(config.pfsp_min_games_per_entry),
+                        hard_low=float(config.pfsp_hard_low),
+                        hard_high=float(config.pfsp_hard_high),
+                        hard_bonus=float(config.pfsp_hard_bonus),
+                        exploration_bonus=float(config.pfsp_exploration_bonus),
+                    )
+                )
+                if config.pfsp_enabled and league_manifest is not None
+                else _default_match_plan_arrays(config)
+            ),
         )
         jax.block_until_ready(params)
         seconds = time.time() - t0
         update_env_steps = int(config.envs) * int(config.rollout_steps)
         env_steps = update_index * update_env_steps
         metrics = {k: float(v) for k, v in metrics_jax.items()}
+        if config.pfsp_enabled and league_manifest is not None:
+            league_manifest = update_manifest_from_slot_stats(
+                league_manifest,
+                slot_games=[int(x) for x in np.asarray(league_stats_jax["slot_games"])],
+                slot_score_sum=[float(x) for x in np.asarray(league_stats_jax["slot_score_sum"])],
+                slot_reward_sum=[float(x) for x in np.asarray(league_stats_jax["slot_reward_sum"])],
+                slot_rank_sum=[float(x) for x in np.asarray(league_stats_jax["slot_rank_sum"])],
+                kind_games={idx: int(x) for idx, x in enumerate(np.asarray(league_stats_jax["kind_games"]))},
+                kind_score_sum={idx: float(x) for idx, x in enumerate(np.asarray(league_stats_jax["kind_score_sum"]))},
+                kind_reward_sum={idx: float(x) for idx, x in enumerate(np.asarray(league_stats_jax["kind_reward_sum"]))},
+                kind_rank_sum={idx: float(x) for idx, x in enumerate(np.asarray(league_stats_jax["kind_rank_sum"]))},
+                update_index=update_index,
+            )
+            save_manifest(out_dir / "league" / "manifest.json", league_manifest)
         metrics.update(
             {
                 "update": update_index,
@@ -464,8 +644,48 @@ def train(config: JaxPPOConfig) -> dict[str, Any]:
         save_jax_checkpoint(out_dir / "latest", params, checkpoint_config, metrics)
         if update_index == 1 or update_index % int(config.save_interval_updates) == 0:
             save_jax_checkpoint(out_dir / "checkpoints" / f"update_{update_index:05d}", params, checkpoint_config, metrics)
+        if config.pfsp_enabled and league_manifest is not None:
+            should_add = (
+                update_index >= int(config.pfsp_warmup_updates)
+                and update_index % int(config.pfsp_snapshot_interval_updates) == 0
+                and float(metrics["invalid_action_rate"]) <= 0.001
+                and float(metrics["done_rate"]) > 0.0
+            )
+            if should_add:
+                entry_id = f"update_{update_index:05d}"
+                snapshot_dir = out_dir / "league" / "snapshots" / entry_id
+                save_jax_checkpoint(snapshot_dir, params, checkpoint_config, metrics)
+                league_manifest = add_snapshot_entry(
+                    league_manifest,
+                    entry_id=entry_id,
+                    path=str(snapshot_dir),
+                    update_index=update_index,
+                    protected_entry_ids={best_entry_id} if best_entry_id is not None else set(),
+                )
+                save_manifest(out_dir / "league" / "manifest.json", league_manifest)
+                frozen_bank = build_pfsp_bank(league_manifest, bc_params, bc_config)
 
         score = float(metrics["mean_reward"])
+        if (
+            config.pfsp_enabled
+            and league_manifest is not None
+            and frozen_bank is not None
+            and int(config.pfsp_matrix_games) > 0
+            and (update_index == 1 or update_index % int(config.pfsp_eval_interval_updates) == 0)
+        ):
+            from .pfsp_eval import evaluate_matrix
+
+            matrix_summary = evaluate_matrix(
+                params=params,
+                bc_config=bc_config,
+                bank=frozen_bank,
+                manifest=league_manifest,
+                config=config,
+                key=key,
+                out_dir=out_dir,
+            )
+            score = float(matrix_summary.get("matrix_score", score))
+            metrics.update({f"pfsp_matrix_{k}": v for k, v in matrix_summary.items() if isinstance(v, (int, float))})
         if int(config.eval_games) > 0 and (update_index == 1 or update_index % int(config.eval_interval_updates) == 0):
             from .eval_vs_heuristic import evaluate
 
@@ -483,6 +703,8 @@ def train(config: JaxPPOConfig) -> dict[str, Any]:
             metrics.update({f"eval_{k}": v for k, v in eval_summary.items() if isinstance(v, (int, float))})
         if score > best_score:
             best_score = score
+            if config.pfsp_enabled:
+                best_entry_id = f"update_{update_index:05d}"
             save_jax_checkpoint(out_dir / "best", params, checkpoint_config, metrics)
         if metrics.get("invalid_action_count", 0.0) > float(config.envs * config.rollout_steps * P_MAX):
             break
@@ -501,7 +723,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--rollout_steps", type=int, default=None)
     ap.add_argument("--episode_steps", type=int, default=500)
     ap.add_argument("--updates", type=int, default=1)
-    ap.add_argument("--opponent", default="simple_heuristic_jax", choices=["simple_heuristic_jax", "jax_proxy"])
+    ap.add_argument("--opponent", default="simple_heuristic_jax", choices=["simple_heuristic_jax", "jax_proxy", "pfsp_jax"])
     ap.add_argument("--eval_heuristic_path", default="orbit_wars_base.py")
     ap.add_argument("--eval_games", type=int, default=2)
     ap.add_argument("--eval_interval_updates", type=int, default=5)
@@ -520,6 +742,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--initial_state_bank", default=None)
     ap.add_argument("--state_bank_mode", default="random", choices=["cycle", "random"])
     ap.add_argument("--source_cap", type=int, default=32)
+    ap.add_argument("--pfsp_enabled", action="store_true")
+    ap.add_argument("--pfsp_max_policy_slots", type=int, default=32)
+    ap.add_argument("--pfsp_anchor_fraction", type=float, default=0.25)
+    ap.add_argument("--pfsp_snapshot_interval_updates", type=int, default=10)
+    ap.add_argument("--pfsp_warmup_updates", type=int, default=10)
+    ap.add_argument("--pfsp_min_games_per_entry", type=int, default=16)
+    ap.add_argument("--pfsp_hard_low", type=float, default=0.20)
+    ap.add_argument("--pfsp_hard_high", type=float, default=0.55)
+    ap.add_argument("--pfsp_hard_bonus", type=float, default=0.15)
+    ap.add_argument("--pfsp_exploration_bonus", type=float, default=0.10)
+    ap.add_argument("--pfsp_matrix_games", type=int, default=16)
+    ap.add_argument("--pfsp_eval_interval_updates", type=int, default=10)
+    ap.add_argument("--pfsp_learner_seat_mode", default="rotate", choices=["fixed0", "rotate", "random"])
+    ap.add_argument("--pfsp_4p_layout", default="one_pfsp_two_anchors", choices=["one_pfsp_two_anchors"])
     return ap
 
 

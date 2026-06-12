@@ -44,7 +44,8 @@ def _owner_totals(owner, alive, ships, prod):
     return players, owner_ships, owner_prod, owner_planets
 
 
-def planet_features_from_state(state, player_id: int) -> jnp.ndarray:
+def planet_features_from_state(state, player_id: int | jnp.ndarray) -> jnp.ndarray:
+    seat = jnp.asarray(player_id, dtype=jnp.int32)
     owner = state.planet_owner
     alive = state.planet_alive
     ships = jnp.maximum(0.0, state.planet_ships)
@@ -58,7 +59,7 @@ def planet_features_from_state(state, player_id: int) -> jnp.ndarray:
     owner_idx = jnp.clip(owner, 0, 7)
     owner_ship_total = jnp.where(owner >= 0, owner_ships[owner_idx], 0.0)
     owner_prod_total = jnp.where(owner >= 0, owner_prod[owner_idx], 0.0)
-    mine = owner == int(player_id)
+    mine = owner == seat
     neutral = owner < 0
     enemy = (~mine) & (~neutral)
     init_dx = state.planet_initial_x - CENTER
@@ -90,22 +91,23 @@ def planet_features_from_state(state, player_id: int) -> jnp.ndarray:
     return jnp.nan_to_num(jnp.where(alive[:, None], cols, 0.0))
 
 
-def global_features_from_state(state, player_id: int) -> jnp.ndarray:
+def global_features_from_state(state, player_id: int | jnp.ndarray) -> jnp.ndarray:
+    seat = jnp.asarray(player_id, dtype=jnp.int32)
     owner = state.planet_owner
     alive = state.planet_alive
     ships = jnp.maximum(0.0, state.planet_ships)
     prod = jnp.maximum(0.0, state.planet_production)
     _players, owner_ships, owner_prod, owner_planets = _owner_totals(owner, alive, ships, prod)
     present = (owner_ships + owner_prod) > 0
-    my_ships = owner_ships[int(player_id)]
-    my_prod = owner_prod[int(player_id)]
-    my_planets = owner_planets[int(player_id)]
+    my_ships = owner_ships[seat]
+    my_prod = owner_prod[seat]
+    my_planets = owner_planets[seat]
     total_ships = jnp.sum(owner_ships)
     total_prod = jnp.sum(owner_prod)
     total_planets = jnp.sum(owner_planets)
     leader_ships = jnp.max(jnp.where(present, owner_ships, -jnp.inf))
     leader_prod = jnp.max(jnp.where(present, owner_prod, -jnp.inf))
-    enemy_present = present.at[int(player_id)].set(False)
+    enemy_present = present.at[seat].set(False)
     weakest_enemy = jnp.min(jnp.where(enemy_present, owner_ships, jnp.inf))
     leader_ships = jnp.where(jnp.isfinite(leader_ships), leader_ships, 0.0)
     leader_prod = jnp.where(jnp.isfinite(leader_prod), leader_prod, 0.0)
@@ -130,15 +132,16 @@ def global_features_from_state(state, player_id: int) -> jnp.ndarray:
     )
 
 
-def target_state_features_from_state(state, player_id: int) -> jnp.ndarray:
+def target_state_features_from_state(state, player_id: int | jnp.ndarray) -> jnp.ndarray:
+    seat = jnp.asarray(player_id, dtype=jnp.int32)
     owner = state.planet_owner
     alive = state.planet_alive
     x = state.planet_x
     y = state.planet_y
     ships = jnp.maximum(0.0, state.planet_ships)
     prod = jnp.maximum(0.0, state.planet_production)
-    mine = alive & (owner == int(player_id))
-    enemy = alive & (owner >= 0) & (owner != int(player_id))
+    mine = alive & (owner == seat)
+    enemy = alive & (owner >= 0) & (owner != seat)
     dx = x[:, None] - x[None, :]
     dy = y[:, None] - y[None, :]
     dist = jnp.hypot(dx, dy) / 10.0
@@ -146,7 +149,7 @@ def target_state_features_from_state(state, player_id: int) -> jnp.ndarray:
     nearest_enemy = jnp.min(jnp.where(enemy[None, :], dist, jnp.inf), axis=1)
     nearest_own = jnp.where(jnp.isfinite(nearest_own), jnp.minimum(1.0, nearest_own / 50.0), 0.0)
     nearest_enemy = jnp.where(jnp.isfinite(nearest_enemy), jnp.minimum(1.0, nearest_enemy / 50.0), 0.0)
-    rel_owner = jnp.where(owner < 0, 0, jnp.where(owner == int(player_id), 1, -1))
+    rel_owner = jnp.where(owner < 0, 0, jnp.where(owner == seat, 1, -1))
     projected_owner = jnp.where(ships > 0, rel_owner, -rel_owner).astype(jnp.float32)
     out = jnp.stack(
         [
@@ -165,10 +168,11 @@ def target_state_features_from_state(state, player_id: int) -> jnp.ndarray:
     return jnp.nan_to_num(jnp.where(alive[:, None], out, 0.0))
 
 
-def build_masks(state, player_id: int) -> tuple[jnp.ndarray, jnp.ndarray]:
+def build_masks(state, player_id: int | jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+    seat = jnp.asarray(player_id, dtype=jnp.int32)
     source_axis = jnp.arange(P_MAX)
     target_axis = jnp.arange(P_MAX)
-    source_alive = state.planet_alive & (state.planet_owner == int(player_id)) & (state.planet_ships >= 1.0)
+    source_alive = state.planet_alive & (state.planet_owner == seat) & (state.planet_ships >= 1.0)
     target_alive = state.planet_alive
     target = jnp.broadcast_to(target_alive[None, :], (P_MAX, P_MAX)) & (source_axis[:, None] != target_axis[None, :])
     target = target & source_alive[:, None]
@@ -228,11 +232,12 @@ def pair_features_for_source(planet_features: jnp.ndarray, target_state_features
     return jnp.nan_to_num(jnp.concatenate([rows, noop], axis=0))
 
 
-def _full_features_and_masks(state, player_id: int) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    pf = planet_features_from_state(state, int(player_id))
-    gf = global_features_from_state(state, int(player_id))
-    tsf = target_state_features_from_state(state, int(player_id))
-    target_mask, amount_mask = build_masks(state, int(player_id))
+def _full_features_and_masks(state, player_id: int | jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    seat = jnp.asarray(player_id, dtype=jnp.int32)
+    pf = planet_features_from_state(state, seat)
+    gf = global_features_from_state(state, seat)
+    tsf = target_state_features_from_state(state, seat)
+    target_mask, amount_mask = build_masks(state, seat)
     return pf, gf, tsf, target_mask, amount_mask
 
 
@@ -248,8 +253,9 @@ def _select_source_slots(state, active_source: jnp.ndarray, source_cap: int) -> 
     return source_slots, source_mask, active_count, selected_count
 
 
-def build_bc_features_for_seat(state, player_id: int, source_cap: int | None = None) -> JaxBCFeatures:
-    pf, gf, tsf, target_mask, amount_mask = _full_features_and_masks(state, int(player_id))
+def build_bc_features_for_seat(state, player_id: int | jnp.ndarray, source_cap: int | None = None) -> JaxBCFeatures:
+    seat = jnp.asarray(player_id, dtype=jnp.int32)
+    pf, gf, tsf, target_mask, amount_mask = _full_features_and_masks(state, seat)
     if source_cap is None:
         source_slots = jnp.arange(P_MAX, dtype=jnp.int32)
         source_mask = target_mask[:, NOOP_TARGET_SLOT]
