@@ -19,7 +19,7 @@ from orbit_jax_env.simple_heuristic_jax import simple_heuristic_actions
 from orbit_jax_env.step import step
 from orbit_jax_env.state import EnvState
 
-from .actions import action_rows_from_choices
+from .actions import action_rows_from_source_choices
 from .bc_policy import bc_forward, init_value_head, load_bc_jax_params, value_apply
 from .checkpointing import save_jax_checkpoint
 from .features import NOOP_TARGET_SLOT, build_bc_features_for_seat
@@ -54,6 +54,7 @@ class JaxPPOConfig:
     enable_comets: bool = False
     initial_state_bank: str | None = None
     state_bank_mode: str = "random"
+    source_cap: int = 32
 
 
 def _append_jsonl(path: Path, row: dict[str, Any]) -> None:
@@ -85,13 +86,13 @@ def _safe_amount_logits(logits: jnp.ndarray, mask: jnp.ndarray) -> jnp.ndarray:
 
 
 def _source_batch(features, target_label: jnp.ndarray | None = None) -> dict[str, jnp.ndarray]:
-    p = features.planet_features.shape[0]
+    p = features.source_slots.shape[0]
     batch = {
         "planet_features": jnp.broadcast_to(features.planet_features[None, :, :], (p, *features.planet_features.shape)),
         "global_features": jnp.broadcast_to(features.global_features[None, :], (p, features.global_features.shape[0])),
         "target_state_features": jnp.broadcast_to(features.target_state_features[None, :, :], (p, *features.target_state_features.shape)),
         "pair_features": features.pair_features,
-        "source_slot": jnp.arange(p, dtype=jnp.int32),
+        "source_slot": features.source_slots.astype(jnp.int32),
     }
     if target_label is not None:
         batch["target_label"] = target_label.astype(jnp.int32)
@@ -101,13 +102,14 @@ def _source_batch(features, target_label: jnp.ndarray | None = None) -> dict[str
 def _policy_eval(params, features, config: dict[str, Any], target_idx: jnp.ndarray, amount_idx: jnp.ndarray):
     out = bc_forward(params["bc"], _source_batch(features, target_idx), config)
     target_logits = _safe_target_logits(out["target_logits"], features.target_mask)
-    chosen_amount_mask = features.amount_mask[jnp.arange(P_MAX), jnp.clip(target_idx, 0, P_MAX)]
+    source_rows = jnp.arange(features.source_slots.shape[0])
+    chosen_amount_mask = features.amount_mask[source_rows, jnp.clip(target_idx, 0, P_MAX)]
     amount_logits = _safe_amount_logits(out["amount_logits"], chosen_amount_mask)
     target_lp_all = jax.nn.log_softmax(target_logits)
     amount_lp_all = jax.nn.log_softmax(amount_logits)
-    source_active = features.target_mask[:, NOOP_TARGET_SLOT]
-    target_lp = target_lp_all[jnp.arange(P_MAX), target_idx]
-    amount_lp = amount_lp_all[jnp.arange(P_MAX), amount_idx]
+    source_active = features.source_mask
+    target_lp = target_lp_all[source_rows, target_idx]
+    amount_lp = amount_lp_all[source_rows, amount_idx]
     logprob = jnp.sum(jnp.where(source_active, target_lp + jnp.where(target_idx == NOOP_TARGET_SLOT, 0.0, amount_lp), 0.0))
     target_prob = jax.nn.softmax(target_logits)
     amount_prob = jax.nn.softmax(amount_logits)
@@ -118,18 +120,19 @@ def _policy_eval(params, features, config: dict[str, Any], target_idx: jnp.ndarr
     return logprob, value, entropy
 
 
-def _learner_act(params, state, key, config: dict[str, Any]):
-    features = build_bc_features_for_seat(state, 0)
+def _learner_act(params, state, key, config: dict[str, Any], source_cap: int):
+    features = build_bc_features_for_seat(state, 0, source_cap=source_cap)
     target_out = bc_forward(params["bc"], _source_batch(features), config)
     target_logits = _safe_target_logits(target_out["target_logits"], features.target_mask)
     kt, ka = jax.random.split(key)
     target_idx = jax.random.categorical(kt, target_logits, axis=-1).astype(jnp.int32)
     amount_out = bc_forward(params["bc"], _source_batch(features, target_idx), config)
-    chosen_amount_mask = features.amount_mask[jnp.arange(P_MAX), jnp.clip(target_idx, 0, P_MAX)]
+    source_rows = jnp.arange(features.source_slots.shape[0])
+    chosen_amount_mask = features.amount_mask[source_rows, jnp.clip(target_idx, 0, P_MAX)]
     amount_logits = _safe_amount_logits(amount_out["amount_logits"], chosen_amount_mask)
     amount_idx = jax.random.categorical(ka, amount_logits, axis=-1).astype(jnp.int32)
     logprob, value, entropy = _policy_eval(params, features, config, target_idx, amount_idx)
-    rows = action_rows_from_choices(state, 0, target_idx, amount_idx)
+    rows = action_rows_from_source_choices(state, 0, features.source_slots, target_idx, amount_idx, features.source_mask)
     return rows, logprob, value, entropy, target_idx, amount_idx, features
 
 
@@ -152,7 +155,7 @@ def _compute_gae(rewards, values, dones, last_values, gamma: float, lam: float):
 
 
 def _value_for_state(params, state, config: dict[str, Any]):
-    features = build_bc_features_for_seat(state, 0)
+    features = build_bc_features_for_seat(state, 0, source_cap=1)
     out = bc_forward(params["bc"], _source_batch(features), config)
     return value_apply(params["value"], out["global_ctx"][0])
 
@@ -199,7 +202,7 @@ def _make_update(config: JaxPPOConfig, bc_config: dict[str, Any], state_bank: En
             reset_keys = jax.random.split(reset_key, int(config.envs))
 
             def one_env(state, k):
-                rows0, lp, val, ent, ti, ai, feats = _learner_act(params, state, k, bc_config)
+                rows0, lp, val, ent, ti, ai, feats = _learner_act(params, state, k, bc_config, int(config.source_cap))
                 obs = build_observation(state)
                 if config.opponent == "jax_proxy":
                     proxy = greedy_actions(obs["planets"], state.num_players)
@@ -207,7 +210,6 @@ def _make_update(config: JaxPPOConfig, bc_config: dict[str, Any], state_bank: En
                     proxy = simple_heuristic_actions(state)
                 actions = proxy.at[0].set(rows0)
                 next_state, _next_obs, rewards, done, info = step(state, actions)
-                source_active = feats.target_mask[:, NOOP_TARGET_SLOT]
                 store = {
                     "planet_features": feats.planet_features,
                     "global_features": feats.global_features,
@@ -215,6 +217,10 @@ def _make_update(config: JaxPPOConfig, bc_config: dict[str, Any], state_bank: En
                     "pair_features": feats.pair_features,
                     "target_mask": feats.target_mask,
                     "amount_mask": feats.amount_mask,
+                    "source_slots": feats.source_slots,
+                    "source_mask": feats.source_mask,
+                    "active_source_count": feats.active_source_count,
+                    "selected_source_count": feats.selected_source_count,
                     "target_idx": ti,
                     "amount_idx": ai,
                     "old_logprob": lp,
@@ -255,10 +261,10 @@ def _make_update(config: JaxPPOConfig, bc_config: dict[str, Any], state_bank: En
         adv, returns = _compute_gae(rewards, values, dones, last_values, float(config.gamma), float(config.lam))
         adv = (adv - jnp.mean(adv)) / (jnp.std(adv) + 1.0e-8)
 
-        def one_eval(pf, gf, tsf, pair, tm, am, ti, ai):
+        def one_eval(pf, gf, tsf, pair, tm, am, slots, sm, active_count, selected_count, ti, ai):
             from .features import JaxBCFeatures
 
-            feats = JaxBCFeatures(pf, gf, tsf, pair, tm, am)
+            feats = JaxBCFeatures(pf, gf, tsf, pair, tm, am, slots, sm, active_count, selected_count)
             return _policy_eval(params, feats, bc_config, ti, ai)
 
         new_lp, new_v, ent = jax.vmap(jax.vmap(one_eval))(
@@ -268,6 +274,10 @@ def _make_update(config: JaxPPOConfig, bc_config: dict[str, Any], state_bank: En
             traj["pair_features"],
             traj["target_mask"],
             traj["amount_mask"],
+            traj["source_slots"],
+            traj["source_mask"],
+            traj["active_source_count"],
+            traj["selected_source_count"],
             traj["target_idx"],
             traj["amount_idx"],
         )
@@ -302,7 +312,10 @@ def _make_update(config: JaxPPOConfig, bc_config: dict[str, Any], state_bank: En
             "reset_count": jnp.sum(dones),
             "mean_episode_step": jnp.mean(traj["episode_step"][-1]),
             "max_episode_step": jnp.max(traj["episode_step"][-1]),
-            "decisions": jnp.sum(traj["target_mask"][:, :, :, NOOP_TARGET_SLOT].astype(jnp.float32)),
+            "decisions": jnp.sum(traj["active_source_count"].astype(jnp.float32)),
+            "selected_decisions": jnp.sum(traj["selected_source_count"].astype(jnp.float32)),
+            "dropped_decisions": jnp.sum(jnp.maximum(traj["active_source_count"] - traj["selected_source_count"], 0).astype(jnp.float32)),
+            "source_cap": jnp.asarray(float(config.source_cap), dtype=jnp.float32),
         }
         return loss, metrics
 
@@ -349,6 +362,8 @@ def train(config: JaxPPOConfig) -> dict[str, Any]:
         raise RuntimeError("orbit_ppo_jax.train supports --opponent simple_heuristic_jax or jax_proxy")
     if config.state_bank_mode not in {"cycle", "random"}:
         raise RuntimeError("--state_bank_mode must be either cycle or random")
+    if int(config.source_cap) < 1 or int(config.source_cap) > P_MAX:
+        raise RuntimeError(f"--source_cap must be between 1 and {P_MAX}")
 
     state_bank = None
     state_bank_metadata: dict[str, Any] = {}
@@ -504,6 +519,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--enable_comets", action="store_true")
     ap.add_argument("--initial_state_bank", default=None)
     ap.add_argument("--state_bank_mode", default="random", choices=["cycle", "random"])
+    ap.add_argument("--source_cap", type=int, default=32)
     return ap
 
 

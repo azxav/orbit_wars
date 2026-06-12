@@ -121,6 +121,59 @@ def test_jax_feature_contract_matches_dense_python_features() -> None:
     np.testing.assert_allclose(np.asarray(actual.pair_features[0]), expected_pair, rtol=1e-5, atol=1e-5)
 
 
+def test_compact_features_select_top_ship_active_owned_sources() -> None:
+    from orbit_jax_env.state import manual_state
+    from orbit_ppo_jax.features import build_bc_features_for_seat
+
+    rows = []
+    for i in range(40):
+        rows.append([100 + i, 0, float(i % 8) * 10.0, float(i // 8) * 10.0, 2.0, float(i + 1), 1.0])
+    rows.extend(
+        [
+            [300, 1, 90.0, 10.0, 2.0, 200.0, 1.0],
+            [301, -1, 90.0, 20.0, 2.0, 201.0, 1.0],
+            [302, 0, 90.0, 30.0, 2.0, 0.0, 1.0],
+        ]
+    )
+    state = manual_state(planet_rows=rows, num_players=2)
+
+    features = build_bc_features_for_seat(state, 0, source_cap=32)
+
+    expected = np.arange(8, 40, dtype=np.int32)[::-1]
+    np.testing.assert_array_equal(np.asarray(features.source_slots), expected)
+    assert np.asarray(features.source_mask).tolist() == [True] * 32
+    assert int(features.active_source_count) == 40
+    assert int(features.selected_source_count) == 32
+    assert features.pair_features.shape == (32, 65, 15)
+    assert features.target_mask.shape == (32, 65)
+    assert features.amount_mask.shape == (32, 65, 7)
+
+
+def test_compact_features_pad_below_cap_and_filter_inactive_sources() -> None:
+    from orbit_jax_env.state import manual_state
+    from orbit_ppo_jax.features import build_bc_features_for_seat
+
+    state = manual_state(
+        planet_rows=[
+            [10, 0, 20.0, 50.0, 2.0, 12.0, 3.0],
+            [11, 0, 30.0, 50.0, 2.0, 5.0, 1.0],
+            [12, 1, 40.0, 50.0, 2.0, 100.0, 1.0],
+            [13, -1, 50.0, 50.0, 2.0, 100.0, 1.0],
+            [14, 0, 60.0, 50.0, 2.0, 0.0, 1.0],
+        ],
+        num_players=2,
+    )
+
+    features = build_bc_features_for_seat(state, 0, source_cap=5)
+
+    np.testing.assert_array_equal(np.asarray(features.source_slots[:2]), np.asarray([0, 1], dtype=np.int32))
+    assert np.asarray(features.source_mask).tolist() == [True, True, False, False, False]
+    assert int(features.active_source_count) == 2
+    assert int(features.selected_source_count) == 2
+    assert not np.asarray(features.target_mask[2:]).any()
+    assert not np.asarray(features.amount_mask[2:]).any()
+
+
 def test_amount_decode_contract_matches_schema_bins() -> None:
     from orbit_ppo_jax.actions import decode_amount_bin_jax
     from orbit_training_prep.schema import decode_amount_bin
@@ -210,6 +263,106 @@ def test_steps_alias_normalizes_to_rollout_steps() -> None:
     assert not hasattr(config, "steps")
     assert config.rollout_steps == 7
     assert config.episode_steps == 500
+    assert config.source_cap == 32
+
+
+def test_source_cap_arg_is_accepted() -> None:
+    from orbit_ppo_jax.train import build_arg_parser, config_from_args
+
+    args = build_arg_parser().parse_args(
+        [
+            "--bc_checkpoint",
+            "bc.pt",
+            "--out_dir",
+            "out",
+            "--source_cap",
+            "2",
+        ]
+    )
+    config = config_from_args(args)
+
+    assert config.source_cap == 2
+
+
+def test_action_rows_scatter_compact_sources_and_ignore_padding() -> None:
+    from orbit_jax_env.state import manual_state
+    from orbit_ppo_jax.actions import action_rows_from_source_choices
+
+    state = manual_state(
+        planet_rows=[
+            [10, 0, 10.0, 10.0, 2.0, 20.0, 1.0],
+            [11, 0, 20.0, 10.0, 2.0, 20.0, 1.0],
+            [12, 1, 30.0, 10.0, 2.0, 5.0, 1.0],
+        ],
+        num_players=2,
+    )
+
+    rows = action_rows_from_source_choices(
+        state,
+        0,
+        jnp.asarray([1, 0, 0], dtype=jnp.int32),
+        jnp.asarray([2, 64, 2], dtype=jnp.int32),
+        jnp.asarray([2, 0, 2], dtype=jnp.int32),
+        jnp.asarray([True, True, False]),
+    )
+
+    rows_np = np.asarray(rows)
+    assert rows_np[0].tolist() == [0.0, 0.0, 0.0]
+    assert rows_np[1, 0] == 11.0
+    assert rows_np[1, 2] > 0.0
+    assert rows_np[2].tolist() == [0.0, 0.0, 0.0]
+    assert not rows_np[3:].any()
+
+    padded_duplicate_rows = action_rows_from_source_choices(
+        state,
+        0,
+        jnp.asarray([0, 0, 0], dtype=jnp.int32),
+        jnp.asarray([2, 2, 2], dtype=jnp.int32),
+        jnp.asarray([2, 2, 2], dtype=jnp.int32),
+        jnp.asarray([True, False, False]),
+    )
+    padded_duplicate_np = np.asarray(padded_duplicate_rows)
+    assert padded_duplicate_np[0, 0] == 10.0
+    assert padded_duplicate_np[0, 2] > 0.0
+
+
+def test_tiny_train_with_small_source_cap_records_compact_metrics(tmp_path: Path) -> None:
+    from orbit_ppo_jax.train import main
+
+    ckpt = _tiny_bc_checkpoint(tmp_path / "bc")
+    out_dir = tmp_path / "ppo_source_cap"
+    main(
+        [
+            "--bc_checkpoint",
+            str(ckpt),
+            "--out_dir",
+            str(out_dir),
+            "--players",
+            "2",
+            "--envs",
+            "1",
+            "--steps",
+            "1",
+            "--episode_steps",
+            "500",
+            "--updates",
+            "1",
+            "--eval_games",
+            "0",
+            "--source_cap",
+            "2",
+        ]
+    )
+
+    config = json.loads((out_dir / "config.json").read_text())
+    metrics = json.loads((out_dir / "metrics.jsonl").read_text().splitlines()[0])
+    assert config["source_cap"] == 2
+    assert metrics["source_cap"] == 2.0
+    assert "selected_decisions" in metrics
+    assert "dropped_decisions" in metrics
+    assert metrics["selected_decisions"] <= metrics["decisions"]
+    assert (out_dir / "latest" / "params.npz").exists()
+
 
 
 def test_explicit_rollout_steps_wins_over_legacy_steps() -> None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 
+import jax
 import jax.numpy as jnp
 
 from orbit_jax_env.config import P_MAX
@@ -24,6 +25,10 @@ class JaxBCFeatures:
     pair_features: jnp.ndarray
     target_mask: jnp.ndarray
     amount_mask: jnp.ndarray
+    source_slots: jnp.ndarray
+    source_mask: jnp.ndarray
+    active_source_count: jnp.ndarray
+    selected_source_count: jnp.ndarray
 
 
 def _ships_from_log_norm(x):
@@ -177,7 +182,7 @@ def build_masks(state, player_id: int) -> tuple[jnp.ndarray, jnp.ndarray]:
 
 
 def pair_features_for_source(planet_features: jnp.ndarray, target_state_features: jnp.ndarray, source_slot: int, amount_mask: jnp.ndarray) -> jnp.ndarray:
-    src = planet_features[int(source_slot)]
+    src = planet_features[source_slot]
     sx, sy = src[4], src[5]
     source_ships = jnp.maximum(0.0, _ships_from_log_norm(src[7]))
     source_prod = jnp.maximum(0.0, src[8] * 5.0)
@@ -223,10 +228,40 @@ def pair_features_for_source(planet_features: jnp.ndarray, target_state_features
     return jnp.nan_to_num(jnp.concatenate([rows, noop], axis=0))
 
 
-def build_bc_features_for_seat(state, player_id: int) -> JaxBCFeatures:
+def _full_features_and_masks(state, player_id: int) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     pf = planet_features_from_state(state, int(player_id))
     gf = global_features_from_state(state, int(player_id))
     tsf = target_state_features_from_state(state, int(player_id))
     target_mask, amount_mask = build_masks(state, int(player_id))
-    pair = jnp.stack([pair_features_for_source(pf, tsf, i, amount_mask[i]) for i in range(P_MAX)], axis=0)
-    return JaxBCFeatures(pf, gf, tsf, pair, target_mask, amount_mask)
+    return pf, gf, tsf, target_mask, amount_mask
+
+
+def _select_source_slots(state, active_source: jnp.ndarray, source_cap: int) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    cap = min(int(source_cap), P_MAX)
+    active_count = jnp.sum(active_source.astype(jnp.int32))
+    scores = jnp.where(active_source, state.planet_ships, -jnp.inf)
+    _top_scores, top_slots = jax.lax.top_k(scores, cap)
+    source_mask = jnp.arange(cap, dtype=jnp.int32) < active_count
+    safe_slot = jnp.argmax(active_source.astype(jnp.int32)).astype(jnp.int32)
+    source_slots = jnp.where(source_mask, top_slots.astype(jnp.int32), safe_slot)
+    selected_count = jnp.minimum(active_count, jnp.asarray(cap, dtype=jnp.int32))
+    return source_slots, source_mask, active_count, selected_count
+
+
+def build_bc_features_for_seat(state, player_id: int, source_cap: int | None = None) -> JaxBCFeatures:
+    pf, gf, tsf, target_mask, amount_mask = _full_features_and_masks(state, int(player_id))
+    if source_cap is None:
+        source_slots = jnp.arange(P_MAX, dtype=jnp.int32)
+        source_mask = target_mask[:, NOOP_TARGET_SLOT]
+        active_count = jnp.sum(source_mask.astype(jnp.int32))
+        selected_count = active_count
+    else:
+        source_slots, source_mask, active_count, selected_count = _select_source_slots(
+            state,
+            target_mask[:, NOOP_TARGET_SLOT],
+            int(source_cap),
+        )
+        target_mask = target_mask[source_slots] & source_mask[:, None]
+        amount_mask = amount_mask[source_slots] & source_mask[:, None, None]
+    pair = jnp.stack([pair_features_for_source(pf, tsf, source_slots[row], amount_mask[row]) for row in range(source_slots.shape[0])], axis=0)
+    return JaxBCFeatures(pf, gf, tsf, pair, target_mask, amount_mask, source_slots, source_mask, active_count, selected_count)
