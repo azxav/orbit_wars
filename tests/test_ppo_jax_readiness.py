@@ -176,7 +176,10 @@ def test_tiny_train_writes_checkpoint_and_metrics(tmp_path: Path) -> None:
     assert (out_dir / "config.json").exists()
     assert (out_dir / "metrics.jsonl").exists()
     assert (out_dir / "latest" / "params.npz").exists()
-    assert json.loads((out_dir / "metrics.jsonl").read_text().splitlines()[0])["update"] == 1
+    metrics = json.loads((out_dir / "metrics.jsonl").read_text().splitlines()[0])
+    assert metrics["update"] == 1
+    assert metrics["env_steps"] == 1
+    assert metrics["steps_per_second"] > 0.0
 
 
 def test_eval_vs_heuristic_runs_with_mocked_kaggle_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

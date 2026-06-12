@@ -275,11 +275,24 @@ def train(config: JaxPPOConfig) -> dict[str, Any]:
         t0 = time.time()
         params, opt_state, metrics_jax = update_fn(params, opt_state, step_key, jnp.asarray(update_index, dtype=jnp.int32))
         jax.block_until_ready(params)
+        seconds = time.time() - t0
+        update_env_steps = int(config.envs) * int(config.steps)
+        env_steps = update_index * update_env_steps
         metrics = {k: float(v) for k, v in metrics_jax.items()}
-        metrics.update({"update": update_index, "seconds": time.time() - t0, **runtime})
+        metrics.update(
+            {
+                "update": update_index,
+                "seconds": seconds,
+                "update_env_steps": update_env_steps,
+                "env_steps": env_steps,
+                "steps_per_second": float(update_env_steps / seconds) if seconds > 0.0 else 0.0,
+                **runtime,
+            }
+        )
         if not all(jnp.isfinite(jnp.asarray(v)) for v in metrics.values() if isinstance(v, float)):
             raise RuntimeError(f"non-finite JAX PPO metrics at update {update_index}: {metrics}")
         _append_jsonl(out_dir / "metrics.jsonl", metrics)
+        print(json.dumps(metrics, sort_keys=True), flush=True)
         save_jax_checkpoint(out_dir / "latest", params, {**asdict(config), "bc_model_config": bc_config, **runtime}, metrics)
         if update_index == 1 or update_index % int(config.save_interval_updates) == 0:
             save_jax_checkpoint(out_dir / "checkpoints" / f"update_{update_index:05d}", params, {**asdict(config), "bc_model_config": bc_config, **runtime}, metrics)
