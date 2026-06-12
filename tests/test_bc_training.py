@@ -216,6 +216,39 @@ def test_amount_loss_ignores_noop_rows() -> None:
     assert metrics["amount_loss"] < 1.0e-6
 
 
+def test_loss_ignores_legacy_sample_weight_after_dataset_balancing() -> None:
+    from orbit_bc_training.losses import bc_loss_and_metrics
+
+    target_logits = torch.full((2, NOOP_TARGET_SLOT + 1), -2.0)
+    target_logits[0, NOOP_TARGET_SLOT] = -1.0
+    target_logits[0, 1] = 4.0
+    target_logits[1, 1] = 3.0
+    outputs = {
+        "target_logits": target_logits,
+        "amount_logits": torch.tensor(
+            [
+                [2.0, 0.0],
+                [0.0, 1.5],
+            ]
+        ),
+    }
+    batch = {
+        "target_mask": torch.ones((2, NOOP_TARGET_SLOT + 1), dtype=torch.bool),
+        "amount_mask": torch.ones((2, 2), dtype=torch.bool),
+        "target_label": torch.tensor([NOOP_TARGET_SLOT, 1]),
+        "amount_label": torch.tensor([0, 1]),
+        "sample_weight": torch.tensor([0.2, 5.0]),
+        "is_noop": torch.tensor([True, False]),
+    }
+
+    _, metrics = bc_loss_and_metrics(outputs, batch)
+    expected_target_loss = torch.nn.functional.cross_entropy(outputs["target_logits"], batch["target_label"])
+    expected_amount_loss = torch.nn.functional.cross_entropy(outputs["amount_logits"][1:], batch["amount_label"][1:])
+
+    assert metrics["target_loss"] == float(expected_target_loss)
+    assert metrics["amount_loss"] == float(expected_amount_loss)
+
+
 def test_model_forward_uses_pair_features(tmp_path: Path) -> None:
     from torch.utils.data import DataLoader
 

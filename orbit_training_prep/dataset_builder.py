@@ -347,8 +347,6 @@ def _sample_weight(row: dict[str, Any]) -> float:
     target = int(row.get("target_slot_label", NOOP_TARGET_SLOT))
     is_noop = target == NOOP_TARGET_SLOT
     weight = float(row.get("train_weight", 1.0))
-    if is_noop:
-        weight *= 0.2
     if bool(row.get("winner_action", False)) or float(row.get("final_reward", 0.0) or 0.0) > 0.0:
         weight *= 1.1
     step = int(row.get("step_index", row.get("step", row.get("obs_step", 0))) or 0)

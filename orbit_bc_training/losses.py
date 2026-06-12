@@ -17,22 +17,19 @@ def masked_argmax(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return apply_mask(logits, mask).argmax(dim=-1)
 
 
-def _weighted_ce(logits: torch.Tensor, labels: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
-    per = F.cross_entropy(logits, labels, reduction="none")
-    denom = weights.sum().clamp_min(1.0)
-    return (per * weights).sum() / denom
+def _mean_ce(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    return F.cross_entropy(logits, labels)
 
 
 def bc_loss_and_metrics(outputs: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, float]]:
     target_logits = apply_mask(outputs["target_logits"], batch["target_mask"])
     amount_logits = apply_mask(outputs["amount_logits"], batch["amount_mask"])
-    weights = batch["sample_weight"].to(target_logits.dtype)
     target_labels = batch["target_label"]
     amount_labels = batch["amount_label"]
-    target_loss = _weighted_ce(target_logits, target_labels, weights)
+    target_loss = _mean_ce(target_logits, target_labels)
     amount_rows = target_labels != NOOP_TARGET_SLOT
     if amount_rows.any():
-        amount_loss = _weighted_ce(amount_logits[amount_rows], amount_labels[amount_rows], weights[amount_rows])
+        amount_loss = _mean_ce(amount_logits[amount_rows], amount_labels[amount_rows])
     else:
         amount_loss = amount_logits.sum() * 0.0
     loss = target_loss + amount_loss

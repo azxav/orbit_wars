@@ -58,7 +58,7 @@ class SplitMaterializeTest(unittest.TestCase):
         self.assertEqual(splits, make_episode_splits(["episode_4", "episode_3", "episode_2", "episode_1"], valid_frac=0.25, seed=42))
 
     def test_source_turn_sample_weight_matches_contract(self) -> None:
-        self.assertEqual(source_turn_sample_weight({"target_slot_label": NOOP_TARGET_SLOT, "winner_action": False, "step_index": 12}), 0.2)
+        self.assertEqual(source_turn_sample_weight({"target_slot_label": NOOP_TARGET_SLOT, "winner_action": False, "step_index": 12}), 1.0)
         self.assertEqual(source_turn_sample_weight({"target_slot_label": 3, "winner_action": False, "step_index": 12}), 1.0)
         self.assertEqual(source_turn_sample_weight({"target_slot_label": 3, "winner_action": True, "step_index": 12}), 1.25)
         self.assertEqual(source_turn_sample_weight({"target_slot_label": 3, "winner_action": True, "step_index": 431}), 0.625)
@@ -95,7 +95,7 @@ class SplitMaterializeTest(unittest.TestCase):
             self.assertEqual(int(train_target_label[0]), 1)
             self.assertEqual(int(valid_target_label[0]), NOOP_TARGET_SLOT)
             self.assertEqual(float(train_sample_weight[0]), np.float32(1.25))
-            self.assertEqual(float(valid_sample_weight[0]), np.float32(0.2))
+            self.assertEqual(float(valid_sample_weight[0]), np.float32(1.0))
             self.assertFalse((out / "train" / "source_turn_rows.jsonl").exists())
             self.assertFalse((out / "valid" / "source_turn_rows.jsonl").exists())
 

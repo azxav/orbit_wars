@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 
 from orbit_training_prep import dataset_builder
-from orbit_training_prep.dataset_builder import DatasetBuilder, _balance_source_turn_dataset, _select_balanced_replay_paths
+from orbit_training_prep.dataset_builder import DatasetBuilder, _balance_source_turn_dataset, _sample_weight, _select_balanced_replay_paths
 from orbit_training_prep.features import PAIR_FEATURE_NAMES
 from orbit_training_prep.schema import AMOUNT_BIN_ALL, AMOUNT_BIN_CAPTURE, NOOP_TARGET_SLOT
 from orbit_training_prep.source_turn_store import SourceTurnDatasetWriter
@@ -284,6 +284,29 @@ class DatasetBuilderMultipleReplaysTest(unittest.TestCase):
             self.assertEqual(balanced["sample_count"], 5)
             self.assertEqual(balanced["proportion_correction"]["sample_balance"]["selected"]["noop"], 5)
             self.assertTrue(balanced["proportion_correction"]["sample_balance"]["infeasible"])
+
+    def test_dataset_builder_sample_weight_does_not_downweight_noop(self) -> None:
+        noop_weight = _sample_weight(
+            {
+                "target_slot_label": NOOP_TARGET_SLOT,
+                "train_weight": 1.0,
+                "winner_action": False,
+                "final_reward": 0.0,
+                "step_index": 12,
+            }
+        )
+        op_weight = _sample_weight(
+            {
+                "target_slot_label": 3,
+                "train_weight": 1.0,
+                "winner_action": False,
+                "final_reward": 0.0,
+                "step_index": 120,
+            }
+        )
+
+        self.assertEqual(noop_weight, 1.0)
+        self.assertEqual(op_weight, 1.0)
 
     def test_cli_ratio_defaults_match_noop_op_target(self) -> None:
         parser = dataset_builder.build_arg_parser()

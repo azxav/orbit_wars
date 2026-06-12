@@ -47,7 +47,7 @@ def row_file_paths(dataset_root: str | Path, filename: str, out_dir: str | Path 
 def source_turn_sample_weight(row: dict[str, Any]) -> float:
     target = row.get("target_slot_label", row.get("target_planet_id_label"))
     is_noop = target in (NOOP_TARGET_SLOT, NOOP_TARGET_ID, "no_op", "noop", None)
-    weight = 0.2 if is_noop else 1.0
+    weight = 1.0
     if bool(row.get("winner_action", False)) or float(row.get("final_reward", 0.0) or 0.0) > 0.0:
         weight *= 1.25
     step = int(row.get("step_index", row.get("step", row.get("obs_step", 0))) or 0)
