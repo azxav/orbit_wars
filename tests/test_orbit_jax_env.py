@@ -56,6 +56,122 @@ def test_launch_production_and_movement_from_manual_state() -> None:
     assert bool(done) is False
 
 
+def test_launch_info_ignores_padding_noop_rows() -> None:
+    from orbit_jax_env.config import MAX_ACTIONS_PER_PLAYER, MAX_PLAYERS
+    from orbit_jax_env.state import manual_state
+    from orbit_jax_env.step import step
+
+    state = manual_state(
+        planet_rows=[[10, 0, 20.0, 50.0, 2.0, 10.0, 3.0]],
+        num_players=2,
+        angular_velocity=0.0,
+    )
+    actions = jnp.zeros((MAX_PLAYERS, MAX_ACTIONS_PER_PLAYER, 3), dtype=jnp.float32)
+
+    _next_state, _obs, _rewards, _done, info = step(state, actions)
+
+    assert int(info["submitted_action_count"]) == 0
+    assert int(info["valid_action_count"]) == 0
+    assert int(info["invalid_action_count"]) == 0
+    assert float(info["invalid_action_rate"]) == 0.0
+
+
+def test_launch_info_counts_valid_launch() -> None:
+    from orbit_jax_env.config import MAX_ACTIONS_PER_PLAYER, MAX_PLAYERS
+    from orbit_jax_env.state import manual_state
+    from orbit_jax_env.step import step
+
+    state = manual_state(
+        planet_rows=[[10, 0, 20.0, 50.0, 2.0, 10.0, 3.0]],
+        num_players=2,
+        angular_velocity=0.0,
+    )
+    actions = jnp.zeros((MAX_PLAYERS, MAX_ACTIONS_PER_PLAYER, 3), dtype=jnp.float32)
+    actions = actions.at[0, 0].set(jnp.array([10.0, 0.0, 4.0], dtype=jnp.float32))
+
+    _next_state, _obs, _rewards, _done, info = step(state, actions)
+
+    assert int(info["submitted_action_count"]) == 1
+    assert int(info["valid_action_count"]) == 1
+    assert int(info["invalid_action_count"]) == 0
+
+
+def test_launch_info_counts_staged_exclusive_invalid_reasons() -> None:
+    from orbit_jax_env.config import MAX_ACTIONS_PER_PLAYER, MAX_PLAYERS
+    from orbit_jax_env.state import manual_state
+    from orbit_jax_env.step import step
+
+    state = manual_state(
+        planet_rows=[
+            [10, 0, 20.0, 50.0, 2.0, 10.0, 3.0],
+            [12, 1, 80.0, 50.0, 2.0, 10.0, 0.0],
+        ],
+        num_players=2,
+        angular_velocity=0.0,
+    )
+    actions = jnp.zeros((MAX_PLAYERS, MAX_ACTIONS_PER_PLAYER, 3), dtype=jnp.float32)
+    actions = actions.at[0, 0].set(jnp.array([999.0, 0.0, 1.0], dtype=jnp.float32))
+    actions = actions.at[0, 1].set(jnp.array([12.0, 0.0, 1.0], dtype=jnp.float32))
+    actions = actions.at[0, 2].set(jnp.array([10.0, 1.0, -1.0], dtype=jnp.float32))
+    actions = actions.at[2, 0].set(jnp.array([10.0, 0.0, 1.0], dtype=jnp.float32))
+
+    _next_state, _obs, _rewards, _done, info = step(state, actions)
+
+    assert int(info["submitted_action_count"]) == 4
+    assert int(info["valid_action_count"]) == 0
+    assert int(info["invalid_action_count"]) == 4
+    assert int(info["invalid_source_id_count"]) == 1
+    assert int(info["invalid_inactive_player_id_count"]) == 1
+    assert int(info["invalid_source_not_owned_count"]) == 1
+    assert int(info["invalid_non_positive_ship_amount_count"]) == 1
+    assert int(info["invalid_unaffordable_source_total_count"]) == 0
+    assert int(info["invalid_no_free_fleet_slot_count"]) == 0
+
+
+def test_launch_info_counts_unaffordable_multi_launch() -> None:
+    from orbit_jax_env.config import MAX_ACTIONS_PER_PLAYER, MAX_PLAYERS
+    from orbit_jax_env.state import manual_state
+    from orbit_jax_env.step import step
+
+    state = manual_state(
+        planet_rows=[[10, 0, 20.0, 50.0, 2.0, 10.0, 3.0]],
+        num_players=2,
+        angular_velocity=0.0,
+    )
+    actions = jnp.zeros((MAX_PLAYERS, MAX_ACTIONS_PER_PLAYER, 3), dtype=jnp.float32)
+    actions = actions.at[0, 0].set(jnp.array([10.0, 0.0, 8.0], dtype=jnp.float32))
+    actions = actions.at[0, 1].set(jnp.array([10.0, 1.0, 8.0], dtype=jnp.float32))
+
+    _next_state, _obs, _rewards, _done, info = step(state, actions)
+
+    assert int(info["submitted_action_count"]) == 2
+    assert int(info["valid_action_count"]) == 0
+    assert int(info["invalid_action_count"]) == 2
+    assert int(info["invalid_unaffordable_source_total_count"]) == 2
+
+
+def test_launch_info_counts_no_free_fleet_slot() -> None:
+    from orbit_jax_env.config import MAX_ACTIONS_PER_PLAYER, MAX_PLAYERS
+    from orbit_jax_env.state import EnvState, manual_state
+    from orbit_jax_env.step import step
+
+    state = manual_state(
+        planet_rows=[[10, 0, 20.0, 50.0, 2.0, 10.0, 3.0]],
+        num_players=2,
+        angular_velocity=0.0,
+    )
+    state = EnvState(**{**state.__dict__, "fleet_alive": jnp.ones_like(state.fleet_alive)})
+    actions = jnp.zeros((MAX_PLAYERS, MAX_ACTIONS_PER_PLAYER, 3), dtype=jnp.float32)
+    actions = actions.at[0, 0].set(jnp.array([10.0, 0.0, 1.0], dtype=jnp.float32))
+
+    _next_state, _obs, _rewards, _done, info = step(state, actions)
+
+    assert int(info["submitted_action_count"]) == 1
+    assert int(info["valid_action_count"]) == 0
+    assert int(info["invalid_action_count"]) == 1
+    assert int(info["invalid_no_free_fleet_slot_count"]) == 1
+
+
 def test_planet_collision_captures_neutral_planet() -> None:
     from orbit_jax_env.config import MAX_ACTIONS_PER_PLAYER, MAX_PLAYERS
     from orbit_jax_env.state import manual_state

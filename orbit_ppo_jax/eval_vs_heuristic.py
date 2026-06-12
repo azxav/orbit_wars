@@ -38,7 +38,8 @@ class JaxCheckpointAgent:
     def __call__(self, obs: dict[str, Any], config: Any) -> list[list[Any]]:
         player_id = int(obs.get("player", 0) or 0)
         players = int(getattr(config, "players", getattr(config, "num_players", self.config.get("players", 2))) or self.config.get("players", 2))
-        episode_steps = int(getattr(config, "episodeSteps", self.config.get("steps", 500)) or self.config.get("steps", 500))
+        checkpoint_episode_steps = self.config.get("episode_steps", self.config.get("steps", 500))
+        episode_steps = int(getattr(config, "episodeSteps", checkpoint_episode_steps) or checkpoint_episode_steps or 500)
         state = state_from_observation(obs, num_players=players, episode_steps=episode_steps)
         features = build_bc_features_for_seat(state, player_id)
         out = bc_forward(self.params["bc"], _source_batch(features), self.bc_config)
@@ -60,6 +61,7 @@ def evaluate(
     players: int = 4,
     out_dir: str | Path = "ppo_eval_runs/jax_eval",
     seed: int = 42,
+    episode_steps: int = 500,
 ) -> dict[str, Any]:
     try:
         from kaggle_environments import make
@@ -75,12 +77,12 @@ def evaluate(
         agents = [learner]
         for _ in range(1, int(players)):
             agents.append(make_opponent("heuristic_path", heuristic_path=heuristic_path))
-        env = make("orbit_wars", configuration={"episodeSteps": 500, "seed": int(seed) + game_idx}, debug=False)
+        env = make("orbit_wars", configuration={"episodeSteps": int(episode_steps), "seed": int(seed) + game_idx}, debug=False)
         env.run(agents)
         final_rewards, statuses = _final_state(env)
         reward = float(final_rewards[0])
         rewards.append(reward)
-        row = {"game": game_idx, "reward": reward, "status": statuses[0], "players": int(players)}
+        row = {"game": game_idx, "reward": reward, "status": statuses[0], "players": int(players), "episode_steps": int(episode_steps)}
         rows.append(row)
         with open(out / "games.jsonl", "a", encoding="utf-8") as f:
             f.write(json.dumps(row, sort_keys=True) + "\n")
@@ -89,6 +91,7 @@ def evaluate(
         "heuristic_path": str(heuristic_path),
         "games": int(games),
         "players": int(players),
+        "episode_steps": int(episode_steps),
         "average_final_reward": float(np.mean(rewards)) if rewards else 0.0,
         "min_final_reward": float(np.min(rewards)) if rewards else 0.0,
         "max_final_reward": float(np.max(rewards)) if rewards else 0.0,
@@ -106,12 +109,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--players", type=int, default=4, choices=[2, 4])
     ap.add_argument("--out_dir", default="ppo_eval_runs/jax_eval")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--episode_steps", type=int, default=500)
     return ap
 
 
 def main(argv: list[str] | None = None) -> dict[str, Any] | None:
     args = build_arg_parser().parse_args(argv)
-    summary = evaluate(args.checkpoint, args.heuristic_path, games=args.games, players=args.players, out_dir=args.out_dir, seed=args.seed)
+    summary = evaluate(
+        args.checkpoint,
+        args.heuristic_path,
+        games=args.games,
+        players=args.players,
+        out_dir=args.out_dir,
+        seed=args.seed,
+        episode_steps=args.episode_steps,
+    )
     if argv is None:
         print(json.dumps(summary, indent=2, sort_keys=True))
         return None

@@ -166,6 +166,8 @@ def test_tiny_train_writes_checkpoint_and_metrics(tmp_path: Path) -> None:
             "1",
             "--steps",
             "1",
+            "--episode_steps",
+            "500",
             "--updates",
             "1",
             "--eval_games",
@@ -176,10 +178,199 @@ def test_tiny_train_writes_checkpoint_and_metrics(tmp_path: Path) -> None:
     assert (out_dir / "config.json").exists()
     assert (out_dir / "metrics.jsonl").exists()
     assert (out_dir / "latest" / "params.npz").exists()
+    config = json.loads((out_dir / "config.json").read_text())
+    assert "steps" not in config
+    assert config["rollout_steps"] == 1
+    assert config["episode_steps"] == 500
     metrics = json.loads((out_dir / "metrics.jsonl").read_text().splitlines()[0])
     assert metrics["update"] == 1
     assert metrics["env_steps"] == 1
+    assert metrics["update_env_steps"] == 1
+    assert metrics["rollout_steps"] == 1
+    assert metrics["episode_steps"] == 500
+    assert metrics["reset_source"] == "jax_reset"
     assert metrics["steps_per_second"] > 0.0
+
+
+def test_steps_alias_normalizes_to_rollout_steps() -> None:
+    from orbit_ppo_jax.train import build_arg_parser, config_from_args
+
+    args = build_arg_parser().parse_args(
+        [
+            "--bc_checkpoint",
+            "bc.pt",
+            "--out_dir",
+            "out",
+            "--steps",
+            "7",
+        ]
+    )
+    config = config_from_args(args)
+
+    assert not hasattr(config, "steps")
+    assert config.rollout_steps == 7
+    assert config.episode_steps == 500
+
+
+def test_explicit_rollout_steps_wins_over_legacy_steps() -> None:
+    from orbit_ppo_jax.train import build_arg_parser, config_from_args
+
+    args = build_arg_parser().parse_args(
+        [
+            "--bc_checkpoint",
+            "bc.pt",
+            "--out_dir",
+            "out",
+            "--steps",
+            "7",
+            "--rollout_steps",
+            "11",
+            "--episode_steps",
+            "123",
+        ]
+    )
+    config = config_from_args(args)
+
+    assert config.rollout_steps == 11
+    assert config.episode_steps == 123
+
+
+def test_compute_gae_uses_last_value_for_truncated_rollout() -> None:
+    from orbit_ppo_jax.train import _compute_gae
+
+    rewards = jnp.zeros((2, 1), dtype=jnp.float32)
+    values = jnp.zeros((2, 1), dtype=jnp.float32)
+    dones = jnp.zeros((2, 1), dtype=jnp.float32)
+    last_values = jnp.asarray([10.0], dtype=jnp.float32)
+
+    advantages, returns = _compute_gae(rewards, values, dones, last_values, gamma=1.0, lam=1.0)
+
+    np.testing.assert_allclose(np.asarray(advantages[:, 0]), np.asarray([10.0, 10.0], dtype=np.float32))
+    np.testing.assert_allclose(np.asarray(returns[:, 0]), np.asarray([10.0, 10.0], dtype=np.float32))
+
+
+def test_compute_gae_masks_terminal_bootstrap() -> None:
+    from orbit_ppo_jax.train import _compute_gae
+
+    rewards = jnp.zeros((2, 1), dtype=jnp.float32)
+    values = jnp.zeros((2, 1), dtype=jnp.float32)
+    dones = jnp.asarray([[0.0], [1.0]], dtype=jnp.float32)
+    last_values = jnp.asarray([10.0], dtype=jnp.float32)
+
+    advantages, returns = _compute_gae(rewards, values, dones, last_values, gamma=1.0, lam=1.0)
+
+    np.testing.assert_allclose(np.asarray(advantages[:, 0]), np.asarray([0.0, 0.0], dtype=np.float32))
+    np.testing.assert_allclose(np.asarray(returns[:, 0]), np.asarray([0.0, 0.0], dtype=np.float32))
+
+
+def test_compute_gae_mixed_done_envs_bootstraps_only_unfinished_envs() -> None:
+    from orbit_ppo_jax.train import _compute_gae
+
+    rewards = jnp.zeros((2, 2), dtype=jnp.float32)
+    values = jnp.zeros((2, 2), dtype=jnp.float32)
+    dones = jnp.asarray([[0.0, 0.0], [1.0, 0.0]], dtype=jnp.float32)
+    last_values = jnp.asarray([10.0, 10.0], dtype=jnp.float32)
+
+    advantages, returns = _compute_gae(rewards, values, dones, last_values, gamma=1.0, lam=1.0)
+
+    np.testing.assert_allclose(np.asarray(advantages[:, 0]), np.asarray([0.0, 0.0], dtype=np.float32))
+    np.testing.assert_allclose(np.asarray(advantages[:, 1]), np.asarray([10.0, 10.0], dtype=np.float32))
+    np.testing.assert_allclose(np.asarray(returns), np.asarray(advantages))
+
+
+def test_persistent_train_state_advances_across_updates(tmp_path: Path) -> None:
+    from orbit_ppo_jax.train import main
+
+    ckpt = _tiny_bc_checkpoint(tmp_path / "bc")
+    out_dir = tmp_path / "ppo_persistent"
+    main(
+        [
+            "--bc_checkpoint",
+            str(ckpt),
+            "--out_dir",
+            str(out_dir),
+            "--players",
+            "2",
+            "--envs",
+            "1",
+            "--rollout_steps",
+            "1",
+            "--episode_steps",
+            "500",
+            "--updates",
+            "2",
+            "--eval_games",
+            "0",
+        ]
+    )
+
+    rows = [json.loads(line) for line in (out_dir / "metrics.jsonl").read_text().splitlines()]
+    assert rows[0]["mean_episode_step"] == 1.0
+    assert rows[1]["mean_episode_step"] == 2.0
+    assert rows[1]["reset_count"] == 0.0
+
+
+def test_tiny_train_can_reset_from_official_state_bank(tmp_path: Path) -> None:
+    from orbit_jax_env.official_state_dataset import save_state_bank
+    from orbit_jax_env.state import manual_state
+    from orbit_ppo_jax.train import main
+
+    ckpt = _tiny_bc_checkpoint(tmp_path / "bc")
+    bank_path = tmp_path / "bank.npz"
+    state0 = manual_state(
+        planet_rows=[[10, 0, 20.0, 50.0, 2.0, 10.0, 3.0], [11, -1, 70.0, 50.0, 2.0, 5.0, 1.0]],
+        num_players=2,
+        episode_steps=500,
+    )
+    state1 = manual_state(
+        planet_rows=[[20, 0, 30.0, 50.0, 2.0, 10.0, 3.0], [21, -1, 80.0, 50.0, 2.0, 5.0, 1.0]],
+        num_players=2,
+        episode_steps=500,
+    )
+    states = jax.tree_util.tree_map(lambda a, b: jnp.stack([a, b]), state0, state1)
+    save_state_bank(
+        bank_path,
+        states,
+        {
+            "players": 2,
+            "episode_steps": 500,
+            "ship_speed": 6.0,
+            "source": "kaggle_official",
+            "seed_start": 0,
+            "seed_count": 2,
+        },
+    )
+    out_dir = tmp_path / "ppo_bank"
+
+    main(
+        [
+            "--bc_checkpoint",
+            str(ckpt),
+            "--out_dir",
+            str(out_dir),
+            "--players",
+            "2",
+            "--envs",
+            "1",
+            "--rollout_steps",
+            "1",
+            "--episode_steps",
+            "500",
+            "--updates",
+            "1",
+            "--eval_games",
+            "0",
+            "--initial_state_bank",
+            str(bank_path),
+            "--state_bank_mode",
+            "cycle",
+        ]
+    )
+
+    config = json.loads((out_dir / "config.json").read_text())
+    metrics = json.loads((out_dir / "metrics.jsonl").read_text().splitlines()[0])
+    assert config["reset_source"] == "official_state_bank"
+    assert metrics["reset_source"] == "official_state_bank"
 
 
 def test_eval_vs_heuristic_runs_with_mocked_kaggle_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -219,7 +410,51 @@ def test_eval_vs_heuristic_runs_with_mocked_kaggle_env(tmp_path: Path, monkeypat
     monkeypatch.setitem(sys.modules, "kaggle_environments", fake_kaggle)
     monkeypatch.setattr("orbit_ppo_jax.eval_vs_heuristic.make_opponent", lambda *args, **kwargs: (lambda obs, config: []))
 
+    made_configs = []
+
+    def fake_make(_name, configuration, debug=False):
+        made_configs.append(configuration)
+        return FakeEnv()
+
+    fake_kaggle.make = fake_make
+
     summary = evaluate(tmp_path / "jax" / "latest", "orbit_wars_base.py", games=1, players=2, out_dir=tmp_path / "eval")
 
     assert summary["average_final_reward"] == 1.0
+    assert summary["episode_steps"] == 500
+    assert made_configs[0]["episodeSteps"] == 500
     assert (tmp_path / "eval" / "summary.json").exists()
+
+
+def test_eval_vs_heuristic_episode_steps_override_with_mocked_kaggle_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from orbit_ppo_jax.bc_policy import init_value_head, load_bc_jax_params
+    from orbit_ppo_jax.checkpointing import save_jax_checkpoint
+    from orbit_ppo_jax.eval_vs_heuristic import evaluate
+
+    ckpt = _tiny_bc_checkpoint(tmp_path / "bc")
+    bc_params, bc_config = load_bc_jax_params(ckpt)
+    params = {"bc": bc_params, "value": init_value_head(jax.random.PRNGKey(0), int(bc_config["hidden_size"]))}
+    save_jax_checkpoint(
+        tmp_path / "jax" / "latest",
+        params,
+        {"bc_checkpoint": str(ckpt), "bc_model_config": bc_config, "players": 2, "episode_steps": 300},
+        {},
+    )
+
+    made_configs = []
+
+    class FakeEnv:
+        def __init__(self) -> None:
+            self.steps = [[types.SimpleNamespace(reward=1.0, status="DONE"), types.SimpleNamespace(reward=-1.0, status="DONE")]]
+
+        def run(self, _agents):
+            return self.steps
+
+    fake_kaggle = types.SimpleNamespace(make=lambda _name, configuration, debug=False: (made_configs.append(configuration) or FakeEnv()))
+    monkeypatch.setitem(sys.modules, "kaggle_environments", fake_kaggle)
+    monkeypatch.setattr("orbit_ppo_jax.eval_vs_heuristic.make_opponent", lambda *args, **kwargs: (lambda obs, config: []))
+
+    summary = evaluate(tmp_path / "jax" / "latest", "orbit_wars_base.py", games=1, players=2, out_dir=tmp_path / "eval", episode_steps=222)
+
+    assert summary["episode_steps"] == 222
+    assert made_configs[0]["episodeSteps"] == 222

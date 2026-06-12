@@ -77,25 +77,49 @@ def _apply_comet_paths(state: EnvState, next_px: jnp.ndarray, next_py: jnp.ndarr
     return out_x, out_y, out_index, expired_after_tick
 
 
-def _launch_all(state: EnvState, actions: jnp.ndarray) -> EnvState:
+def _launch_all(state: EnvState, actions: jnp.ndarray) -> tuple[EnvState, dict[str, jnp.ndarray]]:
     flat = actions.reshape((MAX_PLAYERS * MAX_ACTIONS_PER_PLAYER, 3))
     player_ids = jnp.repeat(jnp.arange(MAX_PLAYERS, dtype=jnp.int32), MAX_ACTIONS_PER_PLAYER)
     source_ids = flat[:, 0].astype(jnp.int32)
     angles = flat[:, 1]
-    ships = jnp.floor(flat[:, 2])
+    ships_raw = flat[:, 2]
+    ships = jnp.floor(ships_raw)
+    submitted = (source_ids != 0) | (angles != 0.0) | (ships_raw != 0.0)
     source_match = source_ids[:, None] == state.planet_id[None, :]
     source_match = source_match & state.planet_alive[None, :]
     source_slots = jnp.argmax(source_match, axis=1).astype(jnp.int32)
     valid_source = jnp.any(source_match, axis=1)
+    active_player = player_ids < state.num_players
     source_owner = state.planet_owner[source_slots]
     owned = source_owner == player_ids
     positive = ships > 0.0
     total_by_source = jnp.zeros((P_MAX,), dtype=jnp.float32).at[source_slots].add(jnp.where(valid_source & owned & positive, ships, 0.0))
     affordable = total_by_source[source_slots] <= state.planet_ships[source_slots]
-    valid = valid_source & owned & positive & affordable & (player_ids < state.num_players)
+    invalid_source_id = submitted & (~valid_source)
+    invalid_inactive_player_id = submitted & valid_source & (~active_player)
+    invalid_source_not_owned = submitted & valid_source & active_player & (~owned)
+    invalid_non_positive_ship_amount = submitted & valid_source & active_player & owned & (~positive)
+    invalid_unaffordable_source_total = submitted & valid_source & active_player & owned & positive & (~affordable)
+    valid_before_capacity = submitted & valid_source & active_player & owned & positive & affordable
     free_count = jnp.sum((~state.fleet_alive).astype(jnp.int32))
-    valid = valid & (jnp.cumsum(valid.astype(jnp.int32)) <= free_count)
+    capacity_ok = jnp.cumsum(valid_before_capacity.astype(jnp.int32)) <= free_count
+    valid = valid_before_capacity & capacity_ok
+    invalid_no_free_fleet_slot = valid_before_capacity & (~capacity_ok)
+    submitted_count = jnp.sum(submitted.astype(jnp.int32))
     valid_count = jnp.sum(valid.astype(jnp.int32))
+    invalid_count = submitted_count - valid_count
+    launch_info = {
+        "submitted_action_count": submitted_count,
+        "valid_action_count": valid_count,
+        "invalid_action_count": invalid_count,
+        "invalid_action_rate": jnp.where(submitted_count > 0, invalid_count.astype(jnp.float32) / submitted_count.astype(jnp.float32), 0.0),
+        "invalid_source_id_count": jnp.sum(invalid_source_id.astype(jnp.int32)),
+        "invalid_inactive_player_id_count": jnp.sum(invalid_inactive_player_id.astype(jnp.int32)),
+        "invalid_source_not_owned_count": jnp.sum(invalid_source_not_owned.astype(jnp.int32)),
+        "invalid_non_positive_ship_amount_count": jnp.sum(invalid_non_positive_ship_amount.astype(jnp.int32)),
+        "invalid_unaffordable_source_total_count": jnp.sum(invalid_unaffordable_source_total.astype(jnp.int32)),
+        "invalid_no_free_fleet_slot_count": jnp.sum(invalid_no_free_fleet_slot.astype(jnp.int32)),
+    }
     launch_order = jnp.cumsum(valid.astype(jnp.int32)) - 1
     launch_ships_by_planet = jnp.zeros((P_MAX,), dtype=jnp.float32).at[source_slots].add(jnp.where(valid, ships, 0.0))
     planet_ships = state.planet_ships - launch_ships_by_planet
@@ -109,7 +133,7 @@ def _launch_all(state: EnvState, actions: jnp.ndarray) -> EnvState:
     slot_ships = ships[action_for_slot]
     start_x = state.planet_x[slot_source] + jnp.cos(slot_angle) * (state.planet_radius[slot_source] + LAUNCH_CLEARANCE)
     start_y = state.planet_y[slot_source] + jnp.sin(slot_angle) * (state.planet_radius[slot_source] + LAUNCH_CLEARANCE)
-    return EnvState(
+    next_state = EnvState(
         **{
             **state.__dict__,
             "planet_ships": planet_ships,
@@ -123,6 +147,7 @@ def _launch_all(state: EnvState, actions: jnp.ndarray) -> EnvState:
             "next_fleet_id": state.next_fleet_id + valid_count,
         }
     )
+    return next_state, launch_info
 
 
 def _move_fleets(state: EnvState, next_px: jnp.ndarray, next_py: jnp.ndarray):
@@ -164,7 +189,7 @@ def _terminal(state: EnvState):
 def step(state: EnvState, actions: jnp.ndarray):
     state = _remove_expired_comets(state)
     state = _spawn_comets(state)
-    state = _launch_all(state, actions)
+    state, launch_info = _launch_all(state, actions)
     planet_ships = state.planet_ships + jnp.where(state.planet_alive & (state.planet_owner != -1), state.planet_production, 0.0)
     state = EnvState(**{**state.__dict__, "planet_ships": planet_ships})
     next_px, next_py = rotated_planet_positions(
@@ -201,4 +226,5 @@ def step(state: EnvState, actions: jnp.ndarray):
         }
     )
     rewards, done, info = _terminal(next_state)
+    info = {**info, **launch_info}
     return next_state, build_observation(next_state), rewards, done, info

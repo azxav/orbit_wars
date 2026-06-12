@@ -16,6 +16,7 @@ from orbit_jax_env.jax_policy import greedy_actions
 from orbit_jax_env.observation import build_observation
 from orbit_jax_env.reset import reset
 from orbit_jax_env.step import step
+from orbit_jax_env.state import EnvState
 
 from .actions import action_rows_from_choices
 from .bc_policy import bc_forward, init_value_head, load_bc_jax_params, value_apply
@@ -31,7 +32,8 @@ class JaxPPOConfig:
     out_dir: str
     players: int = 4
     envs: int = 8
-    steps: int = 32
+    rollout_steps: int = 32
+    episode_steps: int = 500
     updates: int = 1
     opponent: str = "jax_proxy"
     eval_heuristic_path: str = "orbit_wars_base.py"
@@ -48,6 +50,9 @@ class JaxPPOConfig:
     max_grad_norm: float = 0.5
     freeze_bc_steps: int = 0
     save_interval_updates: int = 5
+    enable_comets: bool = False
+    initial_state_bank: str | None = None
+    state_bank_mode: str = "random"
 
 
 def _append_jsonl(path: Path, row: dict[str, Any]) -> None:
@@ -127,7 +132,7 @@ def _learner_act(params, state, key, config: dict[str, Any]):
     return rows, logprob, value, entropy, target_idx, amount_idx, features
 
 
-def _compute_gae(rewards, values, dones, gamma: float, lam: float):
+def _compute_gae(rewards, values, dones, last_values, gamma: float, lam: float):
     def body(carry, x):
         next_adv, next_value = carry
         reward, value, done = x
@@ -138,23 +143,59 @@ def _compute_gae(rewards, values, dones, gamma: float, lam: float):
 
     _carry, adv_rev = jax.lax.scan(
         body,
-        (jnp.zeros_like(values[0]), jnp.zeros_like(values[0])),
+        (jnp.zeros_like(last_values), last_values),
         (rewards[::-1], values[::-1], dones[::-1]),
     )
     adv = adv_rev[::-1]
     return adv, adv + values
 
 
-def _make_update(config: JaxPPOConfig, bc_config: dict[str, Any]):
-    env_config = EnvConfig(num_players=int(config.players), episode_steps=int(config.steps))
-    seats = jnp.arange(MAX_PLAYERS)
+def _value_for_state(params, state, config: dict[str, Any]):
+    features = build_bc_features_for_seat(state, 0)
+    out = bc_forward(params["bc"], _source_batch(features), config)
+    return value_apply(params["value"], out["global_ctx"][0])
 
-    def rollout(params, key):
-        reset_keys = jax.random.split(key, int(config.envs))
-        states = jax.vmap(lambda k: reset(k, env_config))(reset_keys)
 
+def _where_state(mask: jnp.ndarray, replacement: EnvState, original: EnvState) -> EnvState:
+    def choose(a, b):
+        shaped = mask.reshape((mask.shape[0],) + (1,) * (a.ndim - 1))
+        return jnp.where(shaped, a, b)
+
+    return jax.tree_util.tree_map(choose, replacement, original)
+
+
+def _make_update(config: JaxPPOConfig, bc_config: dict[str, Any], state_bank: EnvState | None = None):
+    env_config = EnvConfig(
+        num_players=int(config.players),
+        episode_steps=int(config.episode_steps),
+        enable_comets=bool(config.enable_comets),
+    )
+    bank_mode = str(config.state_bank_mode)
+
+    def reset_many(keys, done_mask, next_states, cycle_index):
+        if state_bank is None:
+            reset_states = jax.vmap(lambda k: reset(k, env_config))(keys)
+            next_cycle_index = cycle_index
+        elif bank_mode == "random":
+            bank_size = state_bank.step.shape[0]
+            idx = jax.random.randint(keys[0], (int(config.envs),), 0, bank_size)
+            reset_states = jax.tree_util.tree_map(lambda x: x[idx], state_bank)
+            next_cycle_index = cycle_index
+        else:
+            bank_size = state_bank.step.shape[0]
+            done_int = done_mask.astype(jnp.int32)
+            ranks = jnp.cumsum(done_int) - 1
+            idx = jnp.mod(cycle_index + ranks, bank_size)
+            reset_states = jax.tree_util.tree_map(lambda x: x[idx], state_bank)
+            next_cycle_index = cycle_index + jnp.sum(done_int)
+        return _where_state(done_mask, reset_states, next_states), next_cycle_index
+
+    def rollout(params, key, states, cycle_index):
         def scan_body(carry, step_key):
-            action_keys = jax.random.split(step_key, int(config.envs))
+            carry_states, carry_cycle_index = carry
+            action_key, reset_key = jax.random.split(step_key)
+            action_keys = jax.random.split(action_key, int(config.envs))
+            reset_keys = jax.random.split(reset_key, int(config.envs))
 
             def one_env(state, k):
                 rows0, lp, val, ent, ti, ai, feats = _learner_act(params, state, k, bc_config)
@@ -163,7 +204,6 @@ def _make_update(config: JaxPPOConfig, bc_config: dict[str, Any]):
                 actions = proxy.at[0].set(rows0)
                 next_state, _next_obs, rewards, done, info = step(state, actions)
                 source_active = feats.target_mask[:, NOOP_TARGET_SLOT]
-                invalid = jnp.asarray(0.0, dtype=jnp.float32)
                 store = {
                     "planet_features": feats.planet_features,
                     "global_features": feats.global_features,
@@ -178,22 +218,37 @@ def _make_update(config: JaxPPOConfig, bc_config: dict[str, Any]):
                     "entropy": ent,
                     "reward": rewards[0],
                     "done": done.astype(jnp.float32),
-                    "invalid": invalid,
+                    "submitted_action_count": info["submitted_action_count"].astype(jnp.float32),
+                    "valid_action_count": info["valid_action_count"].astype(jnp.float32),
+                    "invalid_action_count": info["invalid_action_count"].astype(jnp.float32),
+                    "invalid_source_id_count": info["invalid_source_id_count"].astype(jnp.float32),
+                    "invalid_inactive_player_id_count": info["invalid_inactive_player_id_count"].astype(jnp.float32),
+                    "invalid_source_not_owned_count": info["invalid_source_not_owned_count"].astype(jnp.float32),
+                    "invalid_non_positive_ship_amount_count": info["invalid_non_positive_ship_amount_count"].astype(jnp.float32),
+                    "invalid_unaffordable_source_total_count": info["invalid_unaffordable_source_total_count"].astype(jnp.float32),
+                    "invalid_no_free_fleet_slot_count": info["invalid_no_free_fleet_slot_count"].astype(jnp.float32),
+                    "episode_step": next_state.step.astype(jnp.float32),
                     "rank": info["ranks"][0],
                 }
                 return next_state, store
 
-            next_states, stores = jax.vmap(one_env)(carry, action_keys)
-            return next_states, stores
+            stepped_states, stores = jax.vmap(one_env)(carry_states, action_keys)
+            done_mask = stores["done"].astype(jnp.bool_)
+            next_carry_states, next_cycle_index = reset_many(reset_keys, done_mask, stepped_states, carry_cycle_index)
+            return (next_carry_states, next_cycle_index), stores
 
-        _states, traj = jax.lax.scan(scan_body, states, jax.random.split(key, int(config.steps)))
-        return traj
+        (final_states, final_cycle_index), traj = jax.lax.scan(
+            scan_body,
+            (states, cycle_index),
+            jax.random.split(key, int(config.rollout_steps)),
+        )
+        return traj, final_states, final_cycle_index
 
-    def loss_fn(params, traj):
+    def loss_fn(params, traj, last_values):
         rewards = traj["reward"]
         values = traj["value"]
         dones = traj["done"]
-        adv, returns = _compute_gae(rewards, values, dones, float(config.gamma), float(config.lam))
+        adv, returns = _compute_gae(rewards, values, dones, last_values, float(config.gamma), float(config.lam))
         adv = (adv - jnp.mean(adv)) / (jnp.std(adv) + 1.0e-8)
 
         def one_eval(pf, gf, tsf, pair, tm, am, ti, ai):
@@ -225,16 +280,34 @@ def _make_update(config: JaxPPOConfig, bc_config: dict[str, Any]):
             "mean_reward": jnp.mean(rewards),
             "mean_return": jnp.mean(returns),
             "clip_dev": jnp.mean(jnp.abs(ratio - 1.0)),
-            "invalid_action_count": jnp.sum(traj["invalid"]),
+            "submitted_action_count": jnp.sum(traj["submitted_action_count"]),
+            "valid_action_count": jnp.sum(traj["valid_action_count"]),
+            "invalid_action_count": jnp.sum(traj["invalid_action_count"]),
+            "invalid_source_id_count": jnp.sum(traj["invalid_source_id_count"]),
+            "invalid_inactive_player_id_count": jnp.sum(traj["invalid_inactive_player_id_count"]),
+            "invalid_source_not_owned_count": jnp.sum(traj["invalid_source_not_owned_count"]),
+            "invalid_non_positive_ship_amount_count": jnp.sum(traj["invalid_non_positive_ship_amount_count"]),
+            "invalid_unaffordable_source_total_count": jnp.sum(traj["invalid_unaffordable_source_total_count"]),
+            "invalid_no_free_fleet_slot_count": jnp.sum(traj["invalid_no_free_fleet_slot_count"]),
+            "invalid_action_rate": jnp.where(
+                jnp.sum(traj["submitted_action_count"]) > 0.0,
+                jnp.sum(traj["invalid_action_count"]) / jnp.sum(traj["submitted_action_count"]),
+                0.0,
+            ),
+            "done_rate": jnp.mean(dones),
+            "reset_count": jnp.sum(dones),
+            "mean_episode_step": jnp.mean(traj["episode_step"][-1]),
+            "max_episode_step": jnp.max(traj["episode_step"][-1]),
             "decisions": jnp.sum(traj["target_mask"][:, :, :, NOOP_TARGET_SLOT].astype(jnp.float32)),
         }
         return loss, metrics
 
-    def update(params, opt_state, key, update_index):
-        traj = rollout(params, key)
+    def update(params, opt_state, key, states, cycle_index, update_index):
+        traj, next_states, next_cycle_index = rollout(params, key, states, cycle_index)
+        last_values = jax.vmap(lambda s: _value_for_state(params, s, bc_config))(next_states)
 
         def wrapped_loss(p):
-            return loss_fn(p, traj)
+            return loss_fn(p, traj, last_values)
 
         (loss, metrics), grads = jax.value_and_grad(wrapped_loss, has_aux=True)(params)
         grads = jax.lax.cond(
@@ -246,46 +319,121 @@ def _make_update(config: JaxPPOConfig, bc_config: dict[str, Any]):
         updates, opt_state2 = optimizer.update(grads, opt_state, params)
         params2 = optax.apply_updates(params, updates)
         metrics = {**metrics, "loss": loss}
-        return params2, opt_state2, metrics
+        return params2, opt_state2, next_states, next_cycle_index, metrics
 
     optimizer = optax.chain(optax.clip_by_global_norm(float(config.max_grad_norm)), optax.adam(float(config.lr)))
     return jax.jit(update), optimizer
+
+
+def _initial_vector_states(config: JaxPPOConfig, key, env_config: EnvConfig, state_bank: EnvState | None):
+    if state_bank is None:
+        reset_keys = jax.random.split(key, int(config.envs))
+        return jax.vmap(lambda k: reset(k, env_config))(reset_keys), jnp.array(0, dtype=jnp.int32)
+    bank_size = state_bank.step.shape[0]
+    if config.state_bank_mode == "random":
+        idx = jax.random.randint(key, (int(config.envs),), 0, bank_size)
+        cycle_index = jnp.array(0, dtype=jnp.int32)
+    else:
+        idx = jnp.mod(jnp.arange(int(config.envs), dtype=jnp.int32), bank_size)
+        cycle_index = jnp.array(int(config.envs), dtype=jnp.int32)
+    return jax.tree_util.tree_map(lambda x: x[idx], state_bank), cycle_index
 
 
 def train(config: JaxPPOConfig) -> dict[str, Any]:
     runtime = _check_runtime(config.require_cuda)
     if config.opponent != "jax_proxy":
         raise RuntimeError("orbit_ppo_jax.train currently supports --opponent jax_proxy")
+    if config.state_bank_mode not in {"cycle", "random"}:
+        raise RuntimeError("--state_bank_mode must be either cycle or random")
+
+    state_bank = None
+    state_bank_metadata: dict[str, Any] = {}
+    state_bank_warning = False
+    if config.initial_state_bank:
+        from orbit_jax_env.official_state_dataset import apply_runtime_config, has_imported_comet_paths, load_state_bank
+
+        loaded_bank, state_bank_metadata = load_state_bank(config.initial_state_bank)
+        if int(state_bank_metadata.get("players", config.players)) != int(config.players):
+            raise RuntimeError(
+                f"state bank players={state_bank_metadata.get('players')} does not match trainer players={config.players}"
+            )
+        state_bank_warning = int(state_bank_metadata.get("episode_steps", config.episode_steps)) != int(config.episode_steps)
+        state_bank = apply_runtime_config(
+            loaded_bank,
+            players=int(config.players),
+            episode_steps=int(config.episode_steps),
+        )
+        bank_has_imported_comets = has_imported_comet_paths(state_bank)
+    else:
+        bank_has_imported_comets = False
+
+    reset_source = "official_state_bank" if state_bank is not None else "jax_reset"
+    if bank_has_imported_comets:
+        comet_mode = "official_imported"
+    elif config.enable_comets:
+        comet_mode = "jax_approx"
+    else:
+        comet_mode = "disabled"
+    comet_warning = bool(config.enable_comets and comet_mode == "jax_approx")
+
     out_dir = Path(config.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    saved_config = {
+        **asdict(config),
+        **runtime,
+        "reset_source": reset_source,
+        "state_bank_metadata": state_bank_metadata,
+        "state_bank_episode_steps_overridden": state_bank_warning,
+        "comet_warning": comet_warning,
+        "comet_mode": comet_mode,
+    }
     with open(out_dir / "config.json", "w", encoding="utf-8") as f:
-        json.dump({**asdict(config), **runtime}, f, indent=2, sort_keys=True)
+        json.dump(saved_config, f, indent=2, sort_keys=True)
 
     bc_params, bc_config = load_bc_jax_params(config.bc_checkpoint)
     key = jax.random.PRNGKey(int(config.seed))
     key, value_key = jax.random.split(key)
     params = {"bc": bc_params, "value": init_value_head(value_key, int(bc_config["hidden_size"]))}
-    update_fn, optimizer = _make_update(config, bc_config)
+    update_fn, optimizer = _make_update(config, bc_config, state_bank)
     opt_state = optimizer.init(params)
+    env_config = EnvConfig(
+        num_players=int(config.players),
+        episode_steps=int(config.episode_steps),
+        enable_comets=bool(config.enable_comets),
+    )
+    key, reset_key = jax.random.split(key)
+    states, state_bank_cycle_index = _initial_vector_states(config, reset_key, env_config, state_bank)
     best_score = -1.0e9
     last_metrics: dict[str, Any] = {}
 
     for update_index in range(1, int(config.updates) + 1):
         key, step_key = jax.random.split(key)
         t0 = time.time()
-        params, opt_state, metrics_jax = update_fn(params, opt_state, step_key, jnp.asarray(update_index, dtype=jnp.int32))
+        params, opt_state, states, state_bank_cycle_index, metrics_jax = update_fn(
+            params,
+            opt_state,
+            step_key,
+            states,
+            state_bank_cycle_index,
+            jnp.asarray(update_index, dtype=jnp.int32),
+        )
         jax.block_until_ready(params)
         seconds = time.time() - t0
-        update_env_steps = int(config.envs) * int(config.steps)
+        update_env_steps = int(config.envs) * int(config.rollout_steps)
         env_steps = update_index * update_env_steps
         metrics = {k: float(v) for k, v in metrics_jax.items()}
         metrics.update(
             {
                 "update": update_index,
+                "rollout_steps": int(config.rollout_steps),
+                "episode_steps": int(config.episode_steps),
                 "seconds": seconds,
                 "update_env_steps": update_env_steps,
                 "env_steps": env_steps,
                 "steps_per_second": float(update_env_steps / seconds) if seconds > 0.0 else 0.0,
+                "reset_source": reset_source,
+                "comet_warning": comet_warning,
+                "comet_mode": comet_mode,
                 **runtime,
             }
         )
@@ -293,23 +441,31 @@ def train(config: JaxPPOConfig) -> dict[str, Any]:
             raise RuntimeError(f"non-finite JAX PPO metrics at update {update_index}: {metrics}")
         _append_jsonl(out_dir / "metrics.jsonl", metrics)
         print(json.dumps(metrics, sort_keys=True), flush=True)
-        save_jax_checkpoint(out_dir / "latest", params, {**asdict(config), "bc_model_config": bc_config, **runtime}, metrics)
+        checkpoint_config = {**saved_config, "bc_model_config": bc_config}
+        save_jax_checkpoint(out_dir / "latest", params, checkpoint_config, metrics)
         if update_index == 1 or update_index % int(config.save_interval_updates) == 0:
-            save_jax_checkpoint(out_dir / "checkpoints" / f"update_{update_index:05d}", params, {**asdict(config), "bc_model_config": bc_config, **runtime}, metrics)
+            save_jax_checkpoint(out_dir / "checkpoints" / f"update_{update_index:05d}", params, checkpoint_config, metrics)
 
         score = float(metrics["mean_reward"])
         if int(config.eval_games) > 0 and (update_index == 1 or update_index % int(config.eval_interval_updates) == 0):
             from .eval_vs_heuristic import evaluate
 
-            eval_summary = evaluate(out_dir / "latest", config.eval_heuristic_path, games=int(config.eval_games), players=int(config.players), out_dir=out_dir / "eval")
+            eval_summary = evaluate(
+                out_dir / "latest",
+                config.eval_heuristic_path,
+                games=int(config.eval_games),
+                players=int(config.players),
+                out_dir=out_dir / "eval",
+                episode_steps=int(config.episode_steps),
+            )
             with open(out_dir / "eval_summary.json", "w", encoding="utf-8") as f:
                 json.dump(eval_summary, f, indent=2, sort_keys=True)
             score = float(eval_summary.get("average_final_reward", score))
             metrics.update({f"eval_{k}": v for k, v in eval_summary.items() if isinstance(v, (int, float))})
         if score > best_score:
             best_score = score
-            save_jax_checkpoint(out_dir / "best", params, {**asdict(config), "bc_model_config": bc_config, **runtime}, metrics)
-        if metrics.get("invalid_action_count", 0.0) > float(config.envs * config.steps * P_MAX):
+            save_jax_checkpoint(out_dir / "best", params, checkpoint_config, metrics)
+        if metrics.get("invalid_action_count", 0.0) > float(config.envs * config.rollout_steps * P_MAX):
             break
         last_metrics = metrics
 
@@ -322,7 +478,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--out_dir", required=True)
     ap.add_argument("--players", type=int, default=4, choices=[2, 4])
     ap.add_argument("--envs", type=int, default=8)
-    ap.add_argument("--steps", type=int, default=32)
+    ap.add_argument("--steps", type=int, default=None, help="Legacy alias for --rollout_steps.")
+    ap.add_argument("--rollout_steps", type=int, default=None)
+    ap.add_argument("--episode_steps", type=int, default=500)
     ap.add_argument("--updates", type=int, default=1)
     ap.add_argument("--opponent", default="jax_proxy", choices=["jax_proxy"])
     ap.add_argument("--eval_heuristic_path", default="orbit_wars_base.py")
@@ -339,11 +497,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--max_grad_norm", type=float, default=0.5)
     ap.add_argument("--freeze_bc_steps", type=int, default=0)
     ap.add_argument("--save_interval_updates", type=int, default=5)
+    ap.add_argument("--enable_comets", action="store_true")
+    ap.add_argument("--initial_state_bank", default=None)
+    ap.add_argument("--state_bank_mode", default="random", choices=["cycle", "random"])
     return ap
 
 
 def config_from_args(args: argparse.Namespace) -> JaxPPOConfig:
-    return JaxPPOConfig(**vars(args))
+    values = vars(args).copy()
+    legacy_steps = values.pop("steps", None)
+    rollout_steps = values.get("rollout_steps")
+    values["rollout_steps"] = int(rollout_steps if rollout_steps is not None else (legacy_steps if legacy_steps is not None else 32))
+    return JaxPPOConfig(**values)
 
 
 def main(argv: list[str] | None = None) -> dict[str, Any] | None:

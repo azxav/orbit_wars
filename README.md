@@ -848,16 +848,59 @@ Run one short BC-initialized PPO update on GPU against the pure-JAX proxy oppone
 ```bash
 XLA_PYTHON_CLIENT_MEM_FRACTION=0.75 python -m orbit_ppo_jax.train \
   --require_cuda \
-  --bc_checkpoint bc_checkpoints/compact_bc_v1/best/checkpoint.pt \
-  --out_dir ppo_runs/jax_compact_bc_v1 \
+  --bc_checkpoint bc_checkpoints/lite_bc_v1_500/best/checkpoint.pt \
+  --out_dir ppo_runs/jax_compact_bc_v1_smoke \
   --opponent jax_proxy \
   --eval_heuristic_path orbit_wars_base.py \
   --players 4 \
   --envs 8 \
-  --steps 32 \
+  --rollout_steps 32 \
+  --episode_steps 500 \
   --updates 1 \
   --eval_games 2
 ```
+
+Longer training run:
+
+```bash
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.75 python -m orbit_ppo_jax.train \
+  --require_cuda \
+  --bc_checkpoint bc_checkpoints/lite_bc_v1_500/best/checkpoint.pt \
+  --out_dir ppo_runs/jax_compact_bc_v1 \
+  --opponent jax_proxy \
+  --eval_heuristic_path orbit_wars_base.py \
+  --players 4 \
+  --envs 32 \
+  --rollout_steps 128 \
+  --episode_steps 500 \
+  --updates 1000 \
+  --eval_games 20 \
+  --eval_interval_updates 25 \
+  --save_interval_updates 25
+```
+
+To train from official Kaggle initial maps instead of the synthetic JAX reset template, build a state bank and pass it to the trainer:
+
+```bash
+python -m orbit_jax_env.build_official_state_bank \
+  --out data/official_state_bank_4p.npz \
+  --players 4 \
+  --seeds 0:1024
+```
+
+```bash
+python -m orbit_ppo_jax.train \
+  --bc_checkpoint bc_checkpoints/lite_bc_v1_500/best/checkpoint.pt \
+  --out_dir ppo_runs/jax_compact_bc_v1 \
+  --opponent jax_proxy \
+  --players 4 \
+  --initial_state_bank data/official_state_bank_4p.npz \
+  --state_bank_mode random \
+  --rollout_steps 128 \
+  --episode_steps 500
+```
+
+`--steps` remains accepted as a legacy alias for `--rollout_steps`, but new runs should use `--rollout_steps` and `--episode_steps` explicitly. `--enable_comets` uses the approximate JAX-native comet schedule unless states were imported with official comet path metadata; runs record `comet_mode` and `comet_warning` in config and metrics.
 
 Evaluate a saved JAX PPO checkpoint against the real heuristic:
 
@@ -867,6 +910,7 @@ python -m orbit_ppo_jax.eval_vs_heuristic \
   --heuristic_path orbit_wars_base.py \
   --games 4 \
   --players 4 \
+  --episode_steps 500 \
   --out_dir ppo_eval_runs/jax_compact_bc_v1
 ```
 

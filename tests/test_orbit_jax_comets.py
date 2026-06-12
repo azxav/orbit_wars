@@ -34,6 +34,40 @@ def test_state_from_official_comet_observation_steps_comet_paths() -> None:
         )
 
 
+def test_state_from_observation_preserves_imported_comet_metadata() -> None:
+    from orbit_jax_env.state import state_from_observation
+
+    obs = {
+        "step": 50,
+        "planets": [
+            [100, -1, 10.0, 20.0, 1.0, 3.0, 1.0],
+            [101, 0, 30.0, 40.0, 2.0, 10.0, 2.0],
+        ],
+        "initial_planets": [
+            [100, -1, 10.0, 20.0, 1.0, 3.0, 1.0],
+            [101, 0, 30.0, 40.0, 2.0, 10.0, 2.0],
+        ],
+        "fleets": [],
+        "comet_planet_ids": [100],
+        "comets": [
+            {
+                "path_index": 3,
+                "planet_ids": [100],
+                "paths": [[[10.0, 20.0], [11.0, 21.0], [12.0, 22.0], [13.0, 23.0]]],
+            }
+        ],
+    }
+
+    state = state_from_observation(obs, num_players=2, episode_steps=500)
+
+    assert bool(state.planet_is_comet[0]) is True
+    assert bool(state.planet_is_comet[1]) is False
+    assert int(state.comet_path_index[0]) == 3
+    assert int(state.comet_path_len[0]) == 4
+    np.testing.assert_allclose(np.asarray(state.comet_path_x[0, :4]), np.asarray([10.0, 11.0, 12.0, 13.0], dtype=np.float32))
+    np.testing.assert_allclose(np.asarray(state.comet_path_y[0, :4]), np.asarray([20.0, 21.0, 22.0, 23.0], dtype=np.float32))
+
+
 def test_imported_comet_movement_parity_case_passes() -> None:
     from orbit_jax_env.parity.compare_official import run_parity_case
 
