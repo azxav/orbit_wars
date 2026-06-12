@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
+from orbit_training_prep import dataset_builder
 from orbit_training_prep.dataset_builder import DatasetBuilder, _balance_source_turn_dataset, _select_balanced_replay_paths
 from orbit_training_prep.features import PAIR_FEATURE_NAMES
 from orbit_training_prep.schema import AMOUNT_BIN_ALL, AMOUNT_BIN_CAPTURE, NOOP_TARGET_SLOT
@@ -154,6 +155,51 @@ class DatasetBuilderMultipleReplaysTest(unittest.TestCase):
             self.assertEqual(report["selected_player_counts"], {"2": 2, "4": 2})
             self.assertFalse(report["infeasible"])
 
+    def test_balanced_replay_selection_profiles_with_worker_pool(self) -> None:
+        class ImmediateFuture:
+            def __init__(self, value: int):
+                self.value = value
+
+            def result(self) -> int:
+                return self.value
+
+        class RecordingPool:
+            max_workers_seen: int | None = None
+
+            def __init__(self, *, max_workers: int):
+                RecordingPool.max_workers_seen = int(max_workers)
+
+            def __enter__(self) -> "RecordingPool":
+                return self
+
+            def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+                return None
+
+            def submit(self, fn, path: Path) -> ImmediateFuture:
+                return ImmediateFuture(2 if path.name.startswith("two") else 4)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = [root / "two.json", root / "four.json"]
+            for path in paths:
+                path.write_text("{}", encoding="utf-8")
+
+            original_pool = dataset_builder.ThreadPoolExecutor
+            try:
+                dataset_builder.ThreadPoolExecutor = RecordingPool  # type: ignore[assignment]
+                selected, report = _select_balanced_replay_paths(
+                    paths,
+                    max_files=None,
+                    balance_seed=7,
+                    profile_workers=3,
+                )
+            finally:
+                dataset_builder.ThreadPoolExecutor = original_pool  # type: ignore[assignment]
+
+            self.assertEqual(selected, paths)
+            self.assertEqual(report["selected_player_counts"], {"2": 1, "4": 1})
+            self.assertEqual(RecordingPool.max_workers_seen, 2)
+
     def test_balanced_replay_selection_records_infeasible_unequal_pool(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -238,6 +284,13 @@ class DatasetBuilderMultipleReplaysTest(unittest.TestCase):
             self.assertEqual(balanced["sample_count"], 5)
             self.assertEqual(balanced["proportion_correction"]["sample_balance"]["selected"]["noop"], 5)
             self.assertTrue(balanced["proportion_correction"]["sample_balance"]["infeasible"])
+
+    def test_cli_ratio_defaults_match_noop_op_target(self) -> None:
+        parser = dataset_builder.build_arg_parser()
+        args = parser.parse_args(["--replay", "replays", "--out-dir", "out"])
+
+        self.assertEqual(args.noop_ratio, 0.40)
+        self.assertEqual(args.op_ratio, 0.60)
 
     def test_skips_invalid_json_replay_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

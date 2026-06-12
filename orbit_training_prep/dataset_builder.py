@@ -8,7 +8,7 @@ import multiprocessing as mp
 import shutil
 import sys
 from collections import Counter, defaultdict
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -115,6 +115,7 @@ def _select_balanced_replay_paths(
     *,
     max_files: int | None,
     balance_seed: int,
+    profile_workers: int = 1,
 ) -> tuple[list[Path], dict[str, Any]]:
     paths = list(replay_paths)
     limit = len(paths) if max_files is None else min(int(max_files), len(paths))
@@ -128,9 +129,13 @@ def _select_balanced_replay_paths(
             "shortfall": 0,
         }
 
-    profiles: list[tuple[int, Path, int | None]] = [
-        (i, path, _profile_replay_player_count(path)) for i, path in enumerate(paths)
-    ]
+    worker_count = min(max(1, int(profile_workers)), len(paths))
+    if worker_count > 1:
+        with ThreadPoolExecutor(max_workers=worker_count) as pool:
+            futures = [pool.submit(_profile_replay_player_count, path) for path in paths]
+            profiles = [(i, path, future.result()) for i, (path, future) in enumerate(zip(paths, futures, strict=True))]
+    else:
+        profiles = [(i, path, _profile_replay_player_count(path)) for i, path in enumerate(paths)]
     observed = Counter(player_count if player_count is not None else "unknown" for _, _, player_count in profiles)
     by_players: dict[int, list[tuple[int, Path]]] = {2: [], 4: []}
     other: list[tuple[int, Path]] = []
@@ -777,6 +782,7 @@ class DatasetBuilder:
                 requested_replay_paths,
                 max_files=self.max_replay_files,
                 balance_seed=self.balance_seed,
+                profile_workers=self.workers,
             )
         else:
             replay_paths = resolve_replay_paths(replay_input, self.max_replay_files)
@@ -1114,7 +1120,7 @@ class DatasetBuilder:
         return finalized
 
 
-def main() -> None:
+def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
     ap.add_argument("--replay", required=True, help="Replay JSON file or directory containing replay JSON files.")
     ap.add_argument("--out-dir", required=True)
@@ -1129,9 +1135,13 @@ def main() -> None:
     ap.add_argument("--no-canonicalize-perspective", action="store_true", help="Disable player-perspective canonicalization. Not recommended for BC/PPO because it can reintroduce map/seat bias.")
     ap.add_argument("--no-balance-proportions", action="store_true", help="Disable default replay and source-turn proportion correction.")
     ap.add_argument("--balance-seed", type=int, default=42, help="Seed for deterministic replay/sample downsampling.")
-    ap.add_argument("--noop-ratio", type=float, default=0.6, help="Requested final noop source-turn ratio before normalization.")
-    ap.add_argument("--op-ratio", type=float, default=0.4, help="Requested final non-noop source-turn ratio before normalization.")
-    args = ap.parse_args()
+    ap.add_argument("--noop-ratio", type=float, default=0.40, help="Requested final noop source-turn ratio before normalization.")
+    ap.add_argument("--op-ratio", type=float, default=0.60, help="Requested final non-noop source-turn ratio before normalization.")
+    return ap
+
+
+def main() -> None:
+    args = build_arg_parser().parse_args()
     builder = DatasetBuilder(
         horizon=args.horizon,
         device=args.device,
