@@ -85,6 +85,43 @@ Canonicalization is enabled by default. Only disable it for legacy comparisons:
 --no-canonicalize-perspective
 ```
 
+### Proportion correction, default
+
+The dataset builder also applies proportion correction by default to reduce replay and source-turn label bias:
+
+```text
+2-player / 4-player replay mix: target 50 / 50
+noop / op source-turn rows: target 40 / 60
+fleet amount bins: automatic square-root-smoothed balancing over non-noop rows
+```
+
+Replay balancing happens before worker sharding. Source-turn balancing happens after the final `samples/*.npy` dataset is materialized, so serial and parallel builds use the same global quotas. If the requested ratios are impossible because one class is missing or rare, the builder keeps the closest feasible deterministic subset and records the shortfall in `metadata.json`.
+
+The relevant metadata is under:
+
+```text
+proportion_correction
+proportion_correction.replay_selection
+proportion_correction.sample_balance
+proportion_correction.unbalanced_stats
+```
+
+The final top-level `sample_count`, `amount_bin_counts`, and `stats.source_turn_rows` describe the train-ready filtered dataset. Pre-filter counts are preserved in `proportion_correction.unbalanced_stats`.
+
+Use the default correction for normal training datasets. Disable it only for raw-distribution audits or legacy comparisons:
+
+```bash
+--no-balance-proportions
+```
+
+Deterministic balancing can be controlled with:
+
+```bash
+--balance-seed 42
+--noop-ratio 0.40
+--op-ratio 0.60
+```
+
 Parallel replay-level building is now supported with `--workers N`. Each worker builds a compact source-turn shard, then the main process merges `states/*.npy` and `samples/*.npy` while correcting `samples/state_index.npy` offsets. CUDA exact builds still fall back to serial to avoid multiple GPU contexts.
 
 ---
@@ -291,6 +328,8 @@ python -m orbit_training_prep.dataset_builder \
 
 This is the default high-throughput path. It uses movement-cache heuristics from `orbit_lite`, avoids exact first-hit simulation during dataset construction, and parallelizes across replay files when `--workers > 1`.
 
+It also applies the default anti-bias proportion correction. The output dataset is already filtered to the selected 2P/4P replay mix, noop/op ratio, and softened amount-bin distribution.
+
 For a 128 GB RAM CPU build machine, start with `--workers 16`; increase toward 20-24 only if CPU utilization and disk throughput remain healthy. Keep `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, and `TORCH_NUM_THREADS` at `1` so workers do not oversubscribe CPU threads.
 
 Legacy comparison build without canonicalization:
@@ -327,6 +366,41 @@ python -m orbit_training_prep.dataset_builder \
 ```
 
 Use this only to compare old seat/map-biased behavior against the default canonicalized dataset.
+
+Raw-distribution build without proportion correction:
+
+PowerShell:
+
+```powershell
+python -m orbit_training_prep.dataset_builder `
+  --replay .\replays `
+  --out-dir .\orbit_dataset_work\combined_lite_unbalanced `
+  --horizon 160 `
+  --device cpu `
+  --batch-size 256 `
+  --backend lite `
+  --workers 16 `
+  --no-balance-proportions
+```
+
+Ubuntu / Bash:
+
+```bash
+OMP_NUM_THREADS=1 \
+MKL_NUM_THREADS=1 \
+TORCH_NUM_THREADS=1 \
+python -m orbit_training_prep.dataset_builder \
+  --replay ./replays \
+  --out-dir ./orbit_dataset_work/combined_lite_unbalanced \
+  --horizon 160 \
+  --device cpu \
+  --batch-size 256 \
+  --backend lite \
+  --workers 16 \
+  --no-balance-proportions
+```
+
+Use this only when you need to inspect the original replay/source-turn distribution.
 
 Optional: build a small exact audit dataset:
 
@@ -974,7 +1048,8 @@ actual_returned_move_count
 3. Rebuild datasets after changing feature names or dimensions.
 4. Do not add fallback support for `dense_bc_arrays.npz`.
 5. Keep player-perspective canonicalization shared across dataset building, live BC runtime, and PPO rollout collection.
-6. Use local gameplay evaluation before trusting checkpoint quality.
+6. Keep default proportion correction deterministic and recorded in dataset metadata.
+7. Use local gameplay evaluation before trusting checkpoint quality.
 
 ---
 

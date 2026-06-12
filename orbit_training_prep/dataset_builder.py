@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import multiprocessing as mp
@@ -77,6 +78,120 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
             if line.strip():
                 rows.append(json.loads(line))
     return rows
+
+
+def _stable_hash_int(seed: int, *parts: Any) -> int:
+    h = hashlib.blake2b(digest_size=8)
+    h.update(str(int(seed)).encode("utf-8"))
+    for part in parts:
+        h.update(b"\0")
+        h.update(str(part).encode("utf-8", errors="replace"))
+    return int.from_bytes(h.digest(), "big", signed=False)
+
+
+def _replay_player_count(replay: dict[str, Any]) -> int | None:
+    rewards = replay.get("rewards")
+    if isinstance(rewards, list) and rewards:
+        return int(len(rewards))
+    steps = replay.get("steps")
+    if isinstance(steps, list) and steps and isinstance(steps[0], list) and steps[0]:
+        return int(len(steps[0]))
+    return None
+
+
+def _profile_replay_player_count(path: Path) -> int | None:
+    try:
+        return _replay_player_count(load_replay(path))
+    except Exception:
+        return None
+
+
+def _str_counter(counter: Counter[Any]) -> dict[str, int]:
+    return {str(k): int(v) for k, v in sorted(counter.items(), key=lambda kv: str(kv[0]))}
+
+
+def _select_balanced_replay_paths(
+    replay_paths: list[Path],
+    *,
+    max_files: int | None,
+    balance_seed: int,
+) -> tuple[list[Path], dict[str, Any]]:
+    paths = list(replay_paths)
+    limit = len(paths) if max_files is None else min(int(max_files), len(paths))
+    if limit <= 0 or not paths:
+        return [], {
+            "requested": len(paths),
+            "limit": int(limit),
+            "observed_player_counts": {},
+            "selected_player_counts": {},
+            "infeasible": False,
+            "shortfall": 0,
+        }
+
+    profiles: list[tuple[int, Path, int | None]] = [
+        (i, path, _profile_replay_player_count(path)) for i, path in enumerate(paths)
+    ]
+    observed = Counter(player_count if player_count is not None else "unknown" for _, _, player_count in profiles)
+    by_players: dict[int, list[tuple[int, Path]]] = {2: [], 4: []}
+    other: list[tuple[int, Path]] = []
+    for original_index, path, player_count in profiles:
+        if player_count in by_players:
+            by_players[int(player_count)].append((original_index, path))
+        else:
+            other.append((original_index, path))
+
+    def ranked(items: list[tuple[int, Path]]) -> list[tuple[int, Path]]:
+        return sorted(items, key=lambda x: (_stable_hash_int(balance_seed, x[1]), x[0]))
+
+    selected_pairs: list[tuple[int, Path]] = []
+    infeasible = False
+    if by_players[2] and by_players[4]:
+        best: tuple[float, int, int, int] | None = None
+        for n2 in range(1, min(len(by_players[2]), limit) + 1):
+            for n4 in range(1, min(len(by_players[4]), limit - n2) + 1):
+                total = n2 + n4
+                ratio_error = abs((n2 / float(total)) - 0.5)
+                candidate = (ratio_error, -total, n2, n4)
+                if best is None or candidate < best:
+                    best = candidate
+        if best is None:
+            infeasible = True
+            ranked_known = ranked(by_players[2] + by_players[4])
+            selected_pairs.extend(ranked_known[:limit])
+        else:
+            _, neg_total, n2, n4 = best
+            selected_pairs.extend(ranked(by_players[2])[:n2])
+            selected_pairs.extend(ranked(by_players[4])[:n4])
+            infeasible = int(-neg_total) < min(limit, len(by_players[2]) + len(by_players[4]))
+    elif by_players[2] or by_players[4]:
+        infeasible = True
+        selected_pairs.extend(ranked(by_players[2] + by_players[4])[:limit])
+    else:
+        selected_pairs.extend(other[:limit])
+
+    selected_indexes = {idx for idx, _ in selected_pairs}
+    remaining = [item for item in ranked(other) if item[0] not in selected_indexes]
+    if len(selected_pairs) < limit and not (by_players[2] and by_players[4]):
+        selected_pairs.extend(remaining[: limit - len(selected_pairs)])
+
+    selected_pairs = sorted(selected_pairs, key=lambda x: x[0])
+    selected = [path for _, path in selected_pairs]
+    selected_profile = Counter()
+    for _, path in selected_pairs:
+        player_count = next((pc for i, p, pc in profiles if p == path), None)
+        selected_profile[player_count if player_count is not None else "unknown"] += 1
+    shortfall = int(limit - len(selected))
+    report = {
+        "requested": len(paths),
+        "limit": int(limit),
+        "observed_player_counts": _str_counter(observed),
+        "selected_player_counts": _str_counter(selected_profile),
+        "selected": len(selected),
+        "infeasible": bool(infeasible or shortfall > 0),
+        "shortfall": shortfall,
+        "target_player_mix": {"2": 0.5, "4": 0.5},
+    }
+    return selected, report
 
 
 class JsonlWriter:
@@ -177,6 +292,7 @@ def _build_single_replay_shard(
         write_debug_jsonl=write_debug_jsonl,
         backend=backend,
         canonicalize_perspective=canonicalize_perspective,
+        balance_proportions=False,
     )
     return builder.build_from_replay(replay_path, out_dir)
 
@@ -238,6 +354,214 @@ def _sample_weight(row: dict[str, Any]) -> float:
     return float(weight)
 
 
+def _sample_hash_order(arrays: dict[str, np.ndarray], seed: int, indexes: np.ndarray) -> list[int]:
+    return sorted(
+        (int(i) for i in indexes.tolist()),
+        key=lambda i: _stable_hash_int(
+            seed,
+            i,
+            int(arrays["state_index"][i]),
+            int(arrays["source_slot"][i]),
+            int(arrays["target_label"][i]),
+            int(arrays["amount_label"][i]),
+            int(arrays["step"][i]),
+        ),
+    )
+
+
+def _allocate_amount_quotas(amount_counts: Counter[int], total: int) -> dict[int, int]:
+    if total <= 0 or not amount_counts:
+        return {}
+    bins = sorted(int(b) for b, count in amount_counts.items() if int(b) != 0 and int(count) > 0)
+    if not bins:
+        return {}
+    weights = {b: math.sqrt(float(amount_counts[b])) for b in bins}
+    weight_sum = sum(weights.values())
+    raw = {b: (float(total) * weights[b] / weight_sum) for b in bins}
+    quotas = {b: min(int(amount_counts[b]), int(math.floor(raw[b]))) for b in bins}
+    assigned = sum(quotas.values())
+
+    if total >= len(bins):
+        for b in bins:
+            if assigned >= total:
+                break
+            if quotas[b] == 0:
+                quotas[b] = 1
+                assigned += 1
+
+    while assigned < total:
+        candidates = [b for b in bins if quotas[b] < int(amount_counts[b])]
+        if not candidates:
+            break
+        b = max(candidates, key=lambda x: (raw[x] - quotas[x], int(amount_counts[x]) - quotas[x], -x))
+        quotas[b] += 1
+        assigned += 1
+    return {b: int(q) for b, q in quotas.items() if int(q) > 0}
+
+
+def _select_balanced_sample_indexes(
+    arrays: dict[str, np.ndarray],
+    *,
+    balance_seed: int,
+    noop_ratio: float,
+    op_ratio: float,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    target_label = np.asarray(arrays["target_label"])
+    amount_label = np.asarray(arrays["amount_label"])
+    all_count = int(target_label.shape[0])
+    noop_indexes = np.flatnonzero(target_label == NOOP_TARGET_SLOT)
+    op_indexes = np.flatnonzero(target_label != NOOP_TARGET_SLOT)
+    noop_count = int(noop_indexes.shape[0])
+    op_count = int(op_indexes.shape[0])
+    infeasible = False
+
+    if all_count == 0:
+        selected = np.asarray([], dtype=np.int64)
+        selected_noop = 0
+        selected_op = 0
+    elif noop_count == 0 or op_count == 0:
+        infeasible = True
+        selected = np.arange(all_count, dtype=np.int64)
+        selected_noop = noop_count
+        selected_op = op_count
+    else:
+        needed_noop_for_all_ops = int(math.floor(op_count * float(noop_ratio) / max(float(op_ratio), 1e-12)))
+        if needed_noop_for_all_ops <= noop_count:
+            selected_noop = max(1, needed_noop_for_all_ops)
+            selected_op = op_count
+        else:
+            selected_noop = noop_count
+            selected_op = min(op_count, int(math.floor(noop_count * float(op_ratio) / max(float(noop_ratio), 1e-12))))
+            selected_op = max(1, selected_op)
+        infeasible = selected_noop < noop_count or selected_op < op_count
+
+        selected_noops = _sample_hash_order(arrays, balance_seed, noop_indexes)[:selected_noop]
+        op_amount_counts = Counter(int(amount_label[i]) for i in op_indexes.tolist() if int(amount_label[i]) != 0)
+        quotas = _allocate_amount_quotas(op_amount_counts, selected_op)
+        selected_ops: list[int] = []
+        if quotas:
+            for amount_bin, quota in quotas.items():
+                bin_indexes = op_indexes[amount_label[op_indexes] == int(amount_bin)]
+                selected_ops.extend(_sample_hash_order(arrays, balance_seed, bin_indexes)[: int(quota)])
+        if len(selected_ops) < selected_op:
+            already = set(selected_ops)
+            remaining = np.asarray([int(i) for i in op_indexes.tolist() if int(i) not in already], dtype=np.int64)
+            selected_ops.extend(_sample_hash_order(arrays, balance_seed, remaining)[: selected_op - len(selected_ops)])
+        selected = np.asarray(sorted(selected_noops + selected_ops), dtype=np.int64)
+
+    final_amounts = Counter(int(amount_label[i]) for i in selected.tolist())
+    report = {
+        "requested": {
+            "noop_ratio": float(noop_ratio),
+            "op_ratio": float(op_ratio),
+        },
+        "observed": {
+            "total": all_count,
+            "noop": noop_count,
+            "op": op_count,
+            "amount_bins": {
+                AMOUNT_BIN_NAMES[int(k)]: int(v)
+                for k, v in sorted(Counter(int(a) for a in amount_label.tolist()).items())
+                if 0 <= int(k) < len(AMOUNT_BIN_NAMES)
+            },
+        },
+        "selected": {
+            "total": int(selected.shape[0]),
+            "noop": int(selected_noop),
+            "op": int(selected_op),
+            "amount_bins": {
+                AMOUNT_BIN_NAMES[int(k)]: int(v)
+                for k, v in sorted(final_amounts.items())
+                if 0 <= int(k) < len(AMOUNT_BIN_NAMES)
+            },
+        },
+        "infeasible": bool(infeasible),
+        "dropped": int(all_count - int(selected.shape[0])),
+    }
+    return selected, report
+
+
+def _load_sample_arrays(out_dir: Path, metadata: dict[str, Any]) -> dict[str, np.ndarray]:
+    files = metadata.get("files", {}).get("samples", {}) if isinstance(metadata.get("files"), dict) else {}
+    arrays: dict[str, np.ndarray] = {}
+    for key in ("state_index", "source_slot", "target_label", "amount_label", "step"):
+        path = out_dir / str(files.get(key, f"samples/{key}.npy"))
+        arrays[key] = np.load(path, allow_pickle=False)
+    return arrays
+
+
+def _rewrite_sample_arrays(out_dir: Path, metadata: dict[str, Any], selected: np.ndarray) -> None:
+    files = metadata.get("files", {}).get("samples", {}) if isinstance(metadata.get("files"), dict) else {}
+    for key, (dtype, _) in SAMPLE_SPECS.items():
+        path = out_dir / str(files.get(key, f"samples/{key}.npy"))
+        arr = np.load(path, mmap_mode="r", allow_pickle=False)
+        filtered = np.asarray(arr[selected], dtype=dtype)
+        del arr
+        tmp_path = path.with_name(f"{path.name}.tmp.npy")
+        np.save(tmp_path, filtered, allow_pickle=False)
+        tmp_path.replace(path)
+
+
+def _balance_source_turn_dataset(
+    out_dir: str | Path,
+    metadata: dict[str, Any],
+    *,
+    balance_seed: int,
+    noop_ratio: float,
+    op_ratio: float,
+    replay_selection_report: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    out_dir = Path(out_dir)
+    arrays = _load_sample_arrays(out_dir, metadata)
+    selected, sample_report = _select_balanced_sample_indexes(
+        arrays,
+        balance_seed=balance_seed,
+        noop_ratio=noop_ratio,
+        op_ratio=op_ratio,
+    )
+    _rewrite_sample_arrays(out_dir, metadata, selected)
+
+    final_count = int(selected.shape[0])
+    final_target = np.asarray(arrays["target_label"])[selected]
+    final_amount = np.asarray(arrays["amount_label"])[selected]
+    final_noop = int(np.sum(final_target == NOOP_TARGET_SLOT))
+    final_op = int(final_count - final_noop)
+    final_amount_counts = {
+        AMOUNT_BIN_NAMES[int(k)]: int(v)
+        for k, v in sorted(Counter(int(a) for a in final_amount.tolist()).items())
+        if 0 <= int(k) < len(AMOUNT_BIN_NAMES)
+    }
+
+    updated = dict(metadata)
+    old_stats = dict(metadata.get("stats", {}))
+    stats = dict(old_stats)
+    stats["train_source_turns"] = final_count
+    stats["train_positive_source_turns"] = final_op
+    stats["source_turn_rows"] = final_count
+    stats["positive_source_turns"] = final_op
+    stats["noop_source_turns"] = final_noop
+    stats["balance_dropped_source_turns"] = int(sample_report["dropped"])
+    updated["stats"] = _stats_with_required_train_keys(Counter(stats))
+    updated["sample_count"] = final_count
+    updated["amount_bin_counts"] = final_amount_counts
+
+    correction = dict(metadata.get("proportion_correction", {}))
+    correction.update(
+        {
+            "enabled": True,
+            "balance_seed": int(balance_seed),
+            "unbalanced_stats": old_stats,
+            "sample_balance": sample_report,
+        }
+    )
+    if replay_selection_report is not None:
+        correction["replay_selection"] = replay_selection_report
+    updated["proportion_correction"] = correction
+    with open(out_dir / "metadata.json", "w", encoding="utf-8") as f:
+        json.dump(updated, f, indent=2, sort_keys=True)
+    return updated
+
+
 class DatasetBuilder:
     def __init__(
         self,
@@ -251,6 +575,10 @@ class DatasetBuilder:
         write_debug_jsonl: bool = False,
         backend: str = "exact",
         canonicalize_perspective: bool = True,
+        balance_proportions: bool = True,
+        balance_seed: int = 42,
+        noop_ratio: float = 0.40,
+        op_ratio: float = 0.60,
     ):
         self.horizon = int(horizon)
         if batch_size is not None and int(batch_size) < 1:
@@ -263,6 +591,15 @@ class DatasetBuilder:
         self.workers = int(workers)
         self.write_debug_jsonl = bool(write_debug_jsonl)
         self.canonicalize_perspective = bool(canonicalize_perspective)
+        self.balance_proportions = bool(balance_proportions)
+        self.balance_seed = int(balance_seed)
+        self.noop_ratio = float(noop_ratio)
+        self.op_ratio = float(op_ratio)
+        if self.noop_ratio < 0.0 or self.op_ratio < 0.0 or (self.noop_ratio + self.op_ratio) <= 0.0:
+            raise ValueError("noop_ratio and op_ratio must be non-negative with a positive sum")
+        ratio_total = self.noop_ratio + self.op_ratio
+        self.noop_ratio = float(self.noop_ratio / ratio_total)
+        self.op_ratio = float(self.op_ratio / ratio_total)
         backend_value = str(backend).lower().strip()
         if backend_value not in {"exact", "lite"}:
             raise ValueError("backend must be one of: exact, lite")
@@ -434,7 +771,25 @@ class DatasetBuilder:
 
     def build_from_replay(self, replay_path: str | Path, out_dir: str | Path) -> dict[str, Any]:
         replay_input = Path(replay_path)
-        replay_paths = resolve_replay_paths(replay_input, self.max_replay_files)
+        if self.balance_proportions:
+            requested_replay_paths = resolve_replay_paths(replay_input, None)
+            replay_paths, replay_selection_report = _select_balanced_replay_paths(
+                requested_replay_paths,
+                max_files=self.max_replay_files,
+                balance_seed=self.balance_seed,
+            )
+        else:
+            replay_paths = resolve_replay_paths(replay_input, self.max_replay_files)
+            replay_selection_report = {
+                "requested": len(replay_paths),
+                "limit": len(replay_paths),
+                "observed_player_counts": {},
+                "selected_player_counts": {},
+                "selected": len(replay_paths),
+                "infeasible": False,
+                "shortfall": 0,
+                "target_player_mix": {"2": 0.5, "4": 0.5},
+            }
         out_dir = Path(out_dir)
         if out_dir.exists():
             shutil.rmtree(out_dir)
@@ -453,7 +808,21 @@ class DatasetBuilder:
                     file=sys.stderr,
                 )
             else:
-                return self._build_from_replay_parallel(replay_input, replay_paths, out_dir)
+                metadata = self._build_from_replay_parallel(replay_input, replay_paths, out_dir)
+                if self.balance_proportions:
+                    metadata = _balance_source_turn_dataset(
+                        out_dir,
+                        metadata,
+                        balance_seed=self.balance_seed,
+                        noop_ratio=self.noop_ratio,
+                        op_ratio=self.op_ratio,
+                        replay_selection_report=replay_selection_report,
+                    )
+                else:
+                    metadata["proportion_correction"] = {"enabled": False, "replay_selection": replay_selection_report}
+                    with open(out_dir / "metadata.json", "w", encoding="utf-8") as f:
+                        json.dump(metadata, f, indent=2, sort_keys=True)
+                return metadata
         writer = SourceTurnDatasetWriter(out_dir)
         invalid_json_paths: set[str] = set()
         unreadable_paths: set[str] = set()
@@ -709,6 +1078,12 @@ class DatasetBuilder:
             "max_replay_files": self.max_replay_files,
             "write_debug_jsonl": self.write_debug_jsonl,
             "perspective_canonicalization": {"enabled": self.canonicalize_perspective, "frame": "p0", "rotation": "-2*pi*player_id/num_players"},
+            "proportion_correction": {
+                "enabled": bool(self.balance_proportions),
+                "balance_seed": int(self.balance_seed),
+                "requested": {"noop_ratio": float(self.noop_ratio), "op_ratio": float(self.op_ratio)},
+                "replay_selection": replay_selection_report,
+            },
             "parallel": {"enabled": False, "worker_count": 1, "shards": 1},
             "planet_feature_names": PLANET_FEATURE_NAMES,
             "global_feature_names": GLOBAL_FEATURE_NAMES,
@@ -726,7 +1101,17 @@ class DatasetBuilder:
             "target_inference_methods": dict(inference_methods),
             "amount_bin_counts": {AMOUNT_BIN_NAMES[int(k)]: int(v) for k, v in amount_bins.items() if int(k) < len(AMOUNT_BIN_NAMES)},
         }
-        return writer.finalize(extra_metadata=metadata)
+        finalized = writer.finalize(extra_metadata=metadata)
+        if self.balance_proportions:
+            return _balance_source_turn_dataset(
+                out_dir,
+                finalized,
+                balance_seed=self.balance_seed,
+                noop_ratio=self.noop_ratio,
+                op_ratio=self.op_ratio,
+                replay_selection_report=replay_selection_report,
+            )
+        return finalized
 
 
 def main() -> None:
@@ -742,6 +1127,10 @@ def main() -> None:
     ap.add_argument("--write-debug-jsonl", action="store_true", help="Write debug JSONL files under debug/.")
     ap.add_argument("--backend", choices=("lite", "exact"), default="lite", help="Dataset build backend. lite uses orbit_lite movement-cache heuristics; exact keeps the old simulator path.")
     ap.add_argument("--no-canonicalize-perspective", action="store_true", help="Disable player-perspective canonicalization. Not recommended for BC/PPO because it can reintroduce map/seat bias.")
+    ap.add_argument("--no-balance-proportions", action="store_true", help="Disable default replay and source-turn proportion correction.")
+    ap.add_argument("--balance-seed", type=int, default=42, help="Seed for deterministic replay/sample downsampling.")
+    ap.add_argument("--noop-ratio", type=float, default=0.6, help="Requested final noop source-turn ratio before normalization.")
+    ap.add_argument("--op-ratio", type=float, default=0.4, help="Requested final non-noop source-turn ratio before normalization.")
     args = ap.parse_args()
     builder = DatasetBuilder(
         horizon=args.horizon,
@@ -753,6 +1142,10 @@ def main() -> None:
         write_debug_jsonl=args.write_debug_jsonl,
         backend=args.backend,
         canonicalize_perspective=not args.no_canonicalize_perspective,
+        balance_proportions=not args.no_balance_proportions,
+        balance_seed=args.balance_seed,
+        noop_ratio=args.noop_ratio,
+        op_ratio=args.op_ratio,
     )
     meta = builder.build_from_replay(args.replay, args.out_dir)
     print(json.dumps({"out_dir": args.out_dir, "stats": meta["stats"], "target_inference_methods": meta["target_inference_methods"]}, indent=2, sort_keys=True))

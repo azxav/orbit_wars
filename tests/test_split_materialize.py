@@ -10,7 +10,7 @@ import numpy as np
 from orbit_training_prep.features import PAIR_FEATURE_NAMES
 from orbit_training_prep.materialize_splits import materialize_splits, source_turn_sample_weight
 from orbit_training_prep.schema import NOOP_TARGET_SLOT
-from orbit_training_prep.source_turn_store import SourceTurnDatasetReader, SourceTurnDatasetWriter
+from orbit_training_prep.source_turn_store import SourceTurnDatasetWriter
 from orbit_training_prep.split_episodes import discover_episode_ids, make_episode_splits
 
 
@@ -84,14 +84,18 @@ class SplitMaterializeTest(unittest.TestCase):
 
             self.assertEqual(summary["train"]["source_turn_samples"], 1)
             self.assertEqual(summary["valid"]["source_turn_samples"], 1)
-            train_reader = SourceTurnDatasetReader(out / "train")
-            valid_reader = SourceTurnDatasetReader(out / "valid")
-            self.assertEqual([str(x) for x in train_reader.states["episode_id"].tolist()], ["episode_a"])
-            self.assertEqual([str(x) for x in valid_reader.states["episode_id"].tolist()], ["episode_b"])
-            self.assertEqual(int(train_reader.samples["target_label"][0]), 1)
-            self.assertEqual(int(valid_reader.samples["target_label"][0]), NOOP_TARGET_SLOT)
-            self.assertEqual(float(train_reader.samples["sample_weight"][0]), np.float32(1.25))
-            self.assertEqual(float(valid_reader.samples["sample_weight"][0]), np.float32(0.2))
+            train_episode_id = np.load(out / "train" / "states" / "episode_id.npy", allow_pickle=False)
+            valid_episode_id = np.load(out / "valid" / "states" / "episode_id.npy", allow_pickle=False)
+            train_target_label = np.load(out / "train" / "samples" / "target_label.npy", allow_pickle=False)
+            valid_target_label = np.load(out / "valid" / "samples" / "target_label.npy", allow_pickle=False)
+            train_sample_weight = np.load(out / "train" / "samples" / "sample_weight.npy", allow_pickle=False)
+            valid_sample_weight = np.load(out / "valid" / "samples" / "sample_weight.npy", allow_pickle=False)
+            self.assertEqual([str(x) for x in train_episode_id.tolist()], ["episode_a"])
+            self.assertEqual([str(x) for x in valid_episode_id.tolist()], ["episode_b"])
+            self.assertEqual(int(train_target_label[0]), 1)
+            self.assertEqual(int(valid_target_label[0]), NOOP_TARGET_SLOT)
+            self.assertEqual(float(train_sample_weight[0]), np.float32(1.25))
+            self.assertEqual(float(valid_sample_weight[0]), np.float32(0.2))
             self.assertFalse((out / "train" / "source_turn_rows.jsonl").exists())
             self.assertFalse((out / "valid" / "source_turn_rows.jsonl").exists())
 
