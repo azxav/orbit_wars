@@ -758,6 +758,46 @@ python -m orbit_ppo_training.eval_ppo \
 
 ---
 
+### 11. CUDA JAX PPO from BC
+
+JAX CUDA training is intended for WSL/Linux. Native Windows JAX currently runs CPU-only in this workspace, so use the setup script from WSL:
+
+```bash
+cd /mnt/d/Projects/orbit_dataset_prep
+bash scripts/setup_jax_cuda_wsl.sh
+source .venv-jax/bin/activate
+python scripts/check_jax_cuda.py --require-cuda
+```
+
+Run one short BC-initialized PPO update on GPU against the pure-JAX proxy opponent, with checkpoint selection evaluated against `orbit_wars_base.py`:
+
+```bash
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.75 python -m orbit_ppo_jax.train \
+  --require_cuda \
+  --bc_checkpoint bc_checkpoints/compact_bc_v1/best/checkpoint.pt \
+  --out_dir ppo_runs/jax_compact_bc_v1 \
+  --opponent jax_proxy \
+  --eval_heuristic_path orbit_wars_base.py \
+  --players 4 \
+  --envs 8 \
+  --steps 32 \
+  --updates 1 \
+  --eval_games 2
+```
+
+Evaluate a saved JAX PPO checkpoint against the real heuristic:
+
+```bash
+python -m orbit_ppo_jax.eval_vs_heuristic \
+  --checkpoint ppo_runs/jax_compact_bc_v1/latest \
+  --heuristic_path orbit_wars_base.py \
+  --games 4 \
+  --players 4 \
+  --out_dir ppo_eval_runs/jax_compact_bc_v1
+```
+
+---
+
 ## Debugging commands
 
 ### Audit exact target inference
