@@ -142,54 +142,142 @@ def _swept_circle_hit(
     return torch.where(near_static, c <= 0.0, (disc >= 0.0) & (t2 >= 0.0) & (t1 <= 1.0))
 
 
-def _native_fleet_target_and_eta(fleet: Any, movement: Any, *, horizon: int) -> tuple[int | None, float]:
-    if not _is_native_fleet_observation(fleet) or movement is None:
-        return None, math.inf
+def _native_fleet_targets_and_etas(native_fleets: list[Any], movement: Any, *, horizon: int) -> tuple[np.ndarray, np.ndarray]:
+    """Vectorized first-contact target/ETA derivation for native fleet observations.
+
+    This replaces the previous per-target/per-fleet mini simulation. For a player step with
+    many sources and targets it turns O(S*T*F*H*P) native fleet work into O(F*H*P).
+    """
+    n = len(native_fleets)
+    target_ids = np.full(n, -1, dtype=np.int64)
+    etas = np.full(n, math.inf, dtype=np.float32)
+    if n == 0 or movement is None:
+        return target_ids, etas
+
     h = max(1, int(horizon))
     h = min(h, int(movement.x.shape[0]) - 1)
     if h <= 0:
-        return None, math.inf
+        return target_ids, etas
+
     device = movement.device
     dtype = movement.dtype
-    x0 = torch.tensor(float(safe_float(fleet[2])), dtype=dtype, device=device)
-    y0 = torch.tensor(float(safe_float(fleet[3])), dtype=dtype, device=device)
-    angle = float(safe_float(fleet[4]))
-    speed = _fleet_speed(safe_float(fleet[5]))
-    k = torch.arange(h + 1, dtype=dtype, device=device)
-    fx = x0 + math.cos(angle) * speed * k
-    fy = y0 + math.sin(angle) * speed * k
+    x0 = torch.tensor([safe_float(f[2]) for f in native_fleets], dtype=dtype, device=device)
+    y0 = torch.tensor([safe_float(f[3]) for f in native_fleets], dtype=dtype, device=device)
+    angle = torch.tensor([safe_float(f[4]) for f in native_fleets], dtype=dtype, device=device)
+    speed = torch.tensor([_fleet_speed(safe_float(f[5])) for f in native_fleets], dtype=dtype, device=device)
+    k = torch.arange(h + 1, dtype=dtype, device=device).view(1, -1)
+    cos_a = torch.cos(angle).view(n, 1)
+    sin_a = torch.sin(angle).view(n, 1)
+    fx = x0.view(n, 1) + cos_a * speed.view(n, 1) * k
+    fy = y0.view(n, 1) + sin_a * speed.view(n, 1) * k
+
     px = movement.x[: h + 1]
     py = movement.y[: h + 1]
     radii = movement.radii
     alive0 = movement.alive_at(0)
     step_axis = torch.arange(1, h + 1, dtype=dtype, device=device)
+
     hit = _swept_circle_hit(
-        fx[:-1].view(h, 1),
-        fy[:-1].view(h, 1),
-        fx[1:].view(h, 1),
-        fy[1:].view(h, 1),
-        px[:-1],
-        py[:-1],
-        px[1:],
-        py[1:],
-        radii.view(1, -1),
+        fx[:, :-1].unsqueeze(-1),
+        fy[:, :-1].unsqueeze(-1),
+        fx[:, 1:].unsqueeze(-1),
+        fy[:, 1:].unsqueeze(-1),
+        px[:-1].unsqueeze(0),
+        py[:-1].unsqueeze(0),
+        px[1:].unsqueeze(0),
+        py[1:].unsqueeze(0),
+        radii.view(1, 1, -1),
     )
-    hit = hit & alive0.view(1, -1)
-    hit_step_by_slot = torch.where(hit, step_axis.view(-1, 1), torch.full_like(hit, BIG, dtype=dtype)).amin(0)
-    first_planet_step = float(hit_step_by_slot.amin().item())
-    first_planet_slot = int(torch.argmin(hit_step_by_slot).item())
-    nfx = fx[1:]
-    nfy = fy[1:]
-    ofx = fx[:-1]
-    ofy = fy[:-1]
+    hit = hit & alive0.view(1, 1, -1)
+    hit_step_by_slot = torch.where(hit, step_axis.view(1, h, 1), torch.full_like(hit, BIG, dtype=dtype)).amin(1)
+    first_planet_step = hit_step_by_slot.amin(1)
+    first_planet_slot = hit_step_by_slot.argmin(1)
+
+    nfx = fx[:, 1:]
+    nfy = fy[:, 1:]
+    ofx = fx[:, :-1]
+    ofy = fy[:, :-1]
     bounds = (nfx < 0.0) | (nfx > BOARD_SIZE) | (nfy < 0.0) | (nfy > BOARD_SIZE)
     sun = _point_segment_hits_sun(ofx, ofy, nfx, nfy)
-    sun_step = float(torch.where(sun, step_axis, torch.full_like(sun, BIG, dtype=dtype)).amin().item())
-    bounds_step = float(torch.where(bounds, step_axis, torch.full_like(bounds, BIG, dtype=dtype)).amin().item())
-    first_env_step = min(sun_step, bounds_step)
-    if first_planet_step <= first_env_step and first_planet_step < BIG:
-        return int(movement.planet_ids.long().tolist()[first_planet_slot]), float(first_planet_step)
-    return None, math.inf
+    sun_step = torch.where(sun, step_axis.view(1, -1), torch.full_like(sun, BIG, dtype=dtype)).amin(1)
+    bounds_step = torch.where(bounds, step_axis.view(1, -1), torch.full_like(bounds, BIG, dtype=dtype)).amin(1)
+    first_env_step = torch.minimum(sun_step, bounds_step)
+    valid = (first_planet_step <= first_env_step) & (first_planet_step < BIG)
+
+    planet_ids = movement.planet_ids.long()[first_planet_slot.clamp(0, max(int(movement.P) - 1, 0))]
+    valid_cpu = valid.detach().cpu().numpy().astype(bool)
+    target_ids[valid_cpu] = planet_ids[valid].detach().cpu().numpy().astype(np.int64)
+    etas[valid_cpu] = first_planet_step[valid].detach().cpu().numpy().astype(np.float32)
+    return target_ids, etas
+
+
+def _native_fleet_target_and_eta(fleet: Any, movement: Any, *, horizon: int) -> tuple[int | None, float]:
+    target_ids, etas = _native_fleet_targets_and_etas([fleet], movement, horizon=int(horizon))
+    if len(target_ids) == 0 or int(target_ids[0]) < 0:
+        return None, math.inf
+    return int(target_ids[0]), float(etas[0])
+
+
+def _projected_capture_needed_by_slot(
+    obs: dict[str, Any],
+    player_id: int,
+    *,
+    horizon: int,
+    movement: Any = None,
+) -> np.ndarray:
+    """Compute conservative projected capture thresholds once for the whole observation."""
+    planets = obs.get("planets", []) or []
+    needs = np.ones(P_MAX, dtype=np.int32)
+    base = np.zeros(P_MAX, dtype=np.float32)
+    friendly = np.zeros(P_MAX, dtype=np.float32)
+    hostile = np.zeros(P_MAX, dtype=np.float32)
+    target_id_to_slot: dict[int, int] = {}
+
+    for slot, planet in enumerate(planets[:P_MAX]):
+        if not isinstance(planet, (list, tuple)) or len(planet) < 7:
+            continue
+        target_id_to_slot[int(planet[0])] = int(slot)
+        base[slot] = max(0.0, safe_float(planet[5]))
+
+    explicit_rows: list[tuple[int, float, float, int | None]] = []
+    native_fleets: list[Any] = []
+    for fleet in obs.get("fleets", []) or []:
+        owner = _fleet_owner(fleet)
+        ships = _fleet_ships(fleet)
+        if ships <= 0.0:
+            continue
+        if _is_native_fleet_observation(fleet):
+            native_fleets.append(fleet)
+            continue
+        fleet_target_id = _fleet_target_id(fleet)
+        explicit_rows.append((fleet_target_id if fleet_target_id is not None else -1, _fleet_eta(fleet), ships, owner))
+
+    native_target_ids, native_etas = _native_fleet_targets_and_etas(native_fleets, movement, horizon=int(horizon))
+    for fleet, target_id, eta in zip(native_fleets, native_target_ids, native_etas, strict=True):
+        explicit_rows.append((int(target_id), float(eta), _fleet_ships(fleet), _fleet_owner(fleet)))
+
+    for target_id, eta, ships, owner in explicit_rows:
+        if target_id is None or int(target_id) < 0:
+            continue
+        if not math.isfinite(float(eta)) or float(eta) > int(horizon):
+            continue
+        slot = target_id_to_slot.get(int(target_id))
+        if slot is None or not (0 <= slot < P_MAX):
+            continue
+        if owner == int(player_id):
+            friendly[slot] += float(ships)
+        else:
+            hostile[slot] += float(ships)
+
+    for slot, planet in enumerate(planets[:P_MAX]):
+        if not isinstance(planet, (list, tuple)) or len(planet) < 7:
+            continue
+        if int(planet[1]) == int(player_id):
+            needs[slot] = 1
+        else:
+            projected = max(0.0, float(base[slot] + hostile[slot] - friendly[slot]))
+            needs[slot] = max(1, int(math.floor(projected)) + 1)
+    return needs
 
 
 def projected_capture_needed_ships(
@@ -267,6 +355,12 @@ def compute_viability_masks(
     obs_for_movement["fleets"] = []
     obs_tensors = geometry.obs_to_tensors(obs_for_movement, player_id=int(player_id))
     movement = geometry.build_or_update_movement(obs_tensors)
+    projected_needed_by_slot = _projected_capture_needed_by_slot(
+        obs,
+        int(player_id),
+        horizon=int(capture_horizon),
+        movement=movement,
+    )
 
     sources: list[int] = []
     targets: list[int] = []
@@ -283,14 +377,7 @@ def compute_viability_masks(
                 continue
             target = planets[target_slot]
             current_needed = capture_needed_ships(source, target, int(player_id))
-            projected_needed = projected_capture_needed_ships(
-                obs,
-                source,
-                target,
-                int(player_id),
-                horizon=int(capture_horizon),
-                movement=movement,
-            )
+            projected_needed = int(projected_needed_by_slot[int(target_slot)]) if 0 <= int(target_slot) < P_MAX else current_needed
             target_is_owned = int(target[1]) == int(player_id)
             for amount_bin in range(1, amount_bins):
                 ships = decode_amount_bin(amount_bin, available, current_needed)
