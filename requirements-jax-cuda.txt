@@ -1,0 +1,7 @@
+jax[cuda12]
+flax
+optax
+numpy
+torch
+pytest
+kaggle-environments
