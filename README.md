@@ -843,14 +843,14 @@ source .venv-jax/bin/activate
 python scripts/check_jax_cuda.py --require-cuda
 ```
 
-Run one short BC-initialized PPO update on GPU against the pure-JAX proxy opponent, with checkpoint selection evaluated against `orbit_wars_base.py`:
+Run one short BC-initialized PPO update on GPU against the JAX-native `simple_heuristic.py` opponent port, with checkpoint selection evaluated against `orbit_wars_base.py`:
 
 ```bash
 XLA_PYTHON_CLIENT_MEM_FRACTION=0.75 python -m orbit_ppo_jax.train \
   --require_cuda \
   --bc_checkpoint bc_checkpoints/lite_bc_v1_500/best/checkpoint.pt \
   --out_dir ppo_runs/jax_compact_bc_v1_smoke \
-  --opponent jax_proxy \
+  --opponent simple_heuristic_jax \
   --eval_heuristic_path orbit_wars_base.py \
   --players 4 \
   --envs 8 \
@@ -867,7 +867,7 @@ XLA_PYTHON_CLIENT_MEM_FRACTION=0.75 python -m orbit_ppo_jax.train \
   --require_cuda \
   --bc_checkpoint bc_checkpoints/lite_bc_v1_500/best/checkpoint.pt \
   --out_dir ppo_runs/jax_compact_bc_v1 \
-  --opponent jax_proxy \
+  --opponent simple_heuristic_jax \
   --eval_heuristic_path orbit_wars_base.py \
   --players 4 \
   --envs 32 \
@@ -892,7 +892,7 @@ python -m orbit_jax_env.build_official_state_bank \
 python -m orbit_ppo_jax.train \
   --bc_checkpoint bc_checkpoints/lite_bc_v1_500/best/checkpoint.pt \
   --out_dir ppo_runs/jax_compact_bc_v1 \
-  --opponent jax_proxy \
+  --opponent simple_heuristic_jax \
   --players 4 \
   --initial_state_bank data/official_state_bank_4p.npz \
   --state_bank_mode random \
@@ -900,7 +900,7 @@ python -m orbit_ppo_jax.train \
   --episode_steps 500
 ```
 
-`--steps` remains accepted as a legacy alias for `--rollout_steps`, but new runs should use `--rollout_steps` and `--episode_steps` explicitly. `--enable_comets` uses the approximate JAX-native comet schedule unless states were imported with official comet path metadata; runs record `comet_mode` and `comet_warning` in config and metrics.
+`--opponent simple_heuristic_jax` is the default PPO training opponent. Use `--opponent jax_proxy` only when you want the older, faster nearest-target proxy for throughput comparisons. `--steps` remains accepted as a legacy alias for `--rollout_steps`, but new runs should use `--rollout_steps` and `--episode_steps` explicitly. `--enable_comets` uses the approximate JAX-native comet schedule unless states were imported with official comet path metadata; runs record `comet_mode` and `comet_warning` in config and metrics.
 
 Evaluate a saved JAX PPO checkpoint against the real heuristic:
 

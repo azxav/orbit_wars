@@ -15,6 +15,7 @@ from orbit_jax_env.config import EnvConfig, MAX_PLAYERS, P_MAX
 from orbit_jax_env.jax_policy import greedy_actions
 from orbit_jax_env.observation import build_observation
 from orbit_jax_env.reset import reset
+from orbit_jax_env.simple_heuristic_jax import simple_heuristic_actions
 from orbit_jax_env.step import step
 from orbit_jax_env.state import EnvState
 
@@ -35,7 +36,7 @@ class JaxPPOConfig:
     rollout_steps: int = 32
     episode_steps: int = 500
     updates: int = 1
-    opponent: str = "jax_proxy"
+    opponent: str = "simple_heuristic_jax"
     eval_heuristic_path: str = "orbit_wars_base.py"
     eval_games: int = 2
     eval_interval_updates: int = 5
@@ -200,7 +201,10 @@ def _make_update(config: JaxPPOConfig, bc_config: dict[str, Any], state_bank: En
             def one_env(state, k):
                 rows0, lp, val, ent, ti, ai, feats = _learner_act(params, state, k, bc_config)
                 obs = build_observation(state)
-                proxy = greedy_actions(obs["planets"], state.num_players)
+                if config.opponent == "jax_proxy":
+                    proxy = greedy_actions(obs["planets"], state.num_players)
+                else:
+                    proxy = simple_heuristic_actions(state)
                 actions = proxy.at[0].set(rows0)
                 next_state, _next_obs, rewards, done, info = step(state, actions)
                 source_active = feats.target_mask[:, NOOP_TARGET_SLOT]
@@ -341,8 +345,8 @@ def _initial_vector_states(config: JaxPPOConfig, key, env_config: EnvConfig, sta
 
 def train(config: JaxPPOConfig) -> dict[str, Any]:
     runtime = _check_runtime(config.require_cuda)
-    if config.opponent != "jax_proxy":
-        raise RuntimeError("orbit_ppo_jax.train currently supports --opponent jax_proxy")
+    if config.opponent not in {"simple_heuristic_jax", "jax_proxy"}:
+        raise RuntimeError("orbit_ppo_jax.train supports --opponent simple_heuristic_jax or jax_proxy")
     if config.state_bank_mode not in {"cycle", "random"}:
         raise RuntimeError("--state_bank_mode must be either cycle or random")
 
@@ -482,7 +486,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--rollout_steps", type=int, default=None)
     ap.add_argument("--episode_steps", type=int, default=500)
     ap.add_argument("--updates", type=int, default=1)
-    ap.add_argument("--opponent", default="jax_proxy", choices=["jax_proxy"])
+    ap.add_argument("--opponent", default="simple_heuristic_jax", choices=["simple_heuristic_jax", "jax_proxy"])
     ap.add_argument("--eval_heuristic_path", default="orbit_wars_base.py")
     ap.add_argument("--eval_games", type=int, default=2)
     ap.add_argument("--eval_interval_updates", type=int, default=5)
