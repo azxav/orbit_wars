@@ -107,7 +107,7 @@ def analytic_first_contact(
     )
     planet_hit = planet_hit & p_alive0.to(device=device, dtype=torch.bool).view(1, 1, -1)
     hit_steps = torch.where(planet_hit, step_axis.view(1, -1, 1), big_scalar).amin(dim=1)
-    first_planet_eta = hit_steps.amin(dim=1).values
+    first_planet_eta = hit_steps.amin(dim=1)
     slot_axis = torch.arange(hit_steps.shape[1], dtype=torch.long, device=device).view(1, -1)
     first_slots = torch.where(
         hit_steps == first_planet_eta.view(-1, 1),
