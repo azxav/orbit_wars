@@ -463,6 +463,73 @@ def test_persistent_train_state_advances_across_updates(tmp_path: Path) -> None:
     assert rows[1]["reset_count"] == 0.0
 
 
+def test_tiny_train_auto_resumes_latest_across_process_passes(tmp_path: Path) -> None:
+    from orbit_ppo_jax.train import main
+
+    ckpt = _tiny_bc_checkpoint(tmp_path / "bc")
+    out_dir = tmp_path / "ppo_resume"
+    args = [
+        "--bc_checkpoint",
+        str(ckpt),
+        "--out_dir",
+        str(out_dir),
+        "--players",
+        "2",
+        "--envs",
+        "1",
+        "--rollout_steps",
+        "1",
+        "--episode_steps",
+        "500",
+        "--updates",
+        "1",
+        "--eval_games",
+        "0",
+    ]
+
+    main(args)
+    main(args)
+
+    rows = [json.loads(line) for line in (out_dir / "metrics.jsonl").read_text().splitlines()]
+    assert [row["update"] for row in rows] == [1, 2]
+    assert rows[1]["mean_episode_step"] == 2.0
+    assert rows[1]["reset_count"] == 0.0
+    assert (out_dir / "latest" / "trainer_state.npz").exists()
+
+
+def test_tiny_train_resumes_params_but_resets_envs_when_player_mode_changes(tmp_path: Path) -> None:
+    from orbit_ppo_jax.train import main
+
+    ckpt = _tiny_bc_checkpoint(tmp_path / "bc")
+    out_dir = tmp_path / "ppo_resume_mode_switch"
+    base_args = [
+        "--bc_checkpoint",
+        str(ckpt),
+        "--out_dir",
+        str(out_dir),
+        "--envs",
+        "1",
+        "--rollout_steps",
+        "1",
+        "--episode_steps",
+        "500",
+        "--updates",
+        "1",
+        "--eval_games",
+        "0",
+    ]
+
+    main([*base_args, "--players", "4"])
+    main([*base_args, "--players", "2"])
+
+    rows = [json.loads(line) for line in (out_dir / "metrics.jsonl").read_text().splitlines()]
+    assert [row["update"] for row in rows] == [1, 2]
+    assert rows[1]["mean_episode_step"] == 1.0
+    assert rows[1]["resume_env_state"] == "reset_incompatible"
+    config = json.loads((out_dir / "config.json").read_text())
+    assert config["players"] == 2
+
+
 def test_tiny_train_can_reset_from_official_state_bank(tmp_path: Path) -> None:
     from orbit_jax_env.official_state_dataset import save_state_bank
     from orbit_jax_env.state import manual_state

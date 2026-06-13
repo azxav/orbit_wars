@@ -70,6 +70,92 @@ def load_jax_checkpoint(path: str | Path) -> tuple[dict[str, Any], dict[str, Any
     return params, config, metrics
 
 
+def _tree_arrays(tree: Any) -> list[np.ndarray]:
+    return [np.asarray(leaf) for leaf in jax.tree_util.tree_leaves(tree)]
+
+
+def _restore_tree(data: Any, prefix: str, template: Any) -> Any:
+    leaves, treedef = jax.tree_util.tree_flatten(template)
+    restored = []
+    for idx, _leaf in enumerate(leaves):
+        key = f"{prefix}/{idx:06d}"
+        if key not in data:
+            raise RuntimeError(f"training checkpoint is missing {key}")
+        restored.append(jnp.asarray(data[key]))
+    return jax.tree_util.tree_unflatten(treedef, restored)
+
+
+def save_jax_training_state(
+    path: str | Path,
+    *,
+    opt_state: Any,
+    rng_key: Any,
+    env_states: Any,
+    state_bank_cycle_index: Any,
+    update_index: int,
+    env_steps: int,
+    best_score: float,
+    players: int,
+    envs: int,
+    episode_steps: int,
+    enable_comets: bool,
+    initial_state_bank: str | None,
+    state_bank_mode: str,
+) -> None:
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    arrays: dict[str, np.ndarray] = {
+        "rng_key": np.asarray(rng_key),
+        "state_bank_cycle_index": np.asarray(state_bank_cycle_index),
+        "update_index": np.asarray(int(update_index), dtype=np.int64),
+        "env_steps": np.asarray(int(env_steps), dtype=np.int64),
+        "best_score": np.asarray(float(best_score), dtype=np.float64),
+        "players": np.asarray(int(players), dtype=np.int64),
+        "envs": np.asarray(int(envs), dtype=np.int64),
+        "episode_steps": np.asarray(int(episode_steps), dtype=np.int64),
+        "enable_comets": np.asarray(bool(enable_comets), dtype=np.bool_),
+        "initial_state_bank": np.asarray("" if initial_state_bank is None else str(initial_state_bank)),
+        "state_bank_mode": np.asarray(str(state_bank_mode)),
+    }
+    for idx, leaf in enumerate(_tree_arrays(opt_state)):
+        arrays[f"opt_state/{idx:06d}"] = leaf
+    for idx, leaf in enumerate(_tree_arrays(env_states)):
+        arrays[f"env_states/{idx:06d}"] = leaf
+    np.savez_compressed(path / "trainer_state.npz", **arrays)
+
+
+def load_jax_training_state(
+    path: str | Path,
+    *,
+    opt_state_template: Any,
+    env_states_template: Any | None = None,
+) -> dict[str, Any]:
+    path = Path(path)
+    state_file = path / "trainer_state.npz"
+    if not state_file.exists():
+        raise FileNotFoundError(state_file)
+    with np.load(state_file, allow_pickle=False) as data:
+        loaded: dict[str, Any] = {
+            "rng_key": jnp.asarray(data["rng_key"]),
+            "state_bank_cycle_index": jnp.asarray(data["state_bank_cycle_index"]),
+            "update_index": int(np.asarray(data["update_index"])),
+            "env_steps": int(np.asarray(data["env_steps"])),
+            "best_score": float(np.asarray(data["best_score"])),
+            "players": int(np.asarray(data["players"])),
+            "envs": int(np.asarray(data["envs"])),
+            "episode_steps": int(np.asarray(data["episode_steps"])),
+            "enable_comets": bool(np.asarray(data["enable_comets"])),
+            "initial_state_bank": str(np.asarray(data["initial_state_bank"])),
+            "state_bank_mode": str(np.asarray(data["state_bank_mode"])),
+            "opt_state": _restore_tree(data, "opt_state", opt_state_template),
+        }
+        if env_states_template is not None:
+            loaded["env_states"] = _restore_tree(data, "env_states", env_states_template)
+        if loaded["initial_state_bank"] == "":
+            loaded["initial_state_bank"] = None
+        return loaded
+
+
 def assert_finite_tree(tree: dict[str, Any]) -> None:
     leaves = jax.tree_util.tree_leaves(tree)
     if not all(bool(jnp.all(jnp.isfinite(x))) for x in leaves):

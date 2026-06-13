@@ -22,7 +22,7 @@ from orbit_jax_env.state import EnvState
 
 from .actions import action_rows_from_source_choices
 from .bc_policy import bc_forward, init_value_head, load_bc_jax_params, value_apply
-from .checkpointing import save_jax_checkpoint
+from .checkpointing import load_jax_checkpoint, load_jax_training_state, save_jax_checkpoint, save_jax_training_state
 from .features import NOOP_TARGET_SLOT, build_bc_features_for_seat
 from .pfsp import OPP_FROZEN_POLICY, OPP_JAX_PROXY, OPP_NONE, OPP_SIMPLE_HEURISTIC, add_snapshot_entry, build_initial_manifest, build_match_plan, load_manifest, save_manifest, update_manifest_from_slot_stats
 from .pfsp_bank import build_pfsp_bank, tree_stack, tree_take
@@ -72,6 +72,8 @@ class JaxPPOConfig:
     pfsp_eval_interval_updates: int = 10
     pfsp_learner_seat_mode: str = "rotate"
     pfsp_4p_layout: str = "one_pfsp_two_anchors"
+    resume: bool = True
+    resume_from: str | None = None
 
 
 def _append_jsonl(path: Path, row: dict[str, Any]) -> None:
@@ -478,6 +480,65 @@ def _initial_vector_states(config: JaxPPOConfig, key, env_config: EnvConfig, sta
     return jax.tree_util.tree_map(lambda x: x[idx], state_bank), cycle_index
 
 
+def _resume_checkpoint_dir(config: JaxPPOConfig, out_dir: Path) -> Path | None:
+    if config.resume_from:
+        path = Path(config.resume_from)
+        return path if path.is_dir() else path.parent
+    latest = out_dir / "latest"
+    if config.resume and (latest / "params.npz").exists():
+        return latest
+    return None
+
+
+def _assert_resume_bc_compatible(current_bc_config: dict[str, Any], checkpoint_config: dict[str, Any]) -> None:
+    saved_bc_config = checkpoint_config.get("bc_model_config", checkpoint_config.get("model_config", {}))
+    if not saved_bc_config:
+        return
+    required = (
+        "planet_feature_dim",
+        "global_feature_dim",
+        "target_state_feature_dim",
+        "pair_feature_dim",
+        "max_planets",
+        "target_classes",
+        "amount_bins",
+        "noop_target_slot",
+        "hidden_size",
+        "num_layers",
+        "num_heads",
+    )
+    for key in required:
+        if current_bc_config.get(key) != saved_bc_config.get(key):
+            raise RuntimeError(
+                f"cannot resume PPO checkpoint with incompatible BC config: "
+                f"{key} expected {current_bc_config.get(key)!r}, got {saved_bc_config.get(key)!r}"
+            )
+
+
+def _resume_env_state_compatible(saved: dict[str, Any], config: JaxPPOConfig) -> bool:
+    return (
+        int(saved.get("players", -1)) == int(config.players)
+        and int(saved.get("envs", -1)) == int(config.envs)
+        and int(saved.get("episode_steps", -1)) == int(config.episode_steps)
+        and bool(saved.get("enable_comets", False)) == bool(config.enable_comets)
+        and saved.get("initial_state_bank") == config.initial_state_bank
+        and str(saved.get("state_bank_mode", "")) == str(config.state_bank_mode)
+    )
+
+
+def _league_manifest_path(out_dir: Path, config: JaxPPOConfig) -> Path:
+    legacy = out_dir / "league" / "manifest.json"
+    if legacy.exists():
+        try:
+            if int(load_manifest(legacy).players) == int(config.players):
+                return legacy
+        except Exception:
+            pass
+        return out_dir / "league" / f"{int(config.players)}p" / "manifest.json"
+    mode_specific = out_dir / "league" / f"{int(config.players)}p" / "manifest.json"
+    return mode_specific if mode_specific.exists() else legacy
+
+
 def train(config: JaxPPOConfig) -> dict[str, Any]:
     runtime = _check_runtime(config.require_cuda)
     if config.opponent not in {"simple_heuristic_jax", "jax_proxy", "pfsp_jax"}:
@@ -537,11 +598,15 @@ def train(config: JaxPPOConfig) -> dict[str, Any]:
 
     bc_params, bc_config = load_bc_jax_params(config.bc_checkpoint)
     league_manifest = None
+    manifest_path = out_dir / "league" / "manifest.json"
     if config.pfsp_enabled:
-        league_dir = out_dir / "league"
-        manifest_path = league_dir / "manifest.json"
+        manifest_path = _league_manifest_path(out_dir, config)
         if manifest_path.exists():
             league_manifest = load_manifest(manifest_path)
+            if int(league_manifest.players) != int(config.players):
+                raise RuntimeError(
+                    f"PFSP manifest players={league_manifest.players} does not match trainer players={config.players}"
+                )
         else:
             league_manifest = build_initial_manifest(
                 players=int(config.players),
@@ -567,8 +632,40 @@ def train(config: JaxPPOConfig) -> dict[str, Any]:
     best_score = -1.0e9
     best_entry_id: str | None = None
     last_metrics: dict[str, Any] = {}
+    start_update = 0
+    start_env_steps = 0
+    resume_path = _resume_checkpoint_dir(config, out_dir)
+    resume_env_state = "fresh"
+    if resume_path is not None and (resume_path / "params.npz").exists():
+        loaded_params, resume_checkpoint_config, resume_metrics = load_jax_checkpoint(resume_path)
+        _assert_resume_bc_compatible(bc_config, resume_checkpoint_config)
+        params = loaded_params
+        opt_state = optimizer.init(params)
+        try:
+            training_state = load_jax_training_state(
+                resume_path,
+                opt_state_template=opt_state,
+                env_states_template=states,
+            )
+        except FileNotFoundError:
+            start_update = int(resume_metrics.get("update", 0))
+            start_env_steps = int(resume_metrics.get("env_steps", 0))
+            resume_env_state = "missing_sidecar_reset"
+        else:
+            opt_state = training_state["opt_state"]
+            key = training_state["rng_key"]
+            start_update = int(training_state["update_index"])
+            start_env_steps = int(training_state["env_steps"])
+            best_score = float(training_state["best_score"])
+            if _resume_env_state_compatible(training_state, config):
+                states = training_state["env_states"]
+                state_bank_cycle_index = training_state["state_bank_cycle_index"]
+                resume_env_state = "loaded"
+            else:
+                resume_env_state = "reset_incompatible"
 
-    for update_index in range(1, int(config.updates) + 1):
+    for local_update_index in range(1, int(config.updates) + 1):
+        update_index = int(start_update) + int(local_update_index)
         key, step_key = jax.random.split(key)
         t0 = time.time()
         params, opt_state, states, state_bank_cycle_index, metrics_jax, league_stats_jax = update_fn(
@@ -605,7 +702,7 @@ def train(config: JaxPPOConfig) -> dict[str, Any]:
         jax.block_until_ready(params)
         seconds = time.time() - t0
         update_env_steps = int(config.envs) * int(config.rollout_steps)
-        env_steps = update_index * update_env_steps
+        env_steps = int(start_env_steps) + int(local_update_index) * update_env_steps
         metrics = {k: float(v) for k, v in metrics_jax.items()}
         if config.pfsp_enabled and league_manifest is not None:
             league_manifest = update_manifest_from_slot_stats(
@@ -620,7 +717,7 @@ def train(config: JaxPPOConfig) -> dict[str, Any]:
                 kind_rank_sum={idx: float(x) for idx, x in enumerate(np.asarray(league_stats_jax["kind_rank_sum"]))},
                 update_index=update_index,
             )
-            save_manifest(out_dir / "league" / "manifest.json", league_manifest)
+            save_manifest(manifest_path, league_manifest)
         metrics.update(
             {
                 "update": update_index,
@@ -633,6 +730,9 @@ def train(config: JaxPPOConfig) -> dict[str, Any]:
                 "reset_source": reset_source,
                 "comet_warning": comet_warning,
                 "comet_mode": comet_mode,
+                "resume_from": str(resume_path) if resume_path is not None else "",
+                "resume_start_update": float(start_update),
+                "resume_env_state": resume_env_state,
                 **runtime,
             }
         )
@@ -653,7 +753,7 @@ def train(config: JaxPPOConfig) -> dict[str, Any]:
             )
             if should_add:
                 entry_id = f"update_{update_index:05d}"
-                snapshot_dir = out_dir / "league" / "snapshots" / entry_id
+                snapshot_dir = manifest_path.parent / "snapshots" / entry_id
                 save_jax_checkpoint(snapshot_dir, params, checkpoint_config, metrics)
                 league_manifest = add_snapshot_entry(
                     league_manifest,
@@ -662,7 +762,7 @@ def train(config: JaxPPOConfig) -> dict[str, Any]:
                     update_index=update_index,
                     protected_entry_ids={best_entry_id} if best_entry_id is not None else set(),
                 )
-                save_manifest(out_dir / "league" / "manifest.json", league_manifest)
+                save_manifest(manifest_path, league_manifest)
                 frozen_bank = build_pfsp_bank(league_manifest, bc_params, bc_config)
 
         score = float(metrics["mean_reward"])
@@ -706,9 +806,25 @@ def train(config: JaxPPOConfig) -> dict[str, Any]:
             if config.pfsp_enabled:
                 best_entry_id = f"update_{update_index:05d}"
             save_jax_checkpoint(out_dir / "best", params, checkpoint_config, metrics)
+        save_jax_training_state(
+            out_dir / "latest",
+            opt_state=opt_state,
+            rng_key=key,
+            env_states=states,
+            state_bank_cycle_index=state_bank_cycle_index,
+            update_index=update_index,
+            env_steps=env_steps,
+            best_score=best_score,
+            players=int(config.players),
+            envs=int(config.envs),
+            episode_steps=int(config.episode_steps),
+            enable_comets=bool(config.enable_comets),
+            initial_state_bank=config.initial_state_bank,
+            state_bank_mode=str(config.state_bank_mode),
+        )
+        last_metrics = metrics
         if metrics.get("invalid_action_count", 0.0) > float(config.envs * config.rollout_steps * P_MAX):
             break
-        last_metrics = metrics
 
     return {"out_dir": str(out_dir), "best_score": best_score, "last_metrics": last_metrics, **runtime}
 
@@ -756,6 +872,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--pfsp_eval_interval_updates", type=int, default=10)
     ap.add_argument("--pfsp_learner_seat_mode", default="rotate", choices=["fixed0", "rotate", "random"])
     ap.add_argument("--pfsp_4p_layout", default="one_pfsp_two_anchors", choices=["one_pfsp_two_anchors"])
+    ap.add_argument("--no_resume", dest="resume", action="store_false", help="Start fresh even when out_dir/latest exists.")
+    ap.add_argument("--resume_from", default=None, help="Checkpoint directory to resume from; defaults to out_dir/latest when present.")
+    ap.set_defaults(resume=True)
     return ap
 
 
