@@ -121,6 +121,39 @@ def test_jax_feature_contract_matches_dense_python_features() -> None:
     np.testing.assert_allclose(np.asarray(actual.pair_features[0]), expected_pair, rtol=1e-5, atol=1e-5)
 
 
+def test_batched_pair_features_match_per_source_rows() -> None:
+    from orbit_jax_env.state import manual_state
+    from orbit_ppo_jax.features import (
+        _full_features_and_masks,
+        _pair_features_for_sources,
+        pair_features_for_source,
+    )
+
+    state = manual_state(
+        planet_rows=[
+            [10, 0, 20.0, 50.0, 2.0, 20.0, 3.0],
+            [11, 0, 30.0, 50.0, 2.0, 14.0, 1.0],
+            [12, 1, 80.0, 75.0, 2.0, 12.0, 2.0],
+            [13, -1, 70.0, 50.0, 2.0, 5.0, 1.0],
+        ],
+        num_players=2,
+    )
+    planet_features, _global_features, target_state_features, _target_mask, amount_mask = _full_features_and_masks(state, 0)
+    source_slots = jnp.asarray([0, 1], dtype=jnp.int32)
+    source_amount_mask = amount_mask[source_slots]
+
+    actual = _pair_features_for_sources(planet_features, target_state_features, source_slots, source_amount_mask)
+    expected = jnp.stack(
+        [
+            pair_features_for_source(planet_features, target_state_features, source_slots[0], source_amount_mask[0]),
+            pair_features_for_source(planet_features, target_state_features, source_slots[1], source_amount_mask[1]),
+        ],
+        axis=0,
+    )
+
+    np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), rtol=1e-5, atol=1e-5)
+
+
 def test_compact_features_select_top_ship_active_owned_sources() -> None:
     from orbit_jax_env.state import manual_state
     from orbit_ppo_jax.features import build_bc_features_for_seat
@@ -264,6 +297,48 @@ def test_steps_alias_normalizes_to_rollout_steps() -> None:
     assert config.rollout_steps == 7
     assert config.episode_steps == 500
     assert config.source_cap == 32
+
+
+def test_policy_sample_act_uses_two_bc_forwards(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from orbit_jax_env.state import manual_state
+    from orbit_ppo_jax import train as train_mod
+    from orbit_ppo_jax.bc_policy import init_value_head, load_bc_jax_params
+
+    ckpt = _tiny_bc_checkpoint(tmp_path / "bc")
+    bc_params, bc_config = load_bc_jax_params(ckpt)
+    params = {
+        "bc": bc_params,
+        "value": init_value_head(jax.random.PRNGKey(0), int(bc_config["hidden_size"])),
+    }
+    state = manual_state(
+        planet_rows=[
+            [10, 0, 20.0, 50.0, 2.0, 20.0, 3.0],
+            [11, 0, 30.0, 50.0, 2.0, 14.0, 1.0],
+            [12, 1, 80.0, 75.0, 2.0, 12.0, 2.0],
+            [13, -1, 70.0, 50.0, 2.0, 5.0, 1.0],
+        ],
+        num_players=2,
+    )
+    calls = 0
+    original = train_mod.bc_forward
+
+    def counted_bc_forward(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(train_mod, "bc_forward", counted_bc_forward)
+
+    train_mod._policy_sample_act(
+        params,
+        state,
+        jnp.asarray(0, dtype=jnp.int32),
+        jax.random.PRNGKey(1),
+        bc_config,
+        source_cap=2,
+    )
+
+    assert calls == 2
 
 
 def test_source_cap_arg_is_accepted() -> None:

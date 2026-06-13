@@ -232,6 +232,22 @@ def pair_features_for_source(planet_features: jnp.ndarray, target_state_features
     return jnp.nan_to_num(jnp.concatenate([rows, noop], axis=0))
 
 
+def _pair_features_for_sources(
+    planet_features: jnp.ndarray,
+    target_state_features: jnp.ndarray,
+    source_slots: jnp.ndarray,
+    amount_mask: jnp.ndarray,
+) -> jnp.ndarray:
+    return jax.vmap(
+        lambda source_slot, source_amount_mask: pair_features_for_source(
+            planet_features,
+            target_state_features,
+            source_slot,
+            source_amount_mask,
+        )
+    )(source_slots, amount_mask)
+
+
 def _full_features_and_masks(state, player_id: int | jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     seat = jnp.asarray(player_id, dtype=jnp.int32)
     pf = planet_features_from_state(state, seat)
@@ -269,5 +285,5 @@ def build_bc_features_for_seat(state, player_id: int | jnp.ndarray, source_cap: 
         )
         target_mask = target_mask[source_slots] & source_mask[:, None]
         amount_mask = amount_mask[source_slots] & source_mask[:, None, None]
-    pair = jnp.stack([pair_features_for_source(pf, tsf, source_slots[row], amount_mask[row]) for row in range(source_slots.shape[0])], axis=0)
+    pair = _pair_features_for_sources(pf, tsf, source_slots, amount_mask)
     return JaxBCFeatures(pf, gf, tsf, pair, target_mask, amount_mask, source_slots, source_mask, active_count, selected_count)

@@ -118,12 +118,11 @@ def _source_batch(features, target_label: jnp.ndarray | None = None) -> dict[str
     return batch
 
 
-def _policy_eval(params, features, config: dict[str, Any], target_idx: jnp.ndarray, amount_idx: jnp.ndarray):
-    out = bc_forward(params["bc"], _source_batch(features, target_idx), config)
-    target_logits = _safe_target_logits(out["target_logits"], features.target_mask)
+def _policy_eval_from_forward_outputs(params, features, target_out, amount_out, target_idx: jnp.ndarray, amount_idx: jnp.ndarray):
+    target_logits = _safe_target_logits(target_out["target_logits"], features.target_mask)
     source_rows = jnp.arange(features.source_slots.shape[0])
     chosen_amount_mask = features.amount_mask[source_rows, jnp.clip(target_idx, 0, P_MAX)]
-    amount_logits = _safe_amount_logits(out["amount_logits"], chosen_amount_mask)
+    amount_logits = _safe_amount_logits(amount_out["amount_logits"], chosen_amount_mask)
     target_lp_all = jax.nn.log_softmax(target_logits)
     amount_lp_all = jax.nn.log_softmax(amount_logits)
     source_active = features.source_mask
@@ -135,8 +134,13 @@ def _policy_eval(params, features, config: dict[str, Any], target_idx: jnp.ndarr
     target_ent = -jnp.sum(target_prob * target_lp_all, axis=-1)
     amount_ent = -jnp.sum(amount_prob * amount_lp_all, axis=-1)
     entropy = jnp.sum(jnp.where(source_active, target_ent + jnp.where(target_idx == NOOP_TARGET_SLOT, 0.0, amount_ent), 0.0))
-    value = value_apply(params["value"], out["global_ctx"][0])
+    value = value_apply(params["value"], target_out["global_ctx"][0])
     return logprob, value, entropy
+
+
+def _policy_eval(params, features, config: dict[str, Any], target_idx: jnp.ndarray, amount_idx: jnp.ndarray):
+    out = bc_forward(params["bc"], _source_batch(features, target_idx), config)
+    return _policy_eval_from_forward_outputs(params, features, out, out, target_idx, amount_idx)
 
 
 def _policy_sample_act(params, state, seat, key, config: dict[str, Any], source_cap: int):
@@ -150,7 +154,7 @@ def _policy_sample_act(params, state, seat, key, config: dict[str, Any], source_
     chosen_amount_mask = features.amount_mask[source_rows, jnp.clip(target_idx, 0, P_MAX)]
     amount_logits = _safe_amount_logits(amount_out["amount_logits"], chosen_amount_mask)
     amount_idx = jax.random.categorical(ka, amount_logits, axis=-1).astype(jnp.int32)
-    logprob, value, entropy = _policy_eval(params, features, config, target_idx, amount_idx)
+    logprob, value, entropy = _policy_eval_from_forward_outputs(params, features, target_out, amount_out, target_idx, amount_idx)
     rows = action_rows_from_source_choices(state, seat, features.source_slots, target_idx, amount_idx, features.source_mask)
     return rows, logprob, value, entropy, target_idx, amount_idx, features
 
