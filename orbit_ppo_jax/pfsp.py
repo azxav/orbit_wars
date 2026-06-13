@@ -408,7 +408,7 @@ def build_match_plan(
                 )
             if anchor_entries:
                 planned.append(_cycle_entry(anchor_entries, env_i))
-            diversity_pool = anchor_entries + [entry for entry in frozen_entries if not planned or entry.id != planned[0].id]
+            diversity_pool = anchor_entries or [entry for entry in frozen_entries if not planned or entry.id != planned[0].id]
             if diversity_pool:
                 planned.append(_cycle_entry(diversity_pool, env_i + 1))
             while len(planned) < len(available_seats):

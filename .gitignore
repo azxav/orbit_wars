@@ -8,6 +8,7 @@ bc_checkpoints
 bc_eval_runs
 ppo_checkpoints
 ppo_eval_debug
+ppo_runs
 *.json
 *.jsonl
 *.csv

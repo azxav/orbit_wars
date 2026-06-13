@@ -301,24 +301,26 @@ def _make_update(config: JaxPPOConfig, bc_config: dict[str, Any], state_bank: En
                 obs = build_observation(state)
                 simple_rows = simple_heuristic_actions(state)
                 proxy_rows = greedy_actions(obs["planets"], state.num_players)
+                seat_axis = jnp.arange(MAX_PLAYERS, dtype=jnp.int32)
+                actions = jnp.zeros((MAX_PLAYERS, MAX_ACTIONS_PER_PLAYER, 3), dtype=jnp.float32)
+                actions = jnp.where((opponent_kind == OPP_SIMPLE_HEURISTIC)[:, None, None], simple_rows, actions)
+                actions = jnp.where((opponent_kind == OPP_JAX_PROXY)[:, None, None], proxy_rows, actions)
+                frozen_mask = opponent_kind == OPP_FROZEN_POLICY
+                frozen_seat = jnp.argmax(frozen_mask.astype(jnp.int32)).astype(jnp.int32)
 
-                def rows_for_seat(seat):
-                    kind = opponent_kind[seat]
-                    slot = opponent_slot[seat]
-                    frozen_bc_params_slot = tree_take(frozen_bc_params, jnp.maximum(slot, 0))
-                    frozen_rows = _policy_greedy_act(frozen_bc_params_slot, state, seat, bc_config, int(config.source_cap))
-                    opponent_rows = jax.lax.switch(
-                        kind,
-                        [
-                            lambda: jnp.zeros((MAX_ACTIONS_PER_PLAYER, 3), dtype=jnp.float32),
-                            lambda: simple_rows[seat],
-                            lambda: proxy_rows[seat],
-                            lambda: frozen_rows,
-                        ],
+                def add_frozen_rows(current_actions):
+                    frozen_slot = jnp.maximum(opponent_slot[frozen_seat], 0)
+                    frozen_rows = _policy_greedy_act(
+                        tree_take(frozen_bc_params, frozen_slot),
+                        state,
+                        frozen_seat,
+                        bc_config,
+                        int(config.source_cap),
                     )
-                    return jnp.where(seat == learner_seat, rows0, opponent_rows)
+                    return jnp.where((seat_axis == frozen_seat)[:, None, None], frozen_rows[None, :, :], current_actions)
 
-                actions = jax.vmap(rows_for_seat)(jnp.arange(MAX_PLAYERS, dtype=jnp.int32))
+                actions = jax.lax.cond(jnp.any(frozen_mask), add_frozen_rows, lambda current_actions: current_actions, actions)
+                actions = jnp.where((seat_axis == learner_seat)[:, None, None], rows0[None, :, :], actions)
                 next_state, _next_obs, rewards, done, info = step(state, actions)
                 learner_reward, learner_rank = _learner_terminal_fields(rewards, info["ranks"], learner_seat)
                 store = {

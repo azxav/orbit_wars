@@ -341,6 +341,39 @@ def test_match_plan_4p_does_not_fill_all_opponents_with_same_frozen_policy() -> 
     assert OPP_SIMPLE_HEURISTIC in kinds
 
 
+def test_match_plan_4p_keeps_one_frozen_policy_with_multiple_frozen_entries() -> None:
+    from orbit_ppo_jax.pfsp import OPP_FROZEN_POLICY, PFSPEntry, PFSPEntryStats, PFSPManifest, build_match_plan
+
+    manifest = PFSPManifest(
+        version=1,
+        players=4,
+        max_policy_slots=4,
+        entries=[
+            PFSPEntry("anchor_simple_heuristic_jax", "simple_heuristic_jax", None, True, True, None, 0),
+            PFSPEntry("anchor_jax_proxy", "jax_proxy", None, True, True, None, 0),
+            PFSPEntry("initial_bc", "frozen_policy", 0, True, True, "bc", 0),
+            PFSPEntry("snapshot", "frozen_policy", 1, False, True, "snap", 1),
+        ],
+        stats={
+            "initial_bc": PFSPEntryStats(),
+            "snapshot": PFSPEntryStats(),
+        },
+    )
+
+    plan = build_match_plan(
+        manifest,
+        rng=np.random.default_rng(0),
+        envs=8,
+        players=4,
+        learner_seat_mode="rotate",
+        anchor_fraction=0.0,
+        layout="one_pfsp_two_anchors",
+    )
+
+    frozen_counts = np.sum(np.asarray(plan.opponent_kind) == OPP_FROZEN_POLICY, axis=1)
+    np.testing.assert_array_equal(frozen_counts, np.ones((8,), dtype=np.int64))
+
+
 def test_pfsp_bank_stacks_checkpoint_params_fixed_shape(tmp_path: Path) -> None:
     from orbit_ppo_jax.bc_policy import load_bc_jax_params
     from orbit_ppo_jax.pfsp import build_initial_manifest
