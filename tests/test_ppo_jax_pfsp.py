@@ -538,6 +538,7 @@ def test_tiny_train_pfsp_writes_manifest_metrics_and_latest_checkpoint(tmp_path:
             "99",
             "--pfsp_matrix_games",
             "0",
+            "--no_profile",
         ]
     )
 
@@ -584,6 +585,7 @@ def test_tiny_train_pfsp_updates_initial_bc_stats_on_terminal_episode(tmp_path: 
             "fixed0",
             "--pfsp_matrix_games",
             "0",
+            "--no_profile",
         ]
     )
 
@@ -631,6 +633,7 @@ def test_tiny_train_pfsp_updates_anchor_stats_on_terminal_episode(tmp_path: Path
             "fixed0",
             "--pfsp_matrix_games",
             "0",
+            "--no_profile",
         ]
     )
 
@@ -678,6 +681,7 @@ def test_tiny_train_pfsp_promotes_snapshot_when_gate_passes(tmp_path: Path) -> N
             "1",
             "--pfsp_matrix_games",
             "0",
+            "--no_profile",
         ]
     )
 
@@ -727,6 +731,7 @@ def test_tiny_pfsp_eval_matrix_writes_outputs(tmp_path: Path) -> None:
             "1",
             "--pfsp_eval_interval_updates",
             "1",
+            "--no_profile",
         ]
     )
 

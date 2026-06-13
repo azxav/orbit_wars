@@ -902,6 +902,15 @@ python -m orbit_ppo_jax.train \
 
 `--opponent simple_heuristic_jax` is the default PPO training opponent. Use `--opponent jax_proxy` only when you want the older, faster nearest-target proxy for throughput comparisons. `--steps` remains accepted as a legacy alias for `--rollout_steps`, but new runs should use `--rollout_steps` and `--episode_steps` explicitly. `--enable_comets` uses the approximate JAX-native comet schedule unless states were imported with official comet path metadata; runs record `comet_mode` and `comet_warning` in config and metrics.
 
+JAX PPO uses the optimized path by default:
+
+- `--precision bfloat16` casts BC policy forward-pass compute to reduced dtype while keeping checkpoint loading unchanged; use `--precision float32` or `--precision float16` to override.
+- `--matmul_precision highest` forwards to `jax_default_matmul_precision`; pass another accepted value to override.
+- PPO loss policy evaluation uses `jax.checkpoint`; pass `--no_remat_policy_eval` to disable it.
+- Rollout trajectories store compact planet mask inputs and rebuild full action masks during PPO loss; pass `--no_recompute_masks` to store full masks.
+- `--profile_dir traces --profile_updates 1` wraps the first update in `jax.profiler.trace`; pass `--no_profile` to disable trace output.
+- Split rollout/train JITs queue the next non-PFSP rollout before the current train step, recording the one-update policy lag in metrics; pass `--no_async_rollout_prefetch` to use the fused update path.
+
 Evaluate a saved JAX PPO checkpoint against the real heuristic:
 
 ```bash

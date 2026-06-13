@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 import json
 from pathlib import Path
@@ -23,7 +24,7 @@ from orbit_jax_env.state import EnvState
 from .actions import action_rows_from_source_choices
 from .bc_policy import bc_forward, init_value_head, load_bc_jax_params, value_apply
 from .checkpointing import load_jax_checkpoint, load_jax_training_state, save_jax_checkpoint, save_jax_training_state
-from .features import NOOP_TARGET_SLOT, build_bc_features_for_seat
+from .features import NOOP_TARGET_SLOT, build_bc_features_for_seat, build_selected_masks_from_arrays
 from .pfsp import OPP_FROZEN_POLICY, OPP_JAX_PROXY, OPP_NONE, OPP_SIMPLE_HEURISTIC, add_snapshot_entry, build_initial_manifest, build_match_plan, load_manifest, save_manifest, update_manifest_from_slot_stats
 from .pfsp_bank import build_pfsp_bank, tree_stack, tree_take
 
@@ -74,6 +75,13 @@ class JaxPPOConfig:
     pfsp_4p_layout: str = "one_pfsp_two_anchors"
     resume: bool = True
     resume_from: str | None = None
+    precision: str = "bfloat16"
+    matmul_precision: str = "highest"
+    remat_policy_eval: bool = True
+    recompute_masks: bool = True
+    profile_dir: str | None = "traces"
+    profile_updates: int = 1
+    async_rollout_prefetch: bool = True
 
 
 def _append_jsonl(path: Path, row: dict[str, Any]) -> None:
@@ -88,6 +96,29 @@ def _check_runtime(require_cuda: bool) -> dict[str, Any]:
     if require_cuda and backend not in {"gpu", "cuda"}:
         raise RuntimeError(f"JAX CUDA backend is required, but backend={backend!r}, devices={devices}")
     return {"jax_backend": backend, "jax_devices": devices}
+
+
+def _apply_jax_precision_config(config: JaxPPOConfig) -> None:
+    if config.matmul_precision == "default":
+        return
+    jax.config.update("jax_default_matmul_precision", config.matmul_precision)
+
+
+def _bc_compute_dtype_name(precision: str) -> str:
+    name = str(precision).lower()
+    if name in {"float32", "bfloat16", "float16"}:
+        return name
+    raise RuntimeError("--precision must be float32, bfloat16, or float16")
+
+
+def _profile_update_context(config: JaxPPOConfig, out_dir: Path, update_index: int):
+    if not config.profile_dir or int(update_index) > int(config.profile_updates):
+        return nullcontext()
+    trace_dir = Path(config.profile_dir)
+    if not trace_dir.is_absolute():
+        trace_dir = out_dir / trace_dir
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    return jax.profiler.trace(str(trace_dir))
 
 
 def _safe_target_logits(logits: jnp.ndarray, mask: jnp.ndarray) -> jnp.ndarray:
@@ -349,8 +380,6 @@ def _make_update(config: JaxPPOConfig, bc_config: dict[str, Any], state_bank: En
                     "global_features": feats.global_features,
                     "target_state_features": feats.target_state_features,
                     "pair_features": feats.pair_features,
-                    "target_mask": feats.target_mask,
-                    "amount_mask": feats.amount_mask,
                     "source_slots": feats.source_slots,
                     "source_mask": feats.source_mask,
                     "active_source_count": feats.active_source_count,
@@ -377,6 +406,19 @@ def _make_update(config: JaxPPOConfig, bc_config: dict[str, Any], state_bank: En
                     "opponent_kind": opponent_kind,
                     "opponent_slot": opponent_slot,
                 }
+                if config.recompute_masks:
+                    store = {
+                        **store,
+                        "mask_planet_owner": state.planet_owner,
+                        "mask_planet_alive": state.planet_alive,
+                        "mask_planet_ships": state.planet_ships,
+                    }
+                else:
+                    store = {
+                        **store,
+                        "target_mask": feats.target_mask,
+                        "amount_mask": feats.amount_mask,
+                    }
                 return next_state, store
 
             stepped_states, stores = jax.vmap(one_env)(carry_states, action_keys, learner_seat_plan, opponent_kind_plan, opponent_slot_plan)
@@ -398,26 +440,59 @@ def _make_update(config: JaxPPOConfig, bc_config: dict[str, Any], state_bank: En
         adv, returns = _compute_gae(rewards, values, dones, last_values, float(config.gamma), float(config.lam))
         adv = (adv - jnp.mean(adv)) / (jnp.std(adv) + 1.0e-8)
 
-        def one_eval(pf, gf, tsf, pair, tm, am, slots, sm, active_count, selected_count, ti, ai):
-            from .features import JaxBCFeatures
+        from .features import JaxBCFeatures
 
+        def eval_with_config(p, pf, gf, tsf, pair, tm, am, slots, sm, active_count, selected_count, ti, ai):
             feats = JaxBCFeatures(pf, gf, tsf, pair, tm, am, slots, sm, active_count, selected_count)
-            return _policy_eval(params, feats, bc_config, ti, ai)
+            return _policy_eval(p, feats, bc_config, ti, ai)
 
-        new_lp, new_v, ent = jax.vmap(jax.vmap(one_eval))(
-            traj["planet_features"],
-            traj["global_features"],
-            traj["target_state_features"],
-            traj["pair_features"],
-            traj["target_mask"],
-            traj["amount_mask"],
-            traj["source_slots"],
-            traj["source_mask"],
-            traj["active_source_count"],
-            traj["selected_source_count"],
-            traj["target_idx"],
-            traj["amount_idx"],
-        )
+        policy_eval = jax.checkpoint(eval_with_config) if config.remat_policy_eval else eval_with_config
+        if config.recompute_masks:
+            def one_eval(pf, gf, tsf, pair, slots, sm, active_count, selected_count, ti, ai, owner, alive, ships, learner_seat):
+                tm, am = build_selected_masks_from_arrays(
+                    planet_owner=owner,
+                    planet_alive=alive,
+                    planet_ships=ships,
+                    player_id=learner_seat,
+                    source_slots=slots,
+                    source_mask=sm,
+                )
+                return policy_eval(params, pf, gf, tsf, pair, tm, am, slots, sm, active_count, selected_count, ti, ai)
+
+            new_lp, new_v, ent = jax.vmap(jax.vmap(one_eval))(
+                traj["planet_features"],
+                traj["global_features"],
+                traj["target_state_features"],
+                traj["pair_features"],
+                traj["source_slots"],
+                traj["source_mask"],
+                traj["active_source_count"],
+                traj["selected_source_count"],
+                traj["target_idx"],
+                traj["amount_idx"],
+                traj["mask_planet_owner"],
+                traj["mask_planet_alive"],
+                traj["mask_planet_ships"],
+                traj["learner_seat"],
+            )
+        else:
+            def one_eval(pf, gf, tsf, pair, tm, am, slots, sm, active_count, selected_count, ti, ai):
+                return policy_eval(params, pf, gf, tsf, pair, tm, am, slots, sm, active_count, selected_count, ti, ai)
+
+            new_lp, new_v, ent = jax.vmap(jax.vmap(one_eval))(
+                traj["planet_features"],
+                traj["global_features"],
+                traj["target_state_features"],
+                traj["pair_features"],
+                traj["target_mask"],
+                traj["amount_mask"],
+                traj["source_slots"],
+                traj["source_mask"],
+                traj["active_source_count"],
+                traj["selected_source_count"],
+                traj["target_idx"],
+                traj["amount_idx"],
+            )
         ratio = jnp.exp(new_lp - traj["old_logprob"])
         pg = -jnp.mean(jnp.minimum(ratio * adv, jnp.clip(ratio, 1.0 - float(config.clip), 1.0 + float(config.clip)) * adv))
         vloss = jnp.mean((returns - new_v) ** 2)
@@ -460,11 +535,12 @@ def _make_update(config: JaxPPOConfig, bc_config: dict[str, Any], state_bank: En
             "selected_decisions": jnp.sum(traj["selected_source_count"].astype(jnp.float32)),
             "dropped_decisions": jnp.sum(jnp.maximum(traj["active_source_count"] - traj["selected_source_count"], 0).astype(jnp.float32)),
             "source_cap": jnp.asarray(float(config.source_cap), dtype=jnp.float32),
+            "recompute_masks": jnp.asarray(float(config.recompute_masks), dtype=jnp.float32),
+            "remat_policy_eval": jnp.asarray(float(config.remat_policy_eval), dtype=jnp.float32),
         }
         return loss, metrics
 
-    def update(params, opt_state, key, states, cycle_index, update_index, frozen_bc_params, learner_seat_plan, opponent_kind_plan, opponent_slot_plan):
-        traj, next_states, next_cycle_index = rollout(params, key, states, cycle_index, frozen_bc_params, learner_seat_plan, opponent_kind_plan, opponent_slot_plan)
+    def train_on_traj(params, opt_state, traj, next_states, next_cycle_index, update_index, learner_seat_plan):
         learner_seats = learner_seat_plan
         last_values = jax.vmap(lambda s, seat: _value_for_state(params, s, seat, bc_config))(next_states, learner_seats)
 
@@ -484,8 +560,12 @@ def _make_update(config: JaxPPOConfig, bc_config: dict[str, Any], state_bank: En
         league_stats = _pfsp_slot_stats(traj, int(config.pfsp_max_policy_slots), int(config.players))
         return params2, opt_state2, next_states, next_cycle_index, metrics, league_stats
 
+    def update(params, opt_state, key, states, cycle_index, update_index, frozen_bc_params, learner_seat_plan, opponent_kind_plan, opponent_slot_plan):
+        traj, next_states, next_cycle_index = rollout(params, key, states, cycle_index, frozen_bc_params, learner_seat_plan, opponent_kind_plan, opponent_slot_plan)
+        return train_on_traj(params, opt_state, traj, next_states, next_cycle_index, update_index, learner_seat_plan)
+
     optimizer = optax.chain(optax.clip_by_global_norm(float(config.max_grad_norm)), optax.adam(float(config.lr)))
-    return jax.jit(update), optimizer
+    return jax.jit(update), optimizer, jax.jit(rollout), jax.jit(train_on_traj)
 
 
 def _default_match_plan_arrays(config: JaxPPOConfig):
@@ -547,6 +627,13 @@ def _assert_resume_bc_compatible(current_bc_config: dict[str, Any], checkpoint_c
                 f"cannot resume PPO checkpoint with incompatible BC config: "
                 f"{key} expected {current_bc_config.get(key)!r}, got {saved_bc_config.get(key)!r}"
             )
+    current_dtype = str(current_bc_config.get("compute_dtype", "float32"))
+    saved_dtype = str(saved_bc_config.get("compute_dtype", "float32"))
+    if current_dtype != saved_dtype:
+        raise RuntimeError(
+            f"cannot resume PPO checkpoint with incompatible PPO precision: "
+            f"expected {current_dtype!r}, got {saved_dtype!r}"
+        )
 
 
 def _resume_env_state_compatible(saved: dict[str, Any], config: JaxPPOConfig) -> bool:
@@ -574,6 +661,7 @@ def _league_manifest_path(out_dir: Path, config: JaxPPOConfig) -> Path:
 
 
 def train(config: JaxPPOConfig) -> dict[str, Any]:
+    _apply_jax_precision_config(config)
     runtime = _check_runtime(config.require_cuda)
     if config.opponent not in {"simple_heuristic_jax", "jax_proxy", "pfsp_jax"}:
         raise RuntimeError("orbit_ppo_jax.train supports --opponent simple_heuristic_jax, jax_proxy, or pfsp_jax")
@@ -585,6 +673,9 @@ def train(config: JaxPPOConfig) -> dict[str, Any]:
         raise RuntimeError("--state_bank_mode must be either cycle or random")
     if int(config.source_cap) < 1 or int(config.source_cap) > P_MAX:
         raise RuntimeError(f"--source_cap must be between 1 and {P_MAX}")
+    if int(config.profile_updates) < 1:
+        raise RuntimeError("--profile_updates must be >= 1")
+    _bc_compute_dtype_name(config.precision)
 
     state_bank = None
     state_bank_metadata: dict[str, Any] = {}
@@ -631,6 +722,7 @@ def train(config: JaxPPOConfig) -> dict[str, Any]:
         json.dump(saved_config, f, indent=2, sort_keys=True)
 
     bc_params, bc_config = load_bc_jax_params(config.bc_checkpoint)
+    bc_config = {**bc_config, "compute_dtype": _bc_compute_dtype_name(config.precision)}
     league_manifest = None
     manifest_path = out_dir / "league" / "manifest.json"
     if config.pfsp_enabled:
@@ -654,7 +746,7 @@ def train(config: JaxPPOConfig) -> dict[str, Any]:
     key = jax.random.PRNGKey(int(config.seed))
     key, value_key = jax.random.split(key)
     params = {"bc": bc_params, "value": init_value_head(value_key, int(bc_config["hidden_size"]))}
-    update_fn, optimizer = _make_update(config, bc_config, state_bank)
+    update_fn, optimizer, rollout_fn, train_on_traj_fn = _make_update(config, bc_config, state_bank)
     opt_state = optimizer.init(params)
     env_config = EnvConfig(
         num_players=int(config.players),
@@ -698,41 +790,97 @@ def train(config: JaxPPOConfig) -> dict[str, Any]:
             else:
                 resume_env_state = "reset_incompatible"
 
+    def match_plan_arrays(update_index: int):
+        if config.pfsp_enabled and league_manifest is not None:
+            plan = build_match_plan(
+                league_manifest,
+                rng=np.random.default_rng(int(config.seed) + int(update_index)),
+                envs=int(config.envs),
+                players=int(config.players),
+                learner_seat_mode=str(config.pfsp_learner_seat_mode),
+                anchor_fraction=float(config.pfsp_anchor_fraction),
+                layout=str(config.pfsp_4p_layout),
+                min_games_per_entry=int(config.pfsp_min_games_per_entry),
+                hard_low=float(config.pfsp_hard_low),
+                hard_high=float(config.pfsp_hard_high),
+                hard_bonus=float(config.pfsp_hard_bonus),
+                exploration_bonus=float(config.pfsp_exploration_bonus),
+            )
+            return plan.learner_seat, plan.opponent_kind, plan.opponent_slot
+        return _default_match_plan_arrays(config)
+
+    def frozen_policy_params():
+        return frozen_bank.bc_params if frozen_bank is not None else tree_stack([bc_params])
+
+    async_prefetch_enabled = bool(config.async_rollout_prefetch and not config.pfsp_enabled)
+    prefetched_rollout = None
+
     for local_update_index in range(1, int(config.updates) + 1):
         update_index = int(start_update) + int(local_update_index)
-        key, step_key = jax.random.split(key)
         t0 = time.time()
-        params, opt_state, states, state_bank_cycle_index, metrics_jax, league_stats_jax = update_fn(
-            params,
-            opt_state,
-            step_key,
-            states,
-            state_bank_cycle_index,
-            jnp.asarray(update_index, dtype=jnp.int32),
-            frozen_bank.bc_params if frozen_bank is not None else tree_stack([bc_params]),
-            *(
-                (
-                    lambda plan: (plan.learner_seat, plan.opponent_kind, plan.opponent_slot)
-                )(
-                    build_match_plan(
-                        league_manifest,
-                        rng=np.random.default_rng(int(config.seed) + update_index),
-                        envs=int(config.envs),
-                        players=int(config.players),
-                        learner_seat_mode=str(config.pfsp_learner_seat_mode),
-                        anchor_fraction=float(config.pfsp_anchor_fraction),
-                        layout=str(config.pfsp_4p_layout),
-                        min_games_per_entry=int(config.pfsp_min_games_per_entry),
-                        hard_low=float(config.pfsp_hard_low),
-                        hard_high=float(config.pfsp_hard_high),
-                        hard_bonus=float(config.pfsp_hard_bonus),
-                        exploration_bonus=float(config.pfsp_exploration_bonus),
+        async_prefetch_pending = False
+        async_current_policy_lag = 0.0
+        async_prefetch_policy_lag = 0.0
+        if async_prefetch_enabled:
+            pending_prefetch = None
+            with _profile_update_context(config, out_dir, update_index):
+                if prefetched_rollout is None:
+                    key, step_key = jax.random.split(key)
+                    learner_seat_plan, opponent_kind_plan, opponent_slot_plan = match_plan_arrays(update_index)
+                    traj, rolled_states, rolled_cycle_index = rollout_fn(
+                        params,
+                        step_key,
+                        states,
+                        state_bank_cycle_index,
+                        frozen_policy_params(),
+                        learner_seat_plan,
+                        opponent_kind_plan,
+                        opponent_slot_plan,
                     )
+                else:
+                    traj, rolled_states, rolled_cycle_index, learner_seat_plan = prefetched_rollout
+                    prefetched_rollout = None
+                    async_current_policy_lag = 1.0
+                if local_update_index < int(config.updates):
+                    next_update_index = int(start_update) + int(local_update_index) + 1
+                    key, next_step_key = jax.random.split(key)
+                    next_learner_seat_plan, next_opponent_kind_plan, next_opponent_slot_plan = match_plan_arrays(next_update_index)
+                    next_traj, next_states, next_cycle_index = rollout_fn(
+                        params,
+                        next_step_key,
+                        rolled_states,
+                        rolled_cycle_index,
+                        frozen_policy_params(),
+                        next_learner_seat_plan,
+                        next_opponent_kind_plan,
+                        next_opponent_slot_plan,
+                    )
+                    pending_prefetch = (next_traj, next_states, next_cycle_index, next_learner_seat_plan)
+                    async_prefetch_pending = True
+                    async_prefetch_policy_lag = 1.0
+                params, opt_state, states, state_bank_cycle_index, metrics_jax, league_stats_jax = train_on_traj_fn(
+                    params,
+                    opt_state,
+                    traj,
+                    rolled_states,
+                    rolled_cycle_index,
+                    jnp.asarray(update_index, dtype=jnp.int32),
+                    learner_seat_plan,
                 )
-                if config.pfsp_enabled and league_manifest is not None
-                else _default_match_plan_arrays(config)
-            ),
-        )
+            prefetched_rollout = pending_prefetch
+        else:
+            key, step_key = jax.random.split(key)
+            with _profile_update_context(config, out_dir, update_index):
+                params, opt_state, states, state_bank_cycle_index, metrics_jax, league_stats_jax = update_fn(
+                    params,
+                    opt_state,
+                    step_key,
+                    states,
+                    state_bank_cycle_index,
+                    jnp.asarray(update_index, dtype=jnp.int32),
+                    frozen_policy_params(),
+                    *match_plan_arrays(update_index),
+                )
         jax.block_until_ready(params)
         seconds = time.time() - t0
         update_env_steps = int(config.envs) * int(config.rollout_steps)
@@ -767,6 +915,11 @@ def train(config: JaxPPOConfig) -> dict[str, Any]:
                 "resume_from": str(resume_path) if resume_path is not None else "",
                 "resume_start_update": float(start_update),
                 "resume_env_state": resume_env_state,
+                "async_rollout_prefetch_requested": float(config.async_rollout_prefetch),
+                "async_rollout_prefetch_active": float(async_prefetch_enabled),
+                "async_rollout_prefetch_pending": float(async_prefetch_pending),
+                "async_rollout_current_policy_lag": float(async_current_policy_lag),
+                "async_rollout_prefetch_policy_lag": float(async_prefetch_policy_lag),
                 **runtime,
             }
         )
@@ -908,7 +1061,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--pfsp_4p_layout", default="one_pfsp_two_anchors", choices=["one_pfsp_two_anchors"])
     ap.add_argument("--no_resume", dest="resume", action="store_false", help="Start fresh even when out_dir/latest exists.")
     ap.add_argument("--resume_from", default=None, help="Checkpoint directory to resume from; defaults to out_dir/latest when present.")
+    ap.add_argument("--precision", default="bfloat16", choices=["float32", "bfloat16", "float16"], help="Compute dtype for BC policy forward passes.")
+    ap.add_argument(
+        "--matmul_precision",
+        default="highest",
+        choices=["default", "highest", "high", "float32", "tensorfloat32", "bfloat16"],
+        help="Value for jax_default_matmul_precision when not default.",
+    )
+    ap.add_argument("--remat_policy_eval", action="store_true", help="Use jax.checkpoint on PPO loss policy evaluation.")
+    ap.add_argument("--no_remat_policy_eval", dest="remat_policy_eval", action="store_false", help="Disable PPO loss policy-evaluation rematerialization.")
+    ap.add_argument("--recompute_masks", action="store_true", help="Recompute action masks in the PPO loss from compact state fields instead of storing full masks.")
+    ap.add_argument("--no_recompute_masks", dest="recompute_masks", action="store_false", help="Store full trajectory masks instead of recomputing them during PPO loss.")
+    ap.add_argument("--profile_dir", default="traces", help="Directory for jax.profiler.trace output; relative paths are under out_dir.")
+    ap.add_argument("--no_profile", dest="profile_dir", action="store_const", const=None, help="Disable default jax.profiler.trace output.")
+    ap.add_argument("--profile_updates", type=int, default=1, help="Number of initial updates to trace when --profile_dir is set.")
+    ap.add_argument("--async_rollout_prefetch", action="store_true", help="Use split rollout/train JITs and queue the next non-PFSP rollout before the current train step.")
+    ap.add_argument("--no_async_rollout_prefetch", dest="async_rollout_prefetch", action="store_false", help="Disable split rollout/train prefetching.")
     ap.set_defaults(resume=True)
+    ap.set_defaults(remat_policy_eval=True, recompute_masks=True, async_rollout_prefetch=True)
     return ap
 
 

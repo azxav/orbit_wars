@@ -169,11 +169,20 @@ def target_state_features_from_state(state, player_id: int | jnp.ndarray) -> jnp
 
 
 def build_masks(state, player_id: int | jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+    return _full_masks_from_arrays(state.planet_owner, state.planet_alive, state.planet_ships, player_id)
+
+
+def _full_masks_from_arrays(
+    planet_owner: jnp.ndarray,
+    planet_alive: jnp.ndarray,
+    planet_ships: jnp.ndarray,
+    player_id: int | jnp.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
     seat = jnp.asarray(player_id, dtype=jnp.int32)
     source_axis = jnp.arange(P_MAX)
     target_axis = jnp.arange(P_MAX)
-    source_alive = state.planet_alive & (state.planet_owner == seat) & (state.planet_ships >= 1.0)
-    target_alive = state.planet_alive
+    source_alive = planet_alive & (planet_owner == seat) & (planet_ships >= 1.0)
+    target_alive = planet_alive
     target = jnp.broadcast_to(target_alive[None, :], (P_MAX, P_MAX)) & (source_axis[:, None] != target_axis[None, :])
     target = target & source_alive[:, None]
     target_mask = jnp.concatenate([target, source_alive[:, None]], axis=1)
@@ -183,6 +192,21 @@ def build_masks(state, player_id: int | jnp.ndarray) -> tuple[jnp.ndarray, jnp.n
     amount_mask = amount_mask.at[:, NOOP_TARGET_SLOT, :].set(False)
     amount_mask = amount_mask.at[:, NOOP_TARGET_SLOT, 0].set(source_alive)
     return target_mask, amount_mask
+
+
+def build_selected_masks_from_arrays(
+    *,
+    planet_owner: jnp.ndarray,
+    planet_alive: jnp.ndarray,
+    planet_ships: jnp.ndarray,
+    player_id: int | jnp.ndarray,
+    source_slots: jnp.ndarray,
+    source_mask: jnp.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    target_mask, amount_mask = _full_masks_from_arrays(planet_owner, planet_alive, planet_ships, player_id)
+    selected_target_mask = target_mask[source_slots] & source_mask[:, None]
+    selected_amount_mask = amount_mask[source_slots] & source_mask[:, None, None]
+    return selected_target_mask, selected_amount_mask
 
 
 def pair_features_for_source(planet_features: jnp.ndarray, target_state_features: jnp.ndarray, source_slot: int, amount_mask: jnp.ndarray) -> jnp.ndarray:

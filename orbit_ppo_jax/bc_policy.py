@@ -12,6 +12,35 @@ import torch
 ArrayTree = dict[str, Any]
 
 
+def _compute_dtype(config: dict[str, Any]) -> jnp.dtype:
+    name = str(config.get("compute_dtype", "float32")).lower()
+    if name in {"float32", "fp32", "none"}:
+        return jnp.float32
+    if name in {"bfloat16", "bf16"}:
+        return jnp.bfloat16
+    if name in {"float16", "fp16"}:
+        return jnp.float16
+    raise RuntimeError(f"unsupported JAX BC compute dtype: {name}")
+
+
+def _cast_floating_tree(tree: Any, dtype: jnp.dtype) -> Any:
+    def cast_leaf(x):
+        if x is None:
+            return None
+        if hasattr(x, "dtype") and jnp.issubdtype(x.dtype, jnp.floating):
+            return x.astype(dtype)
+        return x
+
+    return jax.tree_util.tree_map(cast_leaf, tree, is_leaf=lambda x: x is None)
+
+
+def _cast_floating_batch(batch: dict[str, jax.Array], dtype: jnp.dtype) -> dict[str, jax.Array]:
+    return {
+        key: value.astype(dtype) if hasattr(value, "dtype") and jnp.issubdtype(value.dtype, jnp.floating) else value
+        for key, value in batch.items()
+    }
+
+
 def _to_jax(t: torch.Tensor) -> jax.Array:
     return jnp.asarray(t.detach().cpu().numpy(), dtype=jnp.float32)
 
@@ -117,6 +146,10 @@ def encode_context(params: ArrayTree, batch: dict[str, jax.Array], config: dict[
 
 
 def bc_forward(params: ArrayTree, batch: dict[str, jax.Array], config: dict[str, Any]) -> dict[str, jax.Array]:
+    compute_dtype = _compute_dtype(config)
+    if compute_dtype != jnp.float32:
+        params = _cast_floating_tree(params, compute_dtype)
+        batch = _cast_floating_batch(batch, compute_dtype)
     global_ctx, planet_ctx = encode_context(params, batch, config)
     bsz, pmax, hidden = planet_ctx.shape
     source_idx = jnp.clip(batch["source_slot"].astype(jnp.int32), 0, pmax - 1)

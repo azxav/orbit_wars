@@ -154,6 +154,34 @@ def test_batched_pair_features_match_per_source_rows() -> None:
     np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), rtol=1e-5, atol=1e-5)
 
 
+def test_selected_masks_can_be_recomputed_from_compact_state_arrays() -> None:
+    from orbit_jax_env.state import manual_state
+    from orbit_ppo_jax.features import build_bc_features_for_seat, build_selected_masks_from_arrays
+
+    state = manual_state(
+        planet_rows=[
+            [10, 0, 20.0, 50.0, 2.0, 20.0, 3.0],
+            [11, 0, 30.0, 50.0, 2.0, 14.0, 1.0],
+            [12, 1, 80.0, 75.0, 2.0, 12.0, 2.0],
+            [13, -1, 70.0, 50.0, 2.0, 5.0, 1.0],
+        ],
+        num_players=2,
+    )
+    features = build_bc_features_for_seat(state, 0, source_cap=3)
+
+    target_mask, amount_mask = build_selected_masks_from_arrays(
+        planet_owner=state.planet_owner,
+        planet_alive=state.planet_alive,
+        planet_ships=state.planet_ships,
+        player_id=jnp.asarray(0, dtype=jnp.int32),
+        source_slots=features.source_slots,
+        source_mask=features.source_mask,
+    )
+
+    np.testing.assert_array_equal(np.asarray(target_mask), np.asarray(features.target_mask))
+    np.testing.assert_array_equal(np.asarray(amount_mask), np.asarray(features.amount_mask))
+
+
 def test_compact_features_select_top_ship_active_owned_sources() -> None:
     from orbit_jax_env.state import manual_state
     from orbit_ppo_jax.features import build_bc_features_for_seat
@@ -268,6 +296,12 @@ def test_tiny_train_writes_checkpoint_and_metrics(tmp_path: Path) -> None:
     assert "steps" not in config
     assert config["rollout_steps"] == 1
     assert config["episode_steps"] == 500
+    assert config["precision"] == "bfloat16"
+    assert config["matmul_precision"] == "highest"
+    assert config["remat_policy_eval"] is True
+    assert config["recompute_masks"] is True
+    assert config["async_rollout_prefetch"] is True
+    assert config["profile_dir"] == "traces"
     metrics = json.loads((out_dir / "metrics.jsonl").read_text().splitlines()[0])
     assert metrics["update"] == 1
     assert metrics["env_steps"] == 1
@@ -279,6 +313,10 @@ def test_tiny_train_writes_checkpoint_and_metrics(tmp_path: Path) -> None:
     assert "approx_kl" in metrics
     assert "clip_frac" in metrics
     assert "value_explained_variance" in metrics
+    assert metrics["recompute_masks"] == 1.0
+    assert metrics["remat_policy_eval"] == 1.0
+    assert metrics["async_rollout_prefetch_requested"] == 1.0
+    assert metrics["async_rollout_prefetch_active"] == 1.0
 
 
 def test_steps_alias_normalizes_to_rollout_steps() -> None:
@@ -300,6 +338,132 @@ def test_steps_alias_normalizes_to_rollout_steps() -> None:
     assert config.rollout_steps == 7
     assert config.episode_steps == 500
     assert config.source_cap == 32
+
+
+def test_jax_ppo_optimization_args_are_accepted() -> None:
+    from orbit_ppo_jax.train import build_arg_parser, config_from_args
+
+    args = build_arg_parser().parse_args(
+        [
+            "--bc_checkpoint",
+            "bc.pt",
+            "--out_dir",
+            "out",
+            "--precision",
+            "bfloat16",
+            "--matmul_precision",
+            "highest",
+            "--remat_policy_eval",
+            "--recompute_masks",
+            "--profile_dir",
+            "traces",
+            "--profile_updates",
+            "2",
+            "--async_rollout_prefetch",
+        ]
+    )
+    config = config_from_args(args)
+
+    assert config.precision == "bfloat16"
+    assert config.matmul_precision == "highest"
+    assert config.remat_policy_eval is True
+    assert config.recompute_masks is True
+    assert config.profile_dir == "traces"
+    assert config.profile_updates == 2
+    assert config.async_rollout_prefetch is True
+
+
+def test_jax_ppo_optimization_defaults_are_active() -> None:
+    from orbit_ppo_jax.train import build_arg_parser, config_from_args
+
+    args = build_arg_parser().parse_args(
+        [
+            "--bc_checkpoint",
+            "bc.pt",
+            "--out_dir",
+            "out",
+        ]
+    )
+    config = config_from_args(args)
+
+    assert config.precision == "bfloat16"
+    assert config.matmul_precision == "highest"
+    assert config.remat_policy_eval is True
+    assert config.recompute_masks is True
+    assert config.profile_dir == "traces"
+    assert config.profile_updates == 1
+    assert config.async_rollout_prefetch is True
+
+
+def test_jax_ppo_optimization_defaults_can_be_disabled() -> None:
+    from orbit_ppo_jax.train import build_arg_parser, config_from_args
+
+    args = build_arg_parser().parse_args(
+        [
+            "--bc_checkpoint",
+            "bc.pt",
+            "--out_dir",
+            "out",
+            "--precision",
+            "float32",
+            "--matmul_precision",
+            "default",
+            "--no_remat_policy_eval",
+            "--no_recompute_masks",
+            "--no_profile",
+            "--no_async_rollout_prefetch",
+        ]
+    )
+    config = config_from_args(args)
+
+    assert config.precision == "float32"
+    assert config.matmul_precision == "default"
+    assert config.remat_policy_eval is False
+    assert config.recompute_masks is False
+    assert config.profile_dir is None
+    assert config.async_rollout_prefetch is False
+
+
+@pytest.mark.parametrize("compute_dtype, expected_dtype", [("bfloat16", jnp.bfloat16), ("float16", jnp.float16)])
+def test_bc_forward_uses_configured_compute_dtype(tmp_path: Path, compute_dtype: str, expected_dtype: jnp.dtype) -> None:
+    from orbit_ppo_jax.bc_policy import bc_forward, load_bc_jax_params
+
+    ckpt = _tiny_bc_checkpoint(tmp_path / "bc")
+    params, config = load_bc_jax_params(ckpt)
+    config = {**config, "compute_dtype": compute_dtype}
+    batch = {k: jnp.asarray(v.detach().cpu().numpy()) for k, v in _torch_batch().items()}
+
+    actual = bc_forward(params, batch, config)
+
+    assert actual["target_logits"].dtype == expected_dtype
+    assert actual["amount_logits"].dtype == expected_dtype
+
+
+def test_profile_context_uses_jax_profiler_trace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from contextlib import contextmanager
+    from orbit_ppo_jax import train as train_mod
+
+    calls = []
+
+    @contextmanager
+    def fake_trace(path):
+        calls.append(Path(path))
+        yield
+
+    monkeypatch.setattr(train_mod.jax.profiler, "trace", fake_trace)
+    config = train_mod.JaxPPOConfig(
+        bc_checkpoint="bc.pt",
+        out_dir=str(tmp_path / "out"),
+        profile_dir="profile",
+        profile_updates=1,
+    )
+
+    with train_mod._profile_update_context(config, tmp_path / "out", 1):
+        pass
+    with train_mod._profile_update_context(config, tmp_path / "out", 2):
+        pass
+
+    assert calls == [tmp_path / "out" / "profile"]
 
 
 def test_policy_sample_act_uses_two_bc_forwards(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -462,6 +626,7 @@ def test_tiny_train_with_small_source_cap_records_compact_metrics(tmp_path: Path
             "0",
             "--source_cap",
             "2",
+            "--no_profile",
         ]
     )
 
@@ -473,6 +638,195 @@ def test_tiny_train_with_small_source_cap_records_compact_metrics(tmp_path: Path
     assert "dropped_decisions" in metrics
     assert metrics["selected_decisions"] <= metrics["decisions"]
     assert (out_dir / "latest" / "params.npz").exists()
+
+
+def test_tiny_train_with_precision_remat_and_recomputed_masks(tmp_path: Path) -> None:
+    from orbit_ppo_jax.train import main
+
+    ckpt = _tiny_bc_checkpoint(tmp_path / "bc")
+    out_dir = tmp_path / "ppo_optimized"
+    main(
+        [
+            "--bc_checkpoint",
+            str(ckpt),
+            "--out_dir",
+            str(out_dir),
+            "--players",
+            "2",
+            "--envs",
+            "1",
+            "--rollout_steps",
+            "1",
+            "--episode_steps",
+            "500",
+            "--updates",
+            "1",
+            "--eval_games",
+            "0",
+            "--source_cap",
+            "2",
+            "--precision",
+            "bfloat16",
+            "--remat_policy_eval",
+            "--recompute_masks",
+            "--no_profile",
+        ]
+    )
+
+    config = json.loads((out_dir / "config.json").read_text())
+    metrics = json.loads((out_dir / "metrics.jsonl").read_text().splitlines()[0])
+    assert config["precision"] == "bfloat16"
+    assert config["remat_policy_eval"] is True
+    assert config["recompute_masks"] is True
+    assert metrics["recompute_masks"] == 1.0
+    assert metrics["remat_policy_eval"] == 1.0
+    assert (out_dir / "latest" / "params.npz").exists()
+
+
+def test_recompute_masks_rollout_omits_full_masks_from_trajectory(tmp_path: Path) -> None:
+    from orbit_jax_env.config import EnvConfig
+    from orbit_jax_env.reset import reset
+    from orbit_ppo_jax.bc_policy import init_value_head, load_bc_jax_params
+    from orbit_ppo_jax.pfsp_bank import tree_stack
+    from orbit_ppo_jax.train import JaxPPOConfig, _default_match_plan_arrays, _make_update
+
+    ckpt = _tiny_bc_checkpoint(tmp_path / "bc")
+    config = JaxPPOConfig(
+        bc_checkpoint=str(ckpt),
+        out_dir=str(tmp_path / "out"),
+        players=2,
+        envs=1,
+        rollout_steps=1,
+        episode_steps=500,
+        source_cap=2,
+        recompute_masks=True,
+    )
+    bc_params, bc_config = load_bc_jax_params(ckpt)
+    bc_config = {**bc_config, "compute_dtype": "float32"}
+    params = {"bc": bc_params, "value": init_value_head(jax.random.PRNGKey(0), int(bc_config["hidden_size"]))}
+    _update_fn, _optimizer, rollout_fn, _train_on_traj_fn = _make_update(config, bc_config)
+    states = jax.vmap(lambda key: reset(key, EnvConfig(num_players=2, episode_steps=500)))(jax.random.split(jax.random.PRNGKey(1), 1))
+
+    traj, _next_states, _next_cycle_index = rollout_fn(
+        params,
+        jax.random.PRNGKey(2),
+        states,
+        jnp.asarray(0, dtype=jnp.int32),
+        tree_stack([bc_params]),
+        *_default_match_plan_arrays(config),
+    )
+
+    assert "target_mask" not in traj
+    assert "amount_mask" not in traj
+    assert "mask_planet_owner" in traj
+    assert "mask_planet_alive" in traj
+    assert "mask_planet_ships" in traj
+
+
+def test_tiny_train_async_rollout_prefetch_records_active_metrics(tmp_path: Path) -> None:
+    from orbit_ppo_jax.train import main
+
+    ckpt = _tiny_bc_checkpoint(tmp_path / "bc")
+    out_dir = tmp_path / "ppo_async"
+    main(
+        [
+            "--bc_checkpoint",
+            str(ckpt),
+            "--out_dir",
+            str(out_dir),
+            "--players",
+            "2",
+            "--envs",
+            "1",
+            "--rollout_steps",
+            "1",
+            "--episode_steps",
+            "500",
+            "--updates",
+            "2",
+            "--eval_games",
+            "0",
+            "--source_cap",
+            "2",
+            "--async_rollout_prefetch",
+            "--no_profile",
+        ]
+    )
+
+    rows = [json.loads(line) for line in (out_dir / "metrics.jsonl").read_text().splitlines()]
+    assert [row["update"] for row in rows] == [1, 2]
+    assert rows[0]["async_rollout_prefetch_requested"] == 1.0
+    assert rows[0]["async_rollout_prefetch_active"] == 1.0
+    assert rows[1]["async_rollout_prefetch_active"] == 1.0
+    assert (out_dir / "latest" / "params.npz").exists()
+
+
+def test_async_rollout_prefetch_schedules_next_rollout_before_current_training(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from orbit_ppo_jax import train as train_mod
+
+    ckpt = _tiny_bc_checkpoint(tmp_path / "bc")
+    out_dir = tmp_path / "ppo_async_order"
+    call_order: list[str] = []
+
+    class FakeOptimizer:
+        def init(self, _params):
+            return {"step": jnp.asarray(0, dtype=jnp.int32)}
+
+    def fake_rollout(_params, _key, states, cycle_index, *_args):
+        call_order.append("rollout")
+        return {"dummy": jnp.asarray(0.0, dtype=jnp.float32)}, states, cycle_index
+
+    def fake_train_on_traj(params, opt_state, _traj, next_states, next_cycle_index, *_args):
+        call_order.append("train")
+        metrics = {
+            "loss": jnp.asarray(0.0, dtype=jnp.float32),
+            "mean_reward": jnp.asarray(0.0, dtype=jnp.float32),
+            "done_rate": jnp.asarray(0.0, dtype=jnp.float32),
+            "invalid_action_count": jnp.asarray(0.0, dtype=jnp.float32),
+        }
+        league_stats = {
+            "slot_games": jnp.zeros((4,), dtype=jnp.float32),
+            "slot_score_sum": jnp.zeros((4,), dtype=jnp.float32),
+            "slot_reward_sum": jnp.zeros((4,), dtype=jnp.float32),
+            "slot_rank_sum": jnp.zeros((4,), dtype=jnp.float32),
+            "kind_games": jnp.zeros((4,), dtype=jnp.float32),
+            "kind_score_sum": jnp.zeros((4,), dtype=jnp.float32),
+            "kind_reward_sum": jnp.zeros((4,), dtype=jnp.float32),
+            "kind_rank_sum": jnp.zeros((4,), dtype=jnp.float32),
+        }
+        return params, opt_state, next_states, next_cycle_index, metrics, league_stats
+
+    def fake_make_update(*_args, **_kwargs):
+        return None, FakeOptimizer(), fake_rollout, fake_train_on_traj
+
+    monkeypatch.setattr(train_mod, "_make_update", fake_make_update)
+
+    train_mod.main(
+        [
+            "--bc_checkpoint",
+            str(ckpt),
+            "--out_dir",
+            str(out_dir),
+            "--players",
+            "2",
+            "--envs",
+            "1",
+            "--rollout_steps",
+            "1",
+            "--updates",
+            "2",
+            "--eval_games",
+            "0",
+            "--async_rollout_prefetch",
+            "--no_profile",
+        ]
+    )
+
+    assert call_order[:3] == ["rollout", "rollout", "train"]
+    rows = [json.loads(line) for line in (out_dir / "metrics.jsonl").read_text().splitlines()]
+    assert rows[0]["async_rollout_prefetch_pending"] == 1.0
+    assert rows[0]["async_rollout_prefetch_policy_lag"] == 1.0
+    assert rows[1]["async_rollout_current_policy_lag"] == 1.0
 
 
 
@@ -565,6 +919,7 @@ def test_persistent_train_state_advances_across_updates(tmp_path: Path) -> None:
             "2",
             "--eval_games",
             "0",
+            "--no_profile",
         ]
     )
 
@@ -596,6 +951,7 @@ def test_tiny_train_auto_resumes_latest_across_process_passes(tmp_path: Path) ->
         "1",
         "--eval_games",
         "0",
+        "--no_profile",
     ]
 
     main(args)
@@ -628,6 +984,7 @@ def test_tiny_train_resumes_params_but_resets_envs_when_player_mode_changes(tmp_
         "1",
         "--eval_games",
         "0",
+        "--no_profile",
     ]
 
     main([*base_args, "--players", "4"])
@@ -695,6 +1052,7 @@ def test_tiny_train_can_reset_from_official_state_bank(tmp_path: Path) -> None:
             str(bank_path),
             "--state_bank_mode",
             "cycle",
+            "--no_profile",
         ]
     )
 
