@@ -301,7 +301,13 @@ def test_tiny_train_writes_checkpoint_and_metrics(tmp_path: Path) -> None:
     assert config["remat_policy_eval"] is True
     assert config["recompute_masks"] is True
     assert config["async_rollout_prefetch"] is True
+    assert config["opponent"] == "pfsp_jax"
+    assert config["pfsp_enabled"] is True
+    assert config["pfsp_include_anchors"] is False
+    assert config["pfsp_anchor_fraction"] == 0.0
+    assert config["pfsp_matrix_games"] == 0
     assert config["profile_dir"] == "traces"
+    assert (out_dir / "league" / "manifest.json").exists()
     metrics = json.loads((out_dir / "metrics.jsonl").read_text().splitlines()[0])
     assert metrics["update"] == 1
     assert metrics["env_steps"] == 1
@@ -316,7 +322,7 @@ def test_tiny_train_writes_checkpoint_and_metrics(tmp_path: Path) -> None:
     assert metrics["recompute_masks"] == 1.0
     assert metrics["remat_policy_eval"] == 1.0
     assert metrics["async_rollout_prefetch_requested"] == 1.0
-    assert metrics["async_rollout_prefetch_active"] == 1.0
+    assert metrics["async_rollout_prefetch_active"] == 0.0
 
 
 def test_steps_alias_normalizes_to_rollout_steps() -> None:
@@ -397,6 +403,45 @@ def test_jax_ppo_optimization_defaults_are_active() -> None:
     assert config.profile_updates == 1
     assert config.profile_max_env_steps == 1024
     assert config.async_rollout_prefetch is True
+
+
+def test_jax_ppo_defaults_to_pfsp_snapshot_self_play() -> None:
+    from orbit_ppo_jax.train import build_arg_parser, config_from_args
+
+    args = build_arg_parser().parse_args(
+        [
+            "--bc_checkpoint",
+            "bc.pt",
+            "--out_dir",
+            "out",
+        ]
+    )
+    config = config_from_args(args)
+
+    assert config.opponent == "pfsp_jax"
+    assert config.pfsp_enabled is True
+    assert config.pfsp_include_anchors is False
+    assert config.pfsp_anchor_fraction == 0.0
+    assert config.pfsp_matrix_games == 0
+
+
+def test_explicit_non_pfsp_opponent_disables_pfsp_by_default() -> None:
+    from orbit_ppo_jax.train import build_arg_parser, config_from_args
+
+    args = build_arg_parser().parse_args(
+        [
+            "--bc_checkpoint",
+            "bc.pt",
+            "--out_dir",
+            "out",
+            "--opponent",
+            "simple_heuristic_jax",
+        ]
+    )
+    config = config_from_args(args)
+
+    assert config.opponent == "simple_heuristic_jax"
+    assert config.pfsp_enabled is False
 
 
 def test_jax_ppo_optimization_defaults_can_be_disabled() -> None:

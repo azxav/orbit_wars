@@ -135,7 +135,7 @@ def test_pfsp_sampling_prefers_mid_score_entries() -> None:
 def test_manifest_updates_anchor_stats_from_kind_totals() -> None:
     from orbit_ppo_jax.pfsp import OPP_SIMPLE_HEURISTIC, build_initial_manifest, update_manifest_from_slot_stats
 
-    manifest = build_initial_manifest(players=2, max_policy_slots=4, bc_checkpoint="bc.pt")
+    manifest = build_initial_manifest(players=2, max_policy_slots=4, bc_checkpoint="bc.pt", include_anchors=True)
     updated = update_manifest_from_slot_stats(
         manifest,
         slot_games=[0, 0, 0, 0],
@@ -322,8 +322,8 @@ def test_match_plan_prioritizes_entries_below_min_games() -> None:
     assert np.asarray(plan.opponent_slot)[:, 1].tolist() == [1] * 20
 
 
-def test_match_plan_4p_does_not_fill_all_opponents_with_same_frozen_policy() -> None:
-    from orbit_ppo_jax.pfsp import OPP_FROZEN_POLICY, OPP_SIMPLE_HEURISTIC, build_initial_manifest, build_match_plan
+def test_match_plan_4p_fills_all_opponents_from_snapshot_bank() -> None:
+    from orbit_ppo_jax.pfsp import OPP_FROZEN_POLICY, build_initial_manifest, build_match_plan
 
     manifest = build_initial_manifest(players=4, max_policy_slots=4, bc_checkpoint="bc.pt")
     plan = build_match_plan(
@@ -337,8 +337,7 @@ def test_match_plan_4p_does_not_fill_all_opponents_with_same_frozen_policy() -> 
     )
     kinds = np.asarray(plan.opponent_kind)[0, 1:4].tolist()
 
-    assert kinds.count(OPP_FROZEN_POLICY) == 1
-    assert OPP_SIMPLE_HEURISTIC in kinds
+    assert kinds == [OPP_FROZEN_POLICY] * 3
 
 
 def test_match_plan_4p_keeps_one_frozen_policy_with_multiple_frozen_entries() -> None:
@@ -371,7 +370,27 @@ def test_match_plan_4p_keeps_one_frozen_policy_with_multiple_frozen_entries() ->
     )
 
     frozen_counts = np.sum(np.asarray(plan.opponent_kind) == OPP_FROZEN_POLICY, axis=1)
-    np.testing.assert_array_equal(frozen_counts, np.ones((8,), dtype=np.int64))
+    np.testing.assert_array_equal(frozen_counts, np.full((8,), 3, dtype=np.int64))
+
+
+def test_match_plan_4p_defaults_to_snapshot_opponents_only() -> None:
+    from orbit_ppo_jax.pfsp import OPP_FROZEN_POLICY, build_initial_manifest, build_match_plan
+
+    manifest = build_initial_manifest(players=4, max_policy_slots=4, bc_checkpoint="bc.pt")
+    plan = build_match_plan(
+        manifest,
+        rng=np.random.default_rng(0),
+        envs=4,
+        players=4,
+        learner_seat_mode="rotate",
+        anchor_fraction=0.0,
+        layout="one_pfsp_two_anchors",
+    )
+
+    kinds = np.asarray(plan.opponent_kind)
+    for env_i, learner_seat in enumerate(np.asarray(plan.learner_seat)):
+        opponent_seats = [seat for seat in range(4) if seat != int(learner_seat)]
+        assert kinds[env_i, opponent_seats].tolist() == [OPP_FROZEN_POLICY] * 3
 
 
 def test_pfsp_bank_stacks_checkpoint_params_fixed_shape(tmp_path: Path) -> None:
@@ -487,6 +506,7 @@ def test_pfsp_cli_args_are_accepted() -> None:
             "--pfsp_enabled",
             "--pfsp_max_policy_slots",
             "8",
+            "--pfsp_include_anchors",
             "--pfsp_anchor_fraction",
             "0.5",
             "--pfsp_snapshot_interval_updates",
@@ -501,6 +521,7 @@ def test_pfsp_cli_args_are_accepted() -> None:
 
     assert config.opponent == "pfsp_jax"
     assert config.pfsp_enabled is True
+    assert config.pfsp_include_anchors is True
     assert config.pfsp_max_policy_slots == 8
     assert config.pfsp_anchor_fraction == 0.5
 
@@ -625,6 +646,7 @@ def test_tiny_train_pfsp_updates_anchor_stats_on_terminal_episode(tmp_path: Path
             "--pfsp_enabled",
             "--pfsp_max_policy_slots",
             "4",
+            "--pfsp_include_anchors",
             "--pfsp_anchor_fraction",
             "1.0",
             "--pfsp_warmup_updates",

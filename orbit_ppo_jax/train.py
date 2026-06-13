@@ -40,7 +40,7 @@ class JaxPPOConfig:
     rollout_steps: int = 32
     episode_steps: int = 500
     updates: int = 1
-    opponent: str = "simple_heuristic_jax"
+    opponent: str = "pfsp_jax"
     eval_heuristic_path: str = "orbit_wars_base.py"
     eval_games: int = 2
     eval_interval_updates: int = 5
@@ -59,9 +59,10 @@ class JaxPPOConfig:
     initial_state_bank: str | None = None
     state_bank_mode: str = "random"
     source_cap: int = 32
-    pfsp_enabled: bool = False
+    pfsp_enabled: bool = True
+    pfsp_include_anchors: bool = False
     pfsp_max_policy_slots: int = 32
-    pfsp_anchor_fraction: float = 0.25
+    pfsp_anchor_fraction: float = 0.0
     pfsp_snapshot_interval_updates: int = 10
     pfsp_warmup_updates: int = 10
     pfsp_min_games_per_entry: int = 16
@@ -69,7 +70,7 @@ class JaxPPOConfig:
     pfsp_hard_high: float = 0.55
     pfsp_hard_bonus: float = 0.15
     pfsp_exploration_bonus: float = 0.10
-    pfsp_matrix_games: int = 16
+    pfsp_matrix_games: int = 0
     pfsp_eval_interval_updates: int = 10
     pfsp_learner_seat_mode: str = "rotate"
     pfsp_4p_layout: str = "one_pfsp_two_anchors"
@@ -760,6 +761,7 @@ def train(config: JaxPPOConfig) -> dict[str, Any]:
                 players=int(config.players),
                 max_policy_slots=int(config.pfsp_max_policy_slots),
                 bc_checkpoint=config.bc_checkpoint,
+                include_anchors=bool(config.pfsp_include_anchors),
             )
             save_manifest(manifest_path, league_manifest)
         frozen_bank = build_pfsp_bank(league_manifest, bc_params, bc_config)
@@ -1048,7 +1050,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--rollout_steps", type=int, default=None)
     ap.add_argument("--episode_steps", type=int, default=500)
     ap.add_argument("--updates", type=int, default=1)
-    ap.add_argument("--opponent", default="simple_heuristic_jax", choices=["simple_heuristic_jax", "jax_proxy", "pfsp_jax"])
+    ap.add_argument("--opponent", default="pfsp_jax", choices=["simple_heuristic_jax", "jax_proxy", "pfsp_jax"])
     ap.add_argument("--eval_heuristic_path", default="orbit_wars_base.py")
     ap.add_argument("--eval_games", type=int, default=2)
     ap.add_argument("--eval_interval_updates", type=int, default=5)
@@ -1067,9 +1069,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--initial_state_bank", default=None)
     ap.add_argument("--state_bank_mode", default="random", choices=["cycle", "random"])
     ap.add_argument("--source_cap", type=int, default=32)
-    ap.add_argument("--pfsp_enabled", action="store_true")
+    ap.add_argument("--pfsp_enabled", dest="pfsp_enabled", action="store_true")
+    ap.add_argument("--no_pfsp_enabled", dest="pfsp_enabled", action="store_false")
+    ap.add_argument("--pfsp_include_anchors", action="store_true", help="Include heuristic/proxy anchors in the PFSP league for explicit benchmark mixing.")
     ap.add_argument("--pfsp_max_policy_slots", type=int, default=32)
-    ap.add_argument("--pfsp_anchor_fraction", type=float, default=0.25)
+    ap.add_argument("--pfsp_anchor_fraction", type=float, default=0.0)
     ap.add_argument("--pfsp_snapshot_interval_updates", type=int, default=10)
     ap.add_argument("--pfsp_warmup_updates", type=int, default=10)
     ap.add_argument("--pfsp_min_games_per_entry", type=int, default=16)
@@ -1077,7 +1081,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--pfsp_hard_high", type=float, default=0.55)
     ap.add_argument("--pfsp_hard_bonus", type=float, default=0.15)
     ap.add_argument("--pfsp_exploration_bonus", type=float, default=0.10)
-    ap.add_argument("--pfsp_matrix_games", type=int, default=16)
+    ap.add_argument("--pfsp_matrix_games", type=int, default=0)
     ap.add_argument("--pfsp_eval_interval_updates", type=int, default=10)
     ap.add_argument("--pfsp_learner_seat_mode", default="rotate", choices=["fixed0", "rotate", "random"])
     ap.add_argument("--pfsp_4p_layout", default="one_pfsp_two_anchors", choices=["one_pfsp_two_anchors"])
@@ -1100,7 +1104,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--profile_max_env_steps", type=int, default=1024, help="Skip automatic profiling when envs * rollout_steps exceeds this limit; set 0 to force tracing.")
     ap.add_argument("--async_rollout_prefetch", action="store_true", help="Use split rollout/train JITs and queue the next non-PFSP rollout before the current train step.")
     ap.add_argument("--no_async_rollout_prefetch", dest="async_rollout_prefetch", action="store_false", help="Disable split rollout/train prefetching.")
-    ap.set_defaults(resume=True)
+    ap.set_defaults(resume=True, pfsp_enabled=None)
     ap.set_defaults(remat_policy_eval=True, recompute_masks=True, async_rollout_prefetch=True)
     return ap
 
@@ -1110,6 +1114,8 @@ def config_from_args(args: argparse.Namespace) -> JaxPPOConfig:
     legacy_steps = values.pop("steps", None)
     rollout_steps = values.get("rollout_steps")
     values["rollout_steps"] = int(rollout_steps if rollout_steps is not None else (legacy_steps if legacy_steps is not None else 32))
+    if values.get("pfsp_enabled") is None:
+        values["pfsp_enabled"] = values.get("opponent") == "pfsp_jax"
     return JaxPPOConfig(**values)
 
 

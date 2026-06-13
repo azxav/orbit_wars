@@ -105,12 +105,16 @@ def load_manifest(path: str | Path) -> PFSPManifest:
         return PFSPManifest.from_dict(json.load(f))
 
 
-def build_initial_manifest(*, players: int, max_policy_slots: int, bc_checkpoint: str) -> PFSPManifest:
+def build_initial_manifest(*, players: int, max_policy_slots: int, bc_checkpoint: str, include_anchors: bool = False) -> PFSPManifest:
     entries = [
-        PFSPEntry("anchor_simple_heuristic_jax", "simple_heuristic_jax", None, True, True, None, 0),
-        PFSPEntry("anchor_jax_proxy", "jax_proxy", None, True, True, None, 0),
         PFSPEntry("initial_bc", "frozen_policy", 0, True, True, bc_checkpoint, 0),
     ]
+    if include_anchors:
+        entries = [
+            PFSPEntry("anchor_simple_heuristic_jax", "simple_heuristic_jax", None, True, True, None, 0),
+            PFSPEntry("anchor_jax_proxy", "jax_proxy", None, True, True, None, 0),
+            *entries,
+        ]
     return PFSPManifest(
         version=1,
         players=int(players),
@@ -391,49 +395,25 @@ def build_match_plan(
 
     for env_i in range(envs):
         available_seats = [seat for seat in range(players) if seat != int(learner_seat[env_i])]
-        if players == 4 and layout == "one_pfsp_two_anchors":
-            planned: list[PFSPEntry] = []
-            if frozen_entries:
-                planned.append(
-                    _weighted_frozen_entry(
-                        manifest,
-                        frozen_entries,
-                        rng,
-                        min_games_per_entry=min_games_per_entry,
-                        hard_low=hard_low,
-                        hard_high=hard_high,
-                        hard_bonus=hard_bonus,
-                        exploration_bonus=exploration_bonus,
-                    )
+        selected_entries = []
+        for _offset, _seat in enumerate(available_seats):
+            use_anchor = bool(rng.random() < float(anchor_fraction)) or not frozen_entries
+            if use_anchor and anchor_entries:
+                entry = _cycle_entry(anchor_entries, env_i + len(selected_entries))
+            elif frozen_entries:
+                entry = _weighted_frozen_entry(
+                    manifest,
+                    frozen_entries,
+                    rng,
+                    min_games_per_entry=min_games_per_entry,
+                    hard_low=hard_low,
+                    hard_high=hard_high,
+                    hard_bonus=hard_bonus,
+                    exploration_bonus=exploration_bonus,
                 )
-            if anchor_entries:
-                planned.append(_cycle_entry(anchor_entries, env_i))
-            diversity_pool = anchor_entries or [entry for entry in frozen_entries if not planned or entry.id != planned[0].id]
-            if diversity_pool:
-                planned.append(_cycle_entry(diversity_pool, env_i + 1))
-            while len(planned) < len(available_seats):
-                planned.append(_cycle_entry(entries, env_i + len(planned)))
-            selected_entries = planned[: len(available_seats)]
-        else:
-            selected_entries = []
-            for _offset, _seat in enumerate(available_seats):
-                use_anchor = bool(rng.random() < float(anchor_fraction)) or not frozen_entries
-                if use_anchor and anchor_entries:
-                    entry = _cycle_entry(anchor_entries, env_i + len(selected_entries))
-                elif frozen_entries:
-                    entry = _weighted_frozen_entry(
-                        manifest,
-                        frozen_entries,
-                        rng,
-                        min_games_per_entry=min_games_per_entry,
-                        hard_low=hard_low,
-                        hard_high=hard_high,
-                        hard_bonus=hard_bonus,
-                        exploration_bonus=exploration_bonus,
-                    )
-                else:
-                    entry = _cycle_entry(entries, env_i + len(selected_entries))
-                selected_entries.append(entry)
+            else:
+                entry = _cycle_entry(entries, env_i + len(selected_entries))
+            selected_entries.append(entry)
 
         for seat, entry in zip(available_seats, selected_entries, strict=True):
             kind, slot = _entry_kind_and_slot(entry)

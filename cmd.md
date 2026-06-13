@@ -7,8 +7,6 @@ python -m orbit_ppo_jax.train \
   --rollout_steps 32 \
   --episode_steps 500 \
   --updates 5 \
-  --opponent pfsp_jax \
-  --pfsp_enabled \
   --pfsp_max_policy_slots 8 \
   --pfsp_matrix_games 0 \
   --eval_games 0 \
