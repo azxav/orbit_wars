@@ -118,6 +118,27 @@ def _source_batch(features, target_label: jnp.ndarray | None = None) -> dict[str
     return batch
 
 
+def _explained_variance(values: jnp.ndarray, returns: jnp.ndarray) -> jnp.ndarray:
+    var_returns = jnp.var(returns)
+    return jnp.where(var_returns < 1.0e-8, 0.0, 1.0 - jnp.var(returns - values) / var_returns)
+
+
+def _ppo_diagnostic_metrics(
+    *,
+    old_logprob: jnp.ndarray,
+    new_logprob: jnp.ndarray,
+    values: jnp.ndarray,
+    returns: jnp.ndarray,
+    clip_range: float,
+) -> dict[str, jnp.ndarray]:
+    ratio = jnp.exp(new_logprob - old_logprob)
+    return {
+        "approx_kl": jnp.mean(old_logprob - new_logprob),
+        "clip_frac": jnp.mean((jnp.abs(ratio - 1.0) > float(clip_range)).astype(jnp.float32)),
+        "value_explained_variance": _explained_variance(values, returns),
+    }
+
+
 def _policy_eval_from_forward_outputs(params, features, target_out, amount_out, target_idx: jnp.ndarray, amount_idx: jnp.ndarray):
     target_logits = _safe_target_logits(target_out["target_logits"], features.target_mask)
     source_rows = jnp.arange(features.source_slots.shape[0])
@@ -410,6 +431,13 @@ def _make_update(config: JaxPPOConfig, bc_config: dict[str, Any], state_bank: En
             "mean_reward": jnp.mean(rewards),
             "mean_return": jnp.mean(returns),
             "clip_dev": jnp.mean(jnp.abs(ratio - 1.0)),
+            **_ppo_diagnostic_metrics(
+                old_logprob=traj["old_logprob"],
+                new_logprob=new_lp,
+                values=new_v,
+                returns=returns,
+                clip_range=float(config.clip),
+            ),
             "submitted_action_count": jnp.sum(traj["submitted_action_count"]),
             "valid_action_count": jnp.sum(traj["valid_action_count"]),
             "invalid_action_count": jnp.sum(traj["invalid_action_count"]),

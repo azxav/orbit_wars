@@ -276,6 +276,9 @@ def test_tiny_train_writes_checkpoint_and_metrics(tmp_path: Path) -> None:
     assert metrics["episode_steps"] == 500
     assert metrics["reset_source"] == "jax_reset"
     assert metrics["steps_per_second"] > 0.0
+    assert "approx_kl" in metrics
+    assert "clip_frac" in metrics
+    assert "value_explained_variance" in metrics
 
 
 def test_steps_alias_normalizes_to_rollout_steps() -> None:
@@ -339,6 +342,39 @@ def test_policy_sample_act_uses_two_bc_forwards(tmp_path: Path, monkeypatch: pyt
     )
 
     assert calls == 2
+
+
+def test_jax_ppo_diagnostic_metrics_match_expected_formulas() -> None:
+    from orbit_ppo_jax.train import _ppo_diagnostic_metrics
+
+    old_logprob = jnp.log(jnp.asarray([1.0, 1.0, 1.0], dtype=jnp.float32))
+    new_logprob = jnp.log(jnp.asarray([1.3, 0.7, 1.1], dtype=jnp.float32))
+    values = jnp.asarray([0.0, 1.0, 2.0], dtype=jnp.float32)
+    returns = jnp.asarray([0.0, 2.0, 4.0], dtype=jnp.float32)
+
+    metrics = _ppo_diagnostic_metrics(
+        old_logprob=old_logprob,
+        new_logprob=new_logprob,
+        values=values,
+        returns=returns,
+        clip_range=0.2,
+    )
+
+    ratio = np.asarray(jnp.exp(new_logprob - old_logprob))
+    np.testing.assert_allclose(float(metrics["approx_kl"]), float(jnp.mean(old_logprob - new_logprob)), rtol=1e-6)
+    np.testing.assert_allclose(float(metrics["clip_frac"]), float(np.mean(np.abs(ratio - 1.0) > 0.2)), rtol=1e-6)
+    np.testing.assert_allclose(float(metrics["value_explained_variance"]), 0.75, rtol=1e-6)
+
+
+def test_jax_ppo_explained_variance_is_zero_for_constant_returns() -> None:
+    from orbit_ppo_jax.train import _explained_variance
+
+    actual = _explained_variance(
+        jnp.asarray([0.0, 1.0, 2.0], dtype=jnp.float32),
+        jnp.asarray([3.0, 3.0, 3.0], dtype=jnp.float32),
+    )
+
+    assert float(actual) == 0.0
 
 
 def test_source_cap_arg_is_accepted() -> None:
