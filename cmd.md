@@ -1,16 +1,17 @@
-
-  python -m orbit_ppo_jax.train \
+python -m orbit_ppo_jax.train \
   --bc_checkpoint bc_checkpoints/lite_bc_v1_500/best/checkpoint.pt \
-  --out_dir ppo_runs/jax_ppo_4p_cap3_env80 \
+  --out_dir ppo_runs/jax_ppo_4p \
   --players 4 \
   --envs 80 \
   --enable_comets \
   --rollout_steps 32 \
   --episode_steps 500 \
-  --updates 10000 \
+  --updates 5 \
   --opponent pfsp_jax \
   --pfsp_enabled \
   --pfsp_max_policy_slots 8 \
   --pfsp_matrix_games 0 \
   --eval_games 0 \
-  --source_cap 3
+  --source_cap 3 \
+  --precision float16 \
+  --no_remat_policy_eval

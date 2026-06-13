@@ -908,7 +908,7 @@ JAX PPO uses the optimized path by default:
 - `--matmul_precision highest` forwards to `jax_default_matmul_precision`; pass another accepted value to override.
 - PPO loss policy evaluation uses `jax.checkpoint`; pass `--no_remat_policy_eval` to disable it.
 - Rollout trajectories store compact planet mask inputs and rebuild full action masks during PPO loss; pass `--no_recompute_masks` to store full masks.
-- `--profile_dir traces --profile_updates 1` wraps the first update in `jax.profiler.trace`; pass `--no_profile` to disable trace output.
+- `--profile_dir traces --profile_updates 1` wraps small initial updates in `jax.profiler.trace`; automatic tracing is skipped when `envs * rollout_steps` exceeds `--profile_max_env_steps 1024` to avoid profiler-induced OOMs on large runs. Pass `--no_profile` to disable trace output, or `--profile_max_env_steps 0` to force tracing.
 - Split rollout/train JITs queue the next non-PFSP rollout before the current train step, recording the one-update policy lag in metrics; pass `--no_async_rollout_prefetch` to use the fused update path.
 
 Evaluate a saved JAX PPO checkpoint against the real heuristic:

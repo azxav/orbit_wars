@@ -24,7 +24,7 @@ from orbit_jax_env.state import EnvState
 from .actions import action_rows_from_source_choices
 from .bc_policy import bc_forward, init_value_head, load_bc_jax_params, value_apply
 from .checkpointing import load_jax_checkpoint, load_jax_training_state, save_jax_checkpoint, save_jax_training_state
-from .features import NOOP_TARGET_SLOT, build_bc_features_for_seat, build_selected_masks_from_arrays
+from .features import NOOP_TARGET_SLOT, build_bc_features_for_seat, build_selected_masks_from_activity
 from .pfsp import OPP_FROZEN_POLICY, OPP_JAX_PROXY, OPP_NONE, OPP_SIMPLE_HEURISTIC, add_snapshot_entry, build_initial_manifest, build_match_plan, load_manifest, save_manifest, update_manifest_from_slot_stats
 from .pfsp_bank import build_pfsp_bank, tree_stack, tree_take
 
@@ -81,6 +81,7 @@ class JaxPPOConfig:
     recompute_masks: bool = True
     profile_dir: str | None = "traces"
     profile_updates: int = 1
+    profile_max_env_steps: int = 1024
     async_rollout_prefetch: bool = True
 
 
@@ -111,8 +112,21 @@ def _bc_compute_dtype_name(precision: str) -> str:
     raise RuntimeError("--precision must be float32, bfloat16, or float16")
 
 
+def _compute_dtype(precision: str) -> jnp.dtype:
+    name = _bc_compute_dtype_name(precision)
+    if name == "bfloat16":
+        return jnp.bfloat16
+    if name == "float16":
+        return jnp.float16
+    return jnp.float32
+
+
 def _profile_update_context(config: JaxPPOConfig, out_dir: Path, update_index: int):
     if not config.profile_dir or int(update_index) > int(config.profile_updates):
+        return nullcontext()
+    profile_limit = int(config.profile_max_env_steps)
+    update_env_steps = int(config.envs) * int(config.rollout_steps)
+    if profile_limit > 0 and update_env_steps > profile_limit:
         return nullcontext()
     trace_dir = Path(config.profile_dir)
     if not trace_dir.is_absolute():
@@ -183,8 +197,14 @@ def _policy_eval_from_forward_outputs(params, features, target_out, amount_out, 
     logprob = jnp.sum(jnp.where(source_active, target_lp + jnp.where(target_idx == NOOP_TARGET_SLOT, 0.0, amount_lp), 0.0))
     target_prob = jax.nn.softmax(target_logits)
     amount_prob = jax.nn.softmax(amount_logits)
-    target_ent = -jnp.sum(target_prob * target_lp_all, axis=-1)
-    amount_ent = -jnp.sum(amount_prob * amount_lp_all, axis=-1)
+    target_row_any = jnp.any(features.target_mask, axis=-1, keepdims=True)
+    target_noop = jnp.arange(features.target_mask.shape[-1]) == NOOP_TARGET_SLOT
+    target_entropy_mask = jnp.where(target_row_any, features.target_mask, target_noop[None, :])
+    amount_row_any = jnp.any(chosen_amount_mask, axis=-1, keepdims=True)
+    amount_none = jnp.arange(chosen_amount_mask.shape[-1]) == 0
+    amount_entropy_mask = jnp.where(amount_row_any, chosen_amount_mask, amount_none[None, :])
+    target_ent = -jnp.sum(target_prob * jnp.where(target_entropy_mask, target_lp_all, 0.0), axis=-1)
+    amount_ent = -jnp.sum(amount_prob * jnp.where(amount_entropy_mask, amount_lp_all, 0.0), axis=-1)
     entropy = jnp.sum(jnp.where(source_active, target_ent + jnp.where(target_idx == NOOP_TARGET_SLOT, 0.0, amount_ent), 0.0))
     value = value_apply(params["value"], target_out["global_ctx"][0])
     return logprob, value, entropy
@@ -322,6 +342,10 @@ def _make_update(config: JaxPPOConfig, bc_config: dict[str, Any], state_bank: En
         enable_comets=bool(config.enable_comets),
     )
     bank_mode = str(config.state_bank_mode)
+    trajectory_feature_dtype = _compute_dtype(str(bc_config.get("compute_dtype", config.precision)))
+
+    def store_feature(x: jnp.ndarray) -> jnp.ndarray:
+        return x.astype(trajectory_feature_dtype)
 
     def reset_many(keys, done_mask, next_states, cycle_index):
         if state_bank is None:
@@ -376,10 +400,10 @@ def _make_update(config: JaxPPOConfig, bc_config: dict[str, Any], state_bank: En
                 next_state, _next_obs, rewards, done, info = step(state, actions)
                 learner_reward, learner_rank = _learner_terminal_fields(rewards, info["ranks"], learner_seat)
                 store = {
-                    "planet_features": feats.planet_features,
-                    "global_features": feats.global_features,
-                    "target_state_features": feats.target_state_features,
-                    "pair_features": feats.pair_features,
+                    "planet_features": store_feature(feats.planet_features),
+                    "global_features": store_feature(feats.global_features),
+                    "target_state_features": store_feature(feats.target_state_features),
+                    "pair_features": store_feature(feats.pair_features),
                     "source_slots": feats.source_slots,
                     "source_mask": feats.source_mask,
                     "active_source_count": feats.active_source_count,
@@ -407,11 +431,11 @@ def _make_update(config: JaxPPOConfig, bc_config: dict[str, Any], state_bank: En
                     "opponent_slot": opponent_slot,
                 }
                 if config.recompute_masks:
+                    source_alive = state.planet_alive & (state.planet_owner == learner_seat) & (state.planet_ships >= 1.0)
                     store = {
                         **store,
-                        "mask_planet_owner": state.planet_owner,
-                        "mask_planet_alive": state.planet_alive,
-                        "mask_planet_ships": state.planet_ships,
+                        "mask_source_alive": source_alive,
+                        "mask_target_alive": state.planet_alive,
                     }
                 else:
                     store = {
@@ -448,12 +472,10 @@ def _make_update(config: JaxPPOConfig, bc_config: dict[str, Any], state_bank: En
 
         policy_eval = jax.checkpoint(eval_with_config) if config.remat_policy_eval else eval_with_config
         if config.recompute_masks:
-            def one_eval(pf, gf, tsf, pair, slots, sm, active_count, selected_count, ti, ai, owner, alive, ships, learner_seat):
-                tm, am = build_selected_masks_from_arrays(
-                    planet_owner=owner,
-                    planet_alive=alive,
-                    planet_ships=ships,
-                    player_id=learner_seat,
+            def one_eval(pf, gf, tsf, pair, slots, sm, active_count, selected_count, ti, ai, source_alive, target_alive):
+                tm, am = build_selected_masks_from_activity(
+                    source_alive=source_alive,
+                    target_alive=target_alive,
                     source_slots=slots,
                     source_mask=sm,
                 )
@@ -470,10 +492,8 @@ def _make_update(config: JaxPPOConfig, bc_config: dict[str, Any], state_bank: En
                 traj["selected_source_count"],
                 traj["target_idx"],
                 traj["amount_idx"],
-                traj["mask_planet_owner"],
-                traj["mask_planet_alive"],
-                traj["mask_planet_ships"],
-                traj["learner_seat"],
+                traj["mask_source_alive"],
+                traj["mask_target_alive"],
             )
         else:
             def one_eval(pf, gf, tsf, pair, tm, am, slots, sm, active_count, selected_count, ti, ai):
@@ -675,6 +695,8 @@ def train(config: JaxPPOConfig) -> dict[str, Any]:
         raise RuntimeError(f"--source_cap must be between 1 and {P_MAX}")
     if int(config.profile_updates) < 1:
         raise RuntimeError("--profile_updates must be >= 1")
+    if int(config.profile_max_env_steps) < 0:
+        raise RuntimeError("--profile_max_env_steps must be >= 0")
     _bc_compute_dtype_name(config.precision)
 
     state_bank = None
@@ -1075,6 +1097,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--profile_dir", default="traces", help="Directory for jax.profiler.trace output; relative paths are under out_dir.")
     ap.add_argument("--no_profile", dest="profile_dir", action="store_const", const=None, help="Disable default jax.profiler.trace output.")
     ap.add_argument("--profile_updates", type=int, default=1, help="Number of initial updates to trace when --profile_dir is set.")
+    ap.add_argument("--profile_max_env_steps", type=int, default=1024, help="Skip automatic profiling when envs * rollout_steps exceeds this limit; set 0 to force tracing.")
     ap.add_argument("--async_rollout_prefetch", action="store_true", help="Use split rollout/train JITs and queue the next non-PFSP rollout before the current train step.")
     ap.add_argument("--no_async_rollout_prefetch", dest="async_rollout_prefetch", action="store_false", help="Disable split rollout/train prefetching.")
     ap.set_defaults(resume=True)

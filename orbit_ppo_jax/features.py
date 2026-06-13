@@ -209,6 +209,32 @@ def build_selected_masks_from_arrays(
     return selected_target_mask, selected_amount_mask
 
 
+def build_selected_masks_from_activity(
+    *,
+    target_alive: jnp.ndarray,
+    source_alive: jnp.ndarray,
+    source_slots: jnp.ndarray,
+    source_mask: jnp.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    target_alive = target_alive.astype(jnp.bool_)
+    source_alive = source_alive.astype(jnp.bool_)
+    source_slots = source_slots.astype(jnp.int32)
+    selected_source_alive = source_alive[source_slots] & source_mask
+    target_axis = jnp.arange(P_MAX, dtype=jnp.int32)
+    target = (
+        target_alive[None, :]
+        & selected_source_alive[:, None]
+        & (source_slots[:, None] != target_axis[None, :])
+    )
+    target_mask = jnp.concatenate([target, selected_source_alive[:, None]], axis=1)
+    amount_mask = jnp.broadcast_to(jnp.arange(7)[None, None, :] >= 0, (source_slots.shape[0], P_MAX + 1, 7))
+    amount_mask = amount_mask & target_mask[:, :, None]
+    amount_mask = amount_mask.at[:, :P_MAX, 0].set(False)
+    amount_mask = amount_mask.at[:, NOOP_TARGET_SLOT, :].set(False)
+    amount_mask = amount_mask.at[:, NOOP_TARGET_SLOT, 0].set(selected_source_alive)
+    return target_mask, amount_mask
+
+
 def pair_features_for_source(planet_features: jnp.ndarray, target_state_features: jnp.ndarray, source_slot: int, amount_mask: jnp.ndarray) -> jnp.ndarray:
     src = planet_features[source_slot]
     sx, sy = src[4], src[5]

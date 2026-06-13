@@ -359,6 +359,8 @@ def test_jax_ppo_optimization_args_are_accepted() -> None:
             "traces",
             "--profile_updates",
             "2",
+            "--profile_max_env_steps",
+            "0",
             "--async_rollout_prefetch",
         ]
     )
@@ -370,6 +372,7 @@ def test_jax_ppo_optimization_args_are_accepted() -> None:
     assert config.recompute_masks is True
     assert config.profile_dir == "traces"
     assert config.profile_updates == 2
+    assert config.profile_max_env_steps == 0
     assert config.async_rollout_prefetch is True
 
 
@@ -392,6 +395,7 @@ def test_jax_ppo_optimization_defaults_are_active() -> None:
     assert config.recompute_masks is True
     assert config.profile_dir == "traces"
     assert config.profile_updates == 1
+    assert config.profile_max_env_steps == 1024
     assert config.async_rollout_prefetch is True
 
 
@@ -464,6 +468,33 @@ def test_profile_context_uses_jax_profiler_trace(tmp_path: Path, monkeypatch: py
         pass
 
     assert calls == [tmp_path / "out" / "profile"]
+
+
+def test_large_profile_context_skips_trace_by_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from contextlib import contextmanager
+    from orbit_ppo_jax import train as train_mod
+
+    calls = []
+
+    @contextmanager
+    def fake_trace(path):
+        calls.append(Path(path))
+        yield
+
+    monkeypatch.setattr(train_mod.jax.profiler, "trace", fake_trace)
+    config = train_mod.JaxPPOConfig(
+        bc_checkpoint="bc.pt",
+        out_dir=str(tmp_path / "out"),
+        envs=80,
+        rollout_steps=32,
+        profile_dir="traces",
+        profile_updates=1,
+    )
+
+    with train_mod._profile_update_context(config, tmp_path / "out", 1):
+        pass
+
+    assert calls == []
 
 
 def test_policy_sample_act_uses_two_bc_forwards(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -683,6 +714,43 @@ def test_tiny_train_with_precision_remat_and_recomputed_masks(tmp_path: Path) ->
     assert (out_dir / "latest" / "params.npz").exists()
 
 
+def test_tiny_train_float16_precision_keeps_metrics_finite(tmp_path: Path) -> None:
+    from orbit_ppo_jax.train import main
+
+    ckpt = _tiny_bc_checkpoint(tmp_path / "bc")
+    out_dir = tmp_path / "ppo_float16"
+    main(
+        [
+            "--bc_checkpoint",
+            str(ckpt),
+            "--out_dir",
+            str(out_dir),
+            "--players",
+            "2",
+            "--envs",
+            "1",
+            "--rollout_steps",
+            "1",
+            "--episode_steps",
+            "500",
+            "--updates",
+            "1",
+            "--eval_games",
+            "0",
+            "--source_cap",
+            "2",
+            "--precision",
+            "float16",
+            "--no_remat_policy_eval",
+            "--no_profile",
+        ]
+    )
+
+    metrics = json.loads((out_dir / "metrics.jsonl").read_text().splitlines()[0])
+    assert np.isfinite(metrics["entropy"])
+    assert np.isfinite(metrics["loss"])
+
+
 def test_recompute_masks_rollout_omits_full_masks_from_trajectory(tmp_path: Path) -> None:
     from orbit_jax_env.config import EnvConfig
     from orbit_jax_env.reset import reset
@@ -718,9 +786,51 @@ def test_recompute_masks_rollout_omits_full_masks_from_trajectory(tmp_path: Path
 
     assert "target_mask" not in traj
     assert "amount_mask" not in traj
-    assert "mask_planet_owner" in traj
-    assert "mask_planet_alive" in traj
-    assert "mask_planet_ships" in traj
+    assert "mask_source_alive" in traj
+    assert "mask_target_alive" in traj
+    assert "mask_planet_owner" not in traj
+    assert "mask_planet_alive" not in traj
+    assert "mask_planet_ships" not in traj
+
+
+def test_mixed_precision_rollout_stores_features_in_compute_dtype(tmp_path: Path) -> None:
+    from orbit_jax_env.config import EnvConfig
+    from orbit_jax_env.reset import reset
+    from orbit_ppo_jax.bc_policy import init_value_head, load_bc_jax_params
+    from orbit_ppo_jax.pfsp_bank import tree_stack
+    from orbit_ppo_jax.train import JaxPPOConfig, _default_match_plan_arrays, _make_update
+
+    ckpt = _tiny_bc_checkpoint(tmp_path / "bc")
+    config = JaxPPOConfig(
+        bc_checkpoint=str(ckpt),
+        out_dir=str(tmp_path / "out"),
+        players=2,
+        envs=1,
+        rollout_steps=1,
+        episode_steps=500,
+        source_cap=2,
+        precision="bfloat16",
+        recompute_masks=True,
+    )
+    bc_params, bc_config = load_bc_jax_params(ckpt)
+    bc_config = {**bc_config, "compute_dtype": "bfloat16"}
+    params = {"bc": bc_params, "value": init_value_head(jax.random.PRNGKey(0), int(bc_config["hidden_size"]))}
+    _update_fn, _optimizer, rollout_fn, _train_on_traj_fn = _make_update(config, bc_config)
+    states = jax.vmap(lambda key: reset(key, EnvConfig(num_players=2, episode_steps=500)))(jax.random.split(jax.random.PRNGKey(1), 1))
+
+    traj, _next_states, _next_cycle_index = rollout_fn(
+        params,
+        jax.random.PRNGKey(2),
+        states,
+        jnp.asarray(0, dtype=jnp.int32),
+        tree_stack([bc_params]),
+        *_default_match_plan_arrays(config),
+    )
+
+    assert traj["planet_features"].dtype == jnp.bfloat16
+    assert traj["global_features"].dtype == jnp.bfloat16
+    assert traj["target_state_features"].dtype == jnp.bfloat16
+    assert traj["pair_features"].dtype == jnp.bfloat16
 
 
 def test_tiny_train_async_rollout_prefetch_records_active_metrics(tmp_path: Path) -> None:
